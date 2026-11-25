@@ -1,0 +1,1649 @@
+module stage3_handshake_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_client_hello.ext_alpn;
+use shield_client_hello.ext_key_share;
+use shield_client_hello.ext_signature_algorithms;
+use shield_client_hello.ext_supported_groups;
+use shield_client_hello.ext_supported_versions;
+use shield_client_hello.group_x25519;
+use shield_handshake.HandshakePhase;
+use shield_handshake.HandshakeSession;
+use shield_handshake.build_ccs_record;
+use shield_handshake.build_finished;
+use shield_handshake.build_server_hello;
+use shield_handshake.finished_verify_data;
+use shield_handshake.flight_records;
+use shield_handshake.handle_client_hello2_explicit;
+use shield_handshake.handle_client_hello_explicit;
+use shield_handshake.handle_client_record;
+use shield_handshake.handshake_client_app_protection;
+use shield_handshake.handshake_client_app_sec;
+use shield_handshake.handshake_client_hs_protection;
+use shield_handshake.handshake_phase;
+use shield_handshake.handshake_server_app_protection;
+use shield_handshake.handshake_server_app_sec;
+use shield_handshake.magic_hrr_random;
+use shield_handshake.new_handshake_session;
+use shield_handshake.transcript_hash_for_suite;
+use shield_handshake.verify_finished_data;
+use shield_key_schedule.client_application_traffic_secret_0;
+use shield_key_schedule.client_handshake_traffic_secret;
+use shield_key_schedule.early_secret;
+use shield_key_schedule.handshake_secret;
+use shield_key_schedule.master_secret;
+use shield_key_schedule.server_application_traffic_secret_0;
+use shield_key_schedule.server_handshake_traffic_secret;
+use shield_record.ContentType;
+use shield_record.parse_record_header;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.RecordProtection;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_record_crypto.record_protection_is_poisoned;
+use shield_record_crypto.seal_record;
+use test_support.bytes_eq;
+use test_support.hex_decode;
+use test_support.wrap_in_record;
+
+fn test_ecdsa_priv() -> Result<EcdsaP256PrivateKey, Int>
+  intent "テスト用 ECDSA 秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let priv_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match EcdsaP256PrivateKey.from_secret(Secret.from_bytes(priv_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(99),
+  };
+}
+
+fn test_server_x25519_priv() -> Result<X25519PrivateKey, Int>
+  intent "テスト用 X25519 サーバー秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let server_priv_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(server_priv_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(98),
+  };
+}
+
+fn test_client_x25519_priv() -> Result<X25519PrivateKey, Int>
+  intent "テスト用 X25519 クライアント秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let client_priv_raw = hex_decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(client_priv_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(97),
+  };
+}
+
+fn new_test_session(private_key: &EcdsaP256PrivateKey) -> HandshakeSession
+  intent "テスト用の HandshakeSession を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cert_der = Bytes.new();
+  cert_der.push(48);
+  cert_der.push(10);
+  let mut i = 0;
+  while i < 10 {
+    cert_der.push(i + 1);
+    i = i + 1;
+  }
+  let mut cert_chain = List.new();
+  cert_chain.push(cert_der);
+  return new_handshake_session(cert_chain, private_key.clone());
+}
+
+fn new_oversized_test_session(private_key: &EcdsaP256PrivateKey) -> HandshakeSession
+  intent "16,384 バイトを超える証明書チェーンを持つテスト用セッションを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut large_cert = Bytes.with_capacity(18000);
+  let mut i = 0;
+  while i < 18000 {
+    large_cert.push(42);
+    i = i + 1;
+  }
+  let mut cert_chain = List.new();
+  cert_chain.push(large_cert);
+  return new_handshake_session(cert_chain, private_key.clone());
+}
+
+fn slice_bytes(b: &Bytes, start: Int, end: Int) -> Bytes
+  intent "バイト列の一部を安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match b.slice(start, end) {
+    Ok(s) => s,
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn get_record(records: &List<Bytes>, idx: Int) -> Bytes
+  intent "フライトレコードを安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match records.get(idx) {
+    Some(r) => r.clone(),
+    None => Bytes.new(),
+  };
+}
+
+fn derive_shared_secret(priv: &X25519PrivateKey, pub_bytes: &Bytes) -> Bytes
+  intent "共有秘密を安全に導出する"
+  requires none
+  ensures none
+  effects none
+{
+  return match X25519PublicKey.from_bytes(pub_bytes.clone()) {
+    Ok(pub_obj) => match x25519_shared_secret(&priv, &pub_obj) {
+      Ok(ss) => ss.expose(),
+      Err(_) => Bytes.new(),
+    },
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn open_record_pt(rx: &mut RecordProtection, rec: &Bytes) -> Bytes
+  intent "レコードを開いて平文を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match open_record(&mut rx, &rec) {
+    Ok(outcome) => open_outcome_plaintext(&outcome),
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn seal_record_bytes(tx: &mut RecordProtection, ct: &ContentType, pt: &Bytes, pad: Int) -> Bytes
+  intent "レコードを暗号化してバイト列を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match seal_record(&mut tx, &ct, &pt, pad) {
+    Ok(rec) => rec,
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn test_rfc8448_section3_trace() -> Int
+  intent "RFC 8448 Section 3 1-RTT トレース値との照合試験"
+  requires none
+  ensures none
+  effects none
+{
+  let suite = CipherSuite.TlsAes128GcmSha256;
+
+  let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+  let s_sid = hex_decode("e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+  let s_pub = hex_decode("9fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615");
+
+  // ServerHello メッセージ構築
+  let sh_msg = build_server_hello(&s_rand, &s_sid, &suite, Some(s_pub.clone()), group_x25519());
+  let exp_sh_msg = hex_decode("020000760303707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f20e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff130100002e002b0002030400330024001d00209fd7ad6dcff4298dd3f96d5b1b2af910a0535b1488d7f8fabb349a982880b615");
+  if !bytes_eq(&sh_msg, &exp_sh_msg) {
+    return 101;
+  }
+
+  // 鍵スケジュールと Finished 照合
+  let early_sec = early_secret(&suite);
+  let shared_secret = hex_decode("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+  let th_sh = hex_decode("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+  // Server Finished verify_data
+  let th_cv = hex_decode("edb7725fa7a3473b031ec8ef65a2485493900138a2b91291407d7951a06110ed");
+  let s_fin_vd = finished_verify_data(&suite, &s_hs_sec, &th_cv);
+  let exp_s_fin_vd = hex_decode("9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718");
+  if !bytes_eq(&s_fin_vd, &exp_s_fin_vd) {
+    return 102;
+  }
+
+  // Client Finished verify_data
+  let th_sf = hex_decode("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+  let exp_c_fin_vd = hex_decode("a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61");
+  let c_fin_ok = verify_finished_data(&suite, &c_hs_sec, &th_sf, &exp_c_fin_vd);
+  if !c_fin_ok {
+    return 103;
+  }
+
+  // アプリケーショントラフィック秘密
+  let ms_sec = master_secret(&suite, &hs_sec);
+  let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+  let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+
+  let exp_c_ap_sec = hex_decode("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+  let exp_s_ap_sec = hex_decode("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643");
+  if !bytes_eq(&c_ap_sec, &exp_c_ap_sec) {
+    return 104;
+  }
+  if !bytes_eq(&s_ap_sec, &exp_s_ap_sec) {
+    return 105;
+  }
+
+  return 0;
+}
+
+fn test_rfc8448_section5_hrr_trace() -> Int
+  intent "RFC 8448 Section 5 HelloRetryRequest 合成トランスクリプト試験"
+  requires none
+  ensures none
+  effects none
+{
+  let suite = CipherSuite.TlsAes128GcmSha256;
+
+  // RFC 8448 Section 5 ClientHello1 ハッシュ
+  let ch1_hash = hex_decode("2cd2ff743da00e2ee9d9e2b10aef7ff1dfaa369e5d4cb05be1b854a86b162f55");
+
+  // 合成メッセージ: message_hash (0xfe, 0x000020) || ch1_hash
+  let mut synth = Bytes.new();
+  synth.push(254);
+  synth.push(0);
+  synth.push(0);
+  synth.push(32);
+  synth.extend(&ch1_hash);
+
+  // HRR メッセージ (RFC 8448 Section 5)
+  let hrr_rand = magic_hrr_random();
+  let exp_hrr_rand = hex_decode("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c");
+  if !bytes_eq(&hrr_rand, &exp_hrr_rand) {
+    return 201;
+  }
+
+  let empty_sid = Bytes.new();
+  let hrr_msg = build_server_hello(&hrr_rand, &empty_sid, &suite, None, group_x25519());
+  let exp_hrr_msg = hex_decode("020000340303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c00130100000c002b0002030400330002001d");
+  if !bytes_eq(&hrr_msg, &exp_hrr_msg) {
+    return 202;
+  }
+
+  // 合成トランスクリプトハッシュ
+  let mut transcript = Bytes.new();
+  transcript.extend(&synth);
+  transcript.extend(&hrr_msg);
+
+  let th_hrr = transcript_hash_for_suite(&suite, &transcript);
+  let exp_th_hrr = hex_decode("3433c53d6e8d7ceeb829c1d53c074c4d4bd426de8da8e6bd9b0379614393975b");
+  if !bytes_eq(&th_hrr, &exp_th_hrr) {
+    return 203;
+  }
+
+  return 0;
+}
+
+fn build_client_hello_custom(include_vers: Bool, ciphers: List<Int>, sigs: List<Int>, groups: List<Int>, share_bytes_opt: Option<Bytes>, alpn_protos: List<String>, random_override: Option<Bytes>) -> Bytes
+  intent "パラメータを指定して ClientHello を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(3);
+  payload.push(3);
+
+  match random_override {
+    Some(r) => {
+      payload.extend(&r);
+    }
+    None => {
+      let mut i = 0;
+      while i < 32 {
+        payload.push(66);
+        i = i + 1;
+      }
+    }
+  }
+
+  // legacy_session_id (32 bytes)
+  payload.push(32);
+  let mut s = 0;
+  while s < 32 {
+    payload.push(17);
+    s = s + 1;
+  }
+
+  // cipher_suites
+  payload.push(ciphers.len() * 2 / 256);
+  payload.push(ciphers.len() * 2 % 256);
+  let mut ci = 0;
+  while ci < ciphers.len() {
+    match ciphers.get(ci) {
+      Some(cs) => {
+        payload.push(cs / 256);
+        payload.push(cs % 256);
+      }
+      None => {}
+    }
+    ci = ci + 1;
+  }
+
+  // compression
+  payload.push(1);
+  payload.push(0);
+
+  // extensions
+  let mut ext = Bytes.new();
+
+  // supported_versions
+  if include_vers {
+    ext.push(0);
+    ext.push(ext_supported_versions());
+    ext.push(0);
+    ext.push(3);
+    ext.push(2);
+    ext.push(3);
+    ext.push(4);
+  }
+
+  // supported_groups
+  if !groups.is_empty() {
+    ext.push(0);
+    ext.push(ext_supported_groups());
+    let glen = 2 + groups.len() * 2;
+    ext.push(glen / 256);
+    ext.push(glen % 256);
+    let l_len = groups.len() * 2;
+    ext.push(l_len / 256);
+    ext.push(l_len % 256);
+    let mut gi = 0;
+    while gi < groups.len() {
+      match groups.get(gi) {
+        Some(g) => {
+          ext.push(g / 256);
+          ext.push(g % 256);
+        }
+        None => {}
+      }
+      gi = gi + 1;
+    }
+  }
+
+  // signature_algorithms
+  if !sigs.is_empty() {
+    ext.push(0);
+    ext.push(ext_signature_algorithms());
+    let slen = 2 + sigs.len() * 2;
+    ext.push(slen / 256);
+    ext.push(slen % 256);
+    let l_len = sigs.len() * 2;
+    ext.push(l_len / 256);
+    ext.push(l_len % 256);
+    let mut si = 0;
+    while si < sigs.len() {
+      match sigs.get(si) {
+        Some(sig) => {
+          ext.push(sig / 256);
+          ext.push(sig % 256);
+        }
+        None => {}
+      }
+      si = si + 1;
+    }
+  }
+
+  // key_share
+  match share_bytes_opt {
+    Some(kb) => {
+      let klen = 4 + kb.byte_len();
+      let ext_klen = 2 + klen;
+      ext.push(0);
+      ext.push(ext_key_share());
+      ext.push(ext_klen / 256);
+      ext.push(ext_klen % 256);
+      ext.push(klen / 256);
+      ext.push(klen % 256);
+      ext.push(0);
+      ext.push(group_x25519());
+      ext.push(kb.byte_len() / 256);
+      ext.push(kb.byte_len() % 256);
+      ext.extend(&kb);
+    }
+    None => {}
+  }
+
+  // ALPN
+  if !alpn_protos.is_empty() {
+    let mut alpn_payload = Bytes.new();
+    let mut ai = 0;
+    while ai < alpn_protos.len() {
+      match alpn_protos.get(ai) {
+        Some(proto_str) => {
+          let pb = proto_str.as_bytes();
+          alpn_payload.push(pb.byte_len());
+          alpn_payload.extend(&pb);
+        }
+        None => {}
+      }
+      ai = ai + 1;
+    }
+    let ext_alen = 2 + alpn_payload.byte_len();
+    ext.push(0);
+    ext.push(ext_alpn());
+    ext.push(ext_alen / 256);
+    ext.push(ext_alen % 256);
+    ext.push(alpn_payload.byte_len() / 256);
+    ext.push(alpn_payload.byte_len() % 256);
+    ext.extend(&alpn_payload);
+  }
+
+  payload.push(ext.byte_len() / 256);
+  payload.push(ext.byte_len() % 256);
+  payload.extend(&ext);
+
+  let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+  msg.push(1);
+  let plen = payload.byte_len();
+  msg.push(plen / 65536);
+  msg.push(plen / 256 % 256);
+  msg.push(plen % 256);
+  msg.extend(&payload);
+  return msg;
+}
+
+fn test_live_1rtt_handshake() -> Int
+  intent "エンドツーエンド 1-RTT ハンドシェイクの完全実行試験"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  if records.len() != 3 {
+                    return 305;
+                  }
+                  let sh_rec = get_record(&records, 0);
+                  let ccs_rec = get_record(&records, 1);
+                  let sealed_rec = get_record(&records, 2);
+
+                  let sh_ok = parse_record_header(&sh_rec, false).is_ok();
+                  let ccs_ok = parse_record_header(&ccs_rec, false).is_ok();
+                  let sealed_ok = parse_record_header(&sealed_rec, true).is_ok();
+                  if !sh_ok || !ccs_ok || !sealed_ok {
+                    return 309;
+                  }
+
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+                  if shared_secret.byte_len() != 32 {
+                    return 317;
+                  }
+
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                  let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                  let pt = open_record_pt(&mut client_rx_hs, &sealed_rec);
+                  if pt.byte_len() == 0 {
+                    return 318;
+                  }
+                  client_transcript.extend(&pt);
+
+                  let s_fin_len = 36;
+                  let s_fin_vd = slice_bytes(&pt, pt.byte_len() - 32, pt.byte_len());
+                  let part_before_fin = slice_bytes(&client_transcript, 0, client_transcript.byte_len() - s_fin_len);
+                  let th_before_fin = transcript_hash_for_suite(&suite, &part_before_fin);
+                  let exp_s_fin_vd = finished_verify_data(&suite, &s_hs_sec, &th_before_fin);
+                  if !bytes_eq(&s_fin_vd, &exp_s_fin_vd) {
+                    return 321;
+                  }
+
+                  let c_ccs_rec = build_ccs_record();
+                  match handle_client_record(&mut session, &c_ccs_rec) {
+                    Ok(None) => {}
+                    _ => {
+                      return 322;
+                    }
+                  }
+
+                  let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                  let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+                  let c_fin_rec = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &c_fin_msg, 0);
+
+                  match handle_client_record(&mut session, &c_fin_rec) {
+                    Ok(None) => {}
+                    _ => {
+                      return 324;
+                    }
+                  }
+
+                  match handshake_phase(&session) {
+                    HandshakePhase.Connected => {}
+                    _ => {
+                      return 325;
+                    }
+                  }
+
+                  client_transcript.extend(&c_fin_msg);
+                  let ms_sec = master_secret(&suite, &hs_sec);
+                  let exp_c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+                  let exp_s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+
+                  let c_sec = handshake_client_app_sec(&session);
+                  let s_sec = handshake_server_app_sec(&session);
+                  if !bytes_eq(&c_sec, &exp_c_ap_sec) {
+                    return 326;
+                  }
+                  if !bytes_eq(&s_sec, &exp_s_ap_sec) {
+                    return 327;
+                  }
+
+                  let mut client_app_tx = new_record_protection(RecordDirection.Transmit, suite.clone(), exp_c_ap_sec.clone());
+                  let mut client_app_rx = new_record_protection(RecordDirection.Receive, suite.clone(), exp_s_ap_sec.clone());
+
+                  match handshake_server_app_protection(&session) {
+                    Some(s_app_tx) => {
+                      let mut server_tx = s_app_tx;
+                      match handshake_client_app_protection(&session) {
+                        Some(s_app_rx) => {
+                          let mut server_rx = s_app_rx;
+                          let c_http_req = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".as_bytes();
+                          let c_app_record = seal_record_bytes(&mut client_app_tx, &ContentType.ApplicationData, &c_http_req, 0);
+                          let s_pt = open_record_pt(&mut server_rx, &c_app_record);
+                          if !bytes_eq(&s_pt, &c_http_req) {
+                            return 332;
+                          }
+
+                          let s_http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".as_bytes();
+                          let s_app_record = seal_record_bytes(&mut server_tx, &ContentType.ApplicationData, &s_http_resp, 0);
+                          let c_pt = open_record_pt(&mut client_app_rx, &s_app_record);
+                          if !bytes_eq(&c_pt, &s_http_resp) {
+                            return 335;
+                          }
+
+                          return 0;
+                        }
+                        None => {
+                          return 329;
+                        }
+                      }
+                    }
+                    None => {
+                      return 328;
+                    }
+                  }
+                }
+                Err(_) => {
+                  return 304;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_live_hrr_handshake() -> Int
+  intent "エンドツーエンド HelloRetryRequest ハンドシェイクの完全実行試験"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_test_session(&ecdsa_priv);
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+
+              let ch1_msg = build_client_hello_custom(true, ciphers, sigs, groups, None, alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch1_msg, &server_rand, &server_priv) {
+                Ok(hrr_flight) => {
+                  let hrr_records = flight_records(&hrr_flight);
+                  if hrr_records.len() != 2 {
+                    return 403;
+                  }
+
+                  match handshake_phase(&session) {
+                    HandshakePhase.WaitingClientHello2 => {}
+                    _ => {
+                      return 404;
+                    }
+                  }
+
+                  let client_pub = x25519_public_key(&client_priv);
+                  let client_pub_bytes = client_pub.as_bytes();
+
+                  let mut ciphers2 = List.new();
+                  ciphers2.push(4865);
+                  let mut sigs2 = List.new();
+                  sigs2.push(1027);
+                  let mut groups2 = List.new();
+                  groups2.push(29);
+                  let mut alpn2 = List.new();
+                  alpn2.push("http/1.1");
+
+                  let ch2_msg = build_client_hello_custom(true, ciphers2, sigs2, groups2, Some(client_pub_bytes.clone()), alpn2, None);
+
+                  match handle_client_hello2_explicit(&mut session, &ch2_msg, &server_rand, &server_priv) {
+                    Ok(flight2) => {
+                      let records2 = flight_records(&flight2);
+                      if records2.len() != 3 {
+                        return 407;
+                      }
+
+                      match handshake_phase(&session) {
+                        HandshakePhase.WaitingFinished => {}
+                        _ => {
+                          return 408;
+                        }
+                      }
+
+                      let sh_rec = get_record(&records2, 0);
+                      let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                      let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                      let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+
+                      let suite = CipherSuite.TlsAes128GcmSha256;
+                      let early_sec = early_secret(&suite);
+                      let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                      let ch1_hash = transcript_hash_for_suite(&suite, &ch1_msg);
+                      let mut synth = Bytes.new();
+                      synth.push(254);
+                      synth.push(0);
+                      synth.push(0);
+                      synth.push(32);
+                      synth.extend(&ch1_hash);
+
+                      let hrr_rec = get_record(&hrr_records, 0);
+                      let hrr_msg_raw = slice_bytes(&hrr_rec, 5, hrr_rec.byte_len());
+
+                      let mut client_transcript = Bytes.new();
+                      client_transcript.extend(&synth);
+                      client_transcript.extend(&hrr_msg_raw);
+                      client_transcript.extend(&ch2_msg);
+                      client_transcript.extend(&sh_msg_raw);
+
+                      let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                      let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                      let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                      let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                      let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                      let sealed_rec = get_record(&records2, 2);
+                      let pt = open_record_pt(&mut client_rx_hs, &sealed_rec);
+                      if pt.byte_len() == 0 {
+                        return 417;
+                      }
+                      client_transcript.extend(&pt);
+
+                      let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                      let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+                      let c_fin_rec = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &c_fin_msg, 0);
+
+                      match handle_client_record(&mut session, &c_fin_rec) {
+                        Ok(None) => {}
+                        _ => {
+                          return 419;
+                        }
+                      }
+
+                      return match handshake_phase(&session) {
+                        HandshakePhase.Connected => 0,
+                        _ => 420,
+                      };
+                    }
+                    Err(_) => {
+                      return 406;
+                    }
+                  }
+                }
+                Err(_) => {
+                  return 402;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_handshake_rule_negatives() -> Int
+  intent "ADR 0063 決定 1.2 規則に基づく異常系網羅試験"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+          let client_pub = hex_decode("99381de560e4bd43d23d8e435a7dbafeb3c06e510de16335ec4f41208c29d395");
+
+          // 1. supported_versions に 0x0304 なし -> ProtocolVersion
+          let mut s1 = new_test_session(&ecdsa_priv);
+          let mut ciphers1 = List.new();
+          ciphers1.push(4865);
+          let mut sigs1 = List.new();
+          sigs1.push(1027);
+          let mut groups1 = List.new();
+          groups1.push(29);
+          let mut alpn1 = List.new();
+          alpn1.push("http/1.1");
+          let ch1 = build_client_hello_custom(false, ciphers1, sigs1, groups1, Some(client_pub.clone()), alpn1, None);
+          let res1 = handle_client_hello_explicit(&mut s1, &ch1, &server_rand, &server_priv);
+          match res1 {
+            Err(ShieldError.Fatal(AlertDescription.ProtocolVersion)) => {}
+            _ => {
+              return 501;
+            }
+          }
+
+          // 2. 一致する暗号スイートなし -> HandshakeFailure
+          let mut s2 = new_test_session(&ecdsa_priv);
+          let mut ciphers2 = List.new();
+          ciphers2.push(47);  // 0x002f (TLS_RSA_WITH_AES_128_CBC_SHA)
+          let mut sigs2 = List.new();
+          sigs2.push(1027);
+          let mut groups2 = List.new();
+          groups2.push(29);
+          let mut alpn2 = List.new();
+          alpn2.push("http/1.1");
+          let ch2 = build_client_hello_custom(true, ciphers2, sigs2, groups2, Some(client_pub.clone()), alpn2, None);
+          let res2 = handle_client_hello_explicit(&mut s2, &ch2, &server_rand, &server_priv);
+          match res2 {
+            Err(ShieldError.Fatal(AlertDescription.HandshakeFailure)) => {}
+            _ => {
+              return 502;
+            }
+          }
+
+          // 3. signature_algorithms に ecdsa_secp256r1_sha256 なし -> HandshakeFailure
+          let mut s3 = new_test_session(&ecdsa_priv);
+          let mut ciphers3 = List.new();
+          ciphers3.push(4865);
+          let mut sigs3 = List.new();
+          sigs3.push(1026);  // 0x0402
+          let mut groups3 = List.new();
+          groups3.push(29);
+          let mut alpn3 = List.new();
+          alpn3.push("http/1.1");
+          let ch3 = build_client_hello_custom(true, ciphers3, sigs3, groups3, Some(client_pub.clone()), alpn3, None);
+          let res3 = handle_client_hello_explicit(&mut s3, &ch3, &server_rand, &server_priv);
+          match res3 {
+            Err(ShieldError.Fatal(AlertDescription.HandshakeFailure)) => {}
+            _ => {
+              return 503;
+            }
+          }
+
+          // 4. supported_groups に x25519 なし -> HandshakeFailure
+          let mut s4 = new_test_session(&ecdsa_priv);
+          let mut ciphers4 = List.new();
+          ciphers4.push(4865);
+          let mut sigs4 = List.new();
+          sigs4.push(1027);
+          let mut groups4 = List.new();
+          groups4.push(23);  // secp256r1 only
+          let mut alpn4 = List.new();
+          alpn4.push("http/1.1");
+          let ch4 = build_client_hello_custom(true, ciphers4, sigs4, groups4, Some(client_pub.clone()), alpn4, None);
+          let res4 = handle_client_hello_explicit(&mut s4, &ch4, &server_rand, &server_priv);
+          match res4 {
+            Err(ShieldError.Fatal(AlertDescription.HandshakeFailure)) => {}
+            _ => {
+              return 504;
+            }
+          }
+
+          // 5. ALPN 提示ありで http/1.1 なし -> NoApplicationProtocol
+          let mut s5 = new_test_session(&ecdsa_priv);
+          let mut ciphers5 = List.new();
+          ciphers5.push(4865);
+          let mut sigs5 = List.new();
+          sigs5.push(1027);
+          let mut groups5 = List.new();
+          groups5.push(29);
+          let mut alpn5 = List.new();
+          alpn5.push("h2");  // HTTP/2 only
+          let ch5 = build_client_hello_custom(true, ciphers5, sigs5, groups5, Some(client_pub.clone()), alpn5, None);
+          let res5 = handle_client_hello_explicit(&mut s5, &ch5, &server_rand, &server_priv);
+          match res5 {
+            Err(ShieldError.Fatal(AlertDescription.NoApplicationProtocol)) => {}
+            _ => {
+              return 505;
+            }
+          }
+
+          // 6. HRR 後の ClientHello2 で ClientHello1 からパラメータ変更 -> IllegalParameter
+          let mut s6 = new_test_session(&ecdsa_priv);
+          let mut ciphers6 = List.new();
+          ciphers6.push(4865);
+          let mut sigs6 = List.new();
+          sigs6.push(1027);
+          let mut groups6 = List.new();
+          groups6.push(29);
+          let mut alpn6 = List.new();
+          alpn6.push("http/1.1");
+          let ch6_1 = build_client_hello_custom(true, ciphers6, sigs6, groups6, None, alpn6, None);
+          let res6_1 = handle_client_hello_explicit(&mut s6, &ch6_1, &server_rand, &server_priv);
+          if res6_1.is_err() {
+            return 520;
+          }
+
+          let mut ciphers6_2 = List.new();
+          ciphers6_2.push(4865);
+          let mut sigs6_2 = List.new();
+          sigs6_2.push(1027);
+          let mut groups6_2 = List.new();
+          groups6_2.push(29);
+          let mut alpn6_2 = List.new();
+          alpn6_2.push("http/1.1");
+          let wrong_rand = hex_decode("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+          let ch6_2 = build_client_hello_custom(true, ciphers6_2, sigs6_2, groups6_2, Some(client_pub.clone()), alpn6_2, Some(wrong_rand));
+          let res6 = handle_client_hello2_explicit(&mut s6, &ch6_2, &server_rand, &server_priv);
+          match res6 {
+            Err(ShieldError.Fatal(AlertDescription.IllegalParameter)) => {}
+            _ => {
+              return 506;
+            }
+          }
+
+          // 7. HRR 後の ClientHello2 で x25519 key_share を含まない -> IllegalParameter
+          let mut s7 = new_test_session(&ecdsa_priv);
+          let mut ciphers7 = List.new();
+          ciphers7.push(4865);
+          let mut sigs7 = List.new();
+          sigs7.push(1027);
+          let mut groups7 = List.new();
+          groups7.push(29);
+          let mut alpn7 = List.new();
+          alpn7.push("http/1.1");
+          let ch7_1 = build_client_hello_custom(true, ciphers7, sigs7, groups7, None, alpn7, None);
+          let res7_1 = handle_client_hello_explicit(&mut s7, &ch7_1, &server_rand, &server_priv);
+          if res7_1.is_err() {
+            return 521;
+          }
+
+          let mut ciphers7_2 = List.new();
+          ciphers7_2.push(4865);
+          let mut sigs7_2 = List.new();
+          sigs7_2.push(1027);
+          let mut groups7_2 = List.new();
+          groups7_2.push(29);
+          let mut alpn7_2 = List.new();
+          alpn7_2.push("http/1.1");
+          let ch7_2 = build_client_hello_custom(true, ciphers7_2, sigs7_2, groups7_2, None, alpn7_2, None);
+          let res7 = handle_client_hello2_explicit(&mut s7, &ch7_2, &server_rand, &server_priv);
+          match res7 {
+            Err(ShieldError.Fatal(AlertDescription.IllegalParameter)) => {}
+            _ => {
+              return 507;
+            }
+          }
+
+          // 7.1 HRR 後の ClientHello2 で不正な形式 (パース失敗) -> DecodeError で Failed に遷移し、後続の有効な ClientHello2 も拒絶されること (P2 指摘対応)
+          let mut s7_1 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s7_1, &ch7_1, &server_rand, &server_priv);
+          let mut malformed_ch2 = Bytes.new();
+          malformed_ch2.push(1);
+          malformed_ch2.push(0);
+          malformed_ch2.push(0);
+          malformed_ch2.push(10);
+          malformed_ch2.push(3);
+          let res7_1_mal = handle_client_hello2_explicit(&mut s7_1, &malformed_ch2, &server_rand, &server_priv);
+          match res7_1_mal {
+            Err(ShieldError.Fatal(AlertDescription.DecodeError)) => {}
+            _ => {
+              return 536;
+            }
+          }
+          match handshake_phase(&s7_1) {
+            HandshakePhase.Failed(AlertDescription.DecodeError) => {}
+            _ => {
+              return 537;
+            }
+          }
+          let mut ciphers7_v = List.new();
+          ciphers7_v.push(4865);
+          let mut sigs7_v = List.new();
+          sigs7_v.push(1027);
+          let mut groups7_v = List.new();
+          groups7_v.push(29);
+          let mut alpn7_v = List.new();
+          alpn7_v.push("http/1.1");
+          let valid_ch2 = build_client_hello_custom(true, ciphers7_v, sigs7_v, groups7_v, Some(client_pub.clone()), alpn7_v, None);
+          let res7_1_retry = handle_client_hello2_explicit(&mut s7_1, &valid_ch2, &server_rand, &server_priv);
+          match res7_1_retry {
+            Err(ShieldError.Fatal(AlertDescription.DecodeError)) => {}
+            _ => {
+              return 538;
+            }
+          }
+          match handshake_phase(&s7_1) {
+            HandshakePhase.Failed(AlertDescription.DecodeError) => {}
+            _ => {
+              return 539;
+            }
+          }
+
+          // 8. 重複 ChangeCipherSpec -> UnexpectedMessage
+          let mut s8 = new_test_session(&ecdsa_priv);
+          let mut ciphers8 = List.new();
+          ciphers8.push(4865);
+          let mut sigs8 = List.new();
+          sigs8.push(1027);
+          let mut groups8 = List.new();
+          groups8.push(29);
+          let mut alpn8 = List.new();
+          alpn8.push("http/1.1");
+          let ch8 = build_client_hello_custom(true, ciphers8, sigs8, groups8, Some(client_pub.clone()), alpn8, None);
+          let res8_ch = handle_client_hello_explicit(&mut s8, &ch8, &server_rand, &server_priv);
+          if res8_ch.is_err() {
+            return 522;
+          }
+
+          let ccs_rec = build_ccs_record();
+          let res8_1 = handle_client_record(&mut s8, &ccs_rec);
+          match res8_1 {
+            Ok(None) => {}
+            _ => {
+              return 508;
+            }
+          }
+          let res8_2 = handle_client_record(&mut s8, &ccs_rec);
+          match res8_2 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 509;
+            }
+          }
+
+          // 8.1 不正な CCS ペイロード長 (0 バイト) -> UnexpectedMessage
+          let mut s8_inv1 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s8_inv1, &ch8, &server_rand, &server_priv);
+          let inv_ccs_len0 = wrap_in_record(20, 771, &Bytes.new());
+          let res8_inv1 = handle_client_record(&mut s8_inv1, &inv_ccs_len0);
+          match res8_inv1 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 530;
+            }
+          }
+          match handshake_phase(&s8_inv1) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 531;
+            }
+          }
+
+          // 8.2 不正な CCS ペイロード長 (2 バイト 0x01, 0x01) -> UnexpectedMessage
+          let mut s8_inv2 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s8_inv2, &ch8, &server_rand, &server_priv);
+          let mut two_bytes = Bytes.new();
+          two_bytes.push(1);
+          two_bytes.push(1);
+          let inv_ccs_len2 = wrap_in_record(20, 771, &two_bytes);
+          let res8_inv2 = handle_client_record(&mut s8_inv2, &inv_ccs_len2);
+          match res8_inv2 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 532;
+            }
+          }
+          match handshake_phase(&s8_inv2) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 533;
+            }
+          }
+
+          // 8.3 不正な CCS ペイロード値 (1 バイト 0x02) -> UnexpectedMessage
+          let mut s8_inv3 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s8_inv3, &ch8, &server_rand, &server_priv);
+          let mut wrong_val = Bytes.new();
+          wrong_val.push(2);
+          let inv_ccs_val = wrap_in_record(20, 771, &wrong_val);
+          let res8_inv3 = handle_client_record(&mut s8_inv3, &inv_ccs_val);
+          match res8_inv3 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 534;
+            }
+          }
+          match handshake_phase(&s8_inv3) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 535;
+            }
+          }
+
+          // 9. 不正フェーズでのレコード (WaitingClientHello での ApplicationData) -> UnexpectedMessage
+          let mut s9 = new_test_session(&ecdsa_priv);
+          let early_data_record = wrap_in_record(23, 771, &"0-RTT early data".as_bytes());
+          let res9 = handle_client_record(&mut s9, &early_data_record);
+          match res9 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 510;
+            }
+          }
+
+          // 10.1 WaitingFinished フェーズでの初期 ClientHello -> UnexpectedMessage (P2 指摘対応)
+          let mut s10_1 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s10_1, &ch8, &server_rand, &server_priv);
+          let res10_1 = handle_client_hello_explicit(&mut s10_1, &ch8, &server_rand, &server_priv);
+          match res10_1 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 540;
+            }
+          }
+          match handshake_phase(&s10_1) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 541;
+            }
+          }
+
+          // 10.2 WaitingClientHello2 フェーズでの初期 ClientHello -> UnexpectedMessage (P2 指摘対応)
+          let mut s10_2 = new_test_session(&ecdsa_priv);
+          let mut ciphers10 = List.new();
+          ciphers10.push(4865);
+          let mut sigs10 = List.new();
+          sigs10.push(1027);
+          let mut groups10 = List.new();
+          groups10.push(29);
+          let mut alpn10 = List.new();
+          alpn10.push("http/1.1");
+          let ch10_no_share = build_client_hello_custom(true, ciphers10, sigs10, groups10, None, alpn10, None);
+          let _ = handle_client_hello_explicit(&mut s10_2, &ch10_no_share, &server_rand, &server_priv);
+          // HRR 送信済み (WaitingClientHello2)
+          let res10_2 = handle_client_hello_explicit(&mut s10_2, &ch8, &server_rand, &server_priv);
+          match res10_2 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 542;
+            }
+          }
+          match handshake_phase(&s10_2) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 543;
+            }
+          }
+
+          return 0;
+        }
+        Err(_) => {
+          return 500;
+        }
+      }
+    }
+    Err(_) => {
+      return 500;
+    }
+  }
+}
+
+fn test_oversized_server_flight_fragmentation() -> Int
+  intent "16,384 バイト超のサーバーフライトが複数レコードに分割封印される試験 (P2 指摘対応)"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_oversized_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  // SH (0), CCS (1), sealed frag 1 (2), sealed frag 2 (3) で計 4 レコード
+                  if records.len() != 4 {
+                    return 601;
+                  }
+
+                  let sh_rec = get_record(&records, 0);
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+
+                  let sealed_frag1 = get_record(&records, 2);
+                  let sealed_frag2 = get_record(&records, 3);
+
+                  let pt1 = open_record_pt(&mut client_rx_hs, &sealed_frag1);
+                  if pt1.byte_len() != 16384 {
+                    return 602;
+                  }
+
+                  let pt2 = open_record_pt(&mut client_rx_hs, &sealed_frag2);
+                  if pt2.byte_len() == 0 {
+                    return 603;
+                  }
+
+                  // 合計サイズが 18,000 バイト超（証明書 18,000 + その他）
+                  if pt1.byte_len() + pt2.byte_len() <= 18000 {
+                    return 604;
+                  }
+
+                  return 0;
+                }
+                Err(_) => {
+                  return 600;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_client_finished_reassembly_across_records() -> Int
+  intent "Client Finished が複数保護レコードに分割された場合の再組み立て試験 (P2 指摘対応)"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  let sh_rec = get_record(&records, 0);
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let enc_flight_rec = get_record(&records, 2);
+
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                  let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                  let pt = open_record_pt(&mut client_rx_hs, &enc_flight_rec);
+                  if pt.byte_len() == 0 {
+                    return 701;
+                  }
+                  client_transcript.extend(&pt);
+
+                  // CCS 送信
+                  let c_ccs_rec = build_ccs_record();
+                  match handle_client_record(&mut session, &c_ccs_rec) {
+                    Ok(None) => {}
+                    _ => {
+                      return 702;
+                    }
+                  }
+
+                  // Client Finished (36 バイト) を構築
+                  let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                  let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+
+                  // 3 分割テスト:
+                  // 断片 1: 2 バイト (ヘッダ途中)
+                  // 断片 2: 12 バイト (ヘッダ残り + verify_data 一部)
+                  // 断片 3: 22 バイト (verify_data 残り)
+                  let frag1 = slice_bytes(&c_fin_msg, 0, 2);
+                  let frag2 = slice_bytes(&c_fin_msg, 2, 14);
+                  let frag3 = slice_bytes(&c_fin_msg, 14, 36);
+
+                  let rec1 = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &frag1, 0);
+                  let rec2 = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &frag2, 0);
+                  let rec3 = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &frag3, 0);
+
+                  // 断片 1 投入 -> まだ WaitingFinished
+                  match handle_client_record(&mut session, &rec1) {
+                    Ok(None) => {}
+                    _ => {
+                      return 703;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.WaitingFinished => {}
+                    _ => {
+                      return 704;
+                    }
+                  }
+
+                  // 断片 2 投入 -> まだ WaitingFinished
+                  match handle_client_record(&mut session, &rec2) {
+                    Ok(None) => {}
+                    _ => {
+                      return 705;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.WaitingFinished => {}
+                    _ => {
+                      return 706;
+                    }
+                  }
+
+                  // 断片 3 投入 -> Connected へ遷移！
+                  match handle_client_record(&mut session, &rec3) {
+                    Ok(None) => {}
+                    _ => {
+                      return 707;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.Connected => {}
+                    _ => {
+                      return 708;
+                    }
+                  }
+
+                  // 接続後のアプリケーションデータ疎通確認
+                  let ms_sec = master_secret(&suite, &hs_sec);
+                  let exp_c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+                  let exp_s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+
+                  let mut client_app_tx = new_record_protection(RecordDirection.Transmit, suite.clone(), exp_c_ap_sec.clone());
+                  let mut client_app_rx = new_record_protection(RecordDirection.Receive, suite.clone(), exp_s_ap_sec.clone());
+
+                  match handshake_client_app_protection(&session) {
+                    Some(s_app_rx) => {
+                      let mut server_rx = s_app_rx;
+                      let req = "POST /api HTTP/1.1\r\n\r\n".as_bytes();
+                      let c_rec = seal_record_bytes(&mut client_app_tx, &ContentType.ApplicationData, &req, 0);
+                      let s_pt = open_record_pt(&mut server_rx, &c_rec);
+                      if !bytes_eq(&s_pt, &req) {
+                        return 709;
+                      }
+                    }
+                    None => {
+                      return 710;
+                    }
+                  }
+
+                  return 0;
+                }
+                Err(_) => {
+                  return 700;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_client_finished_auth_failure_poison_and_failed() -> Int
+  intent "Client Finished レコードの認証失敗時に保護コンテキストが汚染保持されセッションが Failed に遷移する試験 (P2 指摘対応)"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  let sh_rec = get_record(&records, 0);
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                  let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                  let sealed_rec = get_record(&records, 2);
+                  let pt = open_record_pt(&mut client_rx_hs, &sealed_rec);
+                  client_transcript.extend(&pt);
+
+                  let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                  let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+                  let c_fin_rec = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &c_fin_msg, 0);
+
+                  // 暗号文レコードの末尾バイト（認証タグ）を改ざん
+                  let mut tampered_rec = c_fin_rec.clone();
+                  let last_idx = tampered_rec.byte_len() - 1;
+                  let cur_b = tampered_rec.get(last_idx).unwrap_or(0);
+                  let _ = tampered_rec.set(last_idx, cur_b ^ 1);
+
+                  // 改ざんレコードの受信 -> BadRecordMac で拒絶
+                  let res = handle_client_record(&mut session, &tampered_rec);
+                  match res {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 801;
+                    }
+                  }
+
+                  // セッション状態が Failed(BadRecordMac) に遷移していること
+                  match handshake_phase(&session) {
+                    HandshakePhase.Failed(AlertDescription.BadRecordMac) => {}
+                    _ => {
+                      return 802;
+                    }
+                  }
+
+                  // 失敗したクライアント保護状態が破棄されず、poison された状態で保持されていること
+                  match handshake_client_hs_protection(&session) {
+                    Some(c_prot) => {
+                      if !record_protection_is_poisoned(&c_prot) {
+                        return 803;
+                      }
+                    }
+                    None => {
+                      return 804;
+                    }
+                  }
+
+                  // 失敗済みセッションへの後続レコード投入が即座に Failed で拒絶されること
+                  let res2 = handle_client_record(&mut session, &c_fin_rec);
+                  match res2 {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 805;
+                    }
+                  }
+
+                  // 致命的失敗後に有効な ClientHello を投入しても拒絶され、汚染保護コンテキストや Failed 状態が維持されること (P2 指摘対応)
+                  let res3 = handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv);
+                  match res3 {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 806;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.Failed(AlertDescription.BadRecordMac) => {}
+                    _ => {
+                      return 807;
+                    }
+                  }
+                  match handshake_client_hs_protection(&session) {
+                    Some(c_prot) => {
+                      if !record_protection_is_poisoned(&c_prot) {
+                        return 808;
+                      }
+                    }
+                    None => {
+                      return 809;
+                    }
+                  }
+
+                  // 失敗済みセッションへの handle_client_hello2_explicit も BadRecordMac で拒絶されること
+                  let res4 = handle_client_hello2_explicit(&mut session, &ch_msg, &server_rand, &server_priv);
+                  match res4 {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 810;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.Failed(AlertDescription.BadRecordMac) => {}
+                    _ => {
+                      return 811;
+                    }
+                  }
+
+                  return 0;
+                }
+                Err(_) => {
+                  return 800;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+pub fn main() -> Int
+  intent "Stage 3 ハンドシェイク状態機械の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  let r1 = test_rfc8448_section3_trace();
+  if r1 != 0 {
+    return r1;
+  }
+
+  let r2 = test_rfc8448_section5_hrr_trace();
+  if r2 != 0 {
+    return r2;
+  }
+
+  let r3 = test_live_1rtt_handshake();
+  if r3 != 0 {
+    return r3;
+  }
+
+  let r4 = test_live_hrr_handshake();
+  if r4 != 0 {
+    return r4;
+  }
+
+  let r5 = test_handshake_rule_negatives();
+  if r5 != 0 {
+    return r5;
+  }
+
+  let r6 = test_oversized_server_flight_fragmentation();
+  if r6 != 0 {
+    return r6;
+  }
+
+  let r7 = test_client_finished_reassembly_across_records();
+  if r7 != 0 {
+    return r7;
+  }
+
+  let r8 = test_client_finished_auth_failure_poison_and_failed();
+  if r8 != 0 {
+    return r8;
+  }
+
+  return 0;
+}
