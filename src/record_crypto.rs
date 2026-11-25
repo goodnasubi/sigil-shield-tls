@@ -4,7 +4,7 @@
 //! - Nonce の構成 (12 バイト IV と 64 ビットシーケンス番号の XOR)
 //! - レコード暗号化 (5 バイトヘッダ AAD、内部平文構築、末尾パディング対応)
 //! - レコード復号と検査:
-//!   - 平文断片 2^14 (16,384) バイト以下、暗号文 2^14 + 256 (16,640) バイト以下
+//!   - 内部平文 2^14 + 1 (16,385) バイト以下、平文断片 2^14 (16,384) バイト以下、暗号文 2^14 + 256 (16,640) バイト以下
 //!   - 内部平文が全ゼロなら unexpected_message
 //!   - AEAD 認証失敗時は bad_record_mac で即座に終了し読み続けない (poisoning)
 
@@ -82,7 +82,20 @@ impl RecordProtection {
         }
 
         // TLSInnerPlaintext の構築: content || type || zeros(padding_len)
-        let inner_len = plaintext.len() + 1 + padding_len;
+        let inner_len = match plaintext
+            .len()
+            .checked_add(1)
+            .and_then(|l| l.checked_add(padding_len))
+        {
+            Some(len) => len,
+            None => return Err(ShieldError::Fatal(AlertDescription::DecodeError)),
+        };
+
+        // RFC 8446 §5.4: TLSInnerPlaintext の長さは 2^14 + 1 バイト以下
+        if inner_len > MAX_PLAIN_RECORD_PAYLOAD + 1 {
+            return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+        }
+
         let encrypted_len = inner_len + self.suite.tag_len();
 
         if encrypted_len > MAX_ENCRYPTED_RECORD_PAYLOAD {
@@ -164,6 +177,11 @@ impl RecordProtection {
                 return Err(e);
             }
         };
+
+        // 内部平文長検査 (RFC 8446 §5.4: TLSInnerPlaintext の長さは 2^14 + 1 バイト以下)
+        if inner_plaintext.len() > MAX_PLAIN_RECORD_PAYLOAD + 1 {
+            return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+        }
 
         // 内部平文のパース: 末尾の 0 パディングを除去し最後の非ゼロバイトを種別とする
         let last_nonzero = inner_plaintext.iter().rposition(|&b| b != 0);

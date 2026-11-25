@@ -130,8 +130,10 @@ fn test_record_protection_roundtrip_all_suites() {
 
         for payload in &test_payloads {
             for &pad in &paddings {
-                // パディングを付加した暗号化後の長さが上限を超えない範囲で試験
-                if payload.len() + 1 + pad + suite.tag_len() > MAX_ENCRYPTED_RECORD_PAYLOAD {
+                // パディングを付加した内部平文長 (RFC 8446 §5.4) および暗号化後長が上限を超えない範囲で試験
+                if payload.len() + 1 + pad > MAX_PLAIN_RECORD_PAYLOAD + 1
+                    || payload.len() + 1 + pad + suite.tag_len() > MAX_ENCRYPTED_RECORD_PAYLOAD
+                {
                     continue;
                 }
 
@@ -264,6 +266,112 @@ fn test_plain_fragment_length_boundary() {
         tx.seal_record(ContentType::ApplicationData, &over_plain, 0),
         Err(ShieldError::Fatal(AlertDescription::DecodeError))
     );
+}
+
+#[test]
+fn test_tls_inner_plaintext_length_limit_seal() {
+    let suite = CipherSuite::TlsAes128GcmSha256;
+    let ks = KeySchedule::new(suite);
+    let secret = vec![0x44u8; suite.hash_len()];
+    let mut tx = RecordProtection::new(RecordDirection::Transmit, suite, secret, &ks);
+
+    // 16,384 バイト平文 + パディング 0 バイト = inner_len 16,385 (2^14 + 1) は成功
+    let max_plain = vec![0x42u8; MAX_PLAIN_RECORD_PAYLOAD];
+    assert!(tx
+        .seal_record(ContentType::ApplicationData, &max_plain, 0)
+        .is_ok());
+
+    // 16,384 バイト平文 + パディング 1 バイト = inner_len 16,386 (> 2^14 + 1) は DecodeError
+    assert_eq!(
+        tx.seal_record(ContentType::ApplicationData, &max_plain, 1),
+        Err(ShieldError::Fatal(AlertDescription::DecodeError))
+    );
+
+    // Codex 指摘の再現ケース: 16,384 バイト平文 + パディング 64 バイト (暗号文長は 16,640 以下でも拒否)
+    assert_eq!(
+        tx.seal_record(ContentType::ApplicationData, &max_plain, 64),
+        Err(ShieldError::Fatal(AlertDescription::DecodeError))
+    );
+
+    // 16,383 バイト平文 + パディング 1 バイト = inner_len 16,385 は成功
+    let plain_16383 = vec![0x43u8; MAX_PLAIN_RECORD_PAYLOAD - 1];
+    assert!(tx
+        .seal_record(ContentType::ApplicationData, &plain_16383, 1)
+        .is_ok());
+
+    // 16,383 バイト平文 + パディング 2 バイト = inner_len 16,386 は DecodeError
+    assert_eq!(
+        tx.seal_record(ContentType::ApplicationData, &plain_16383, 2),
+        Err(ShieldError::Fatal(AlertDescription::DecodeError))
+    );
+}
+
+#[test]
+fn test_tls_inner_plaintext_length_limit_open() {
+    let suite = CipherSuite::TlsChacha20Poly1305Sha256;
+    let ks = KeySchedule::new(suite);
+    let secret = vec![0x55u8; suite.hash_len()];
+    let mut rx = RecordProtection::new(RecordDirection::Receive, suite, secret, &ks);
+
+    // 適合ピア上限 (inner_len = 16,385 バイト) のレコードを正しく復号できること
+    // 例: 16,383 バイト平文 + 1 バイト種別 + 1 バイトパディング
+    let mut valid_inner = vec![0x77u8; MAX_PLAIN_RECORD_PAYLOAD - 1];
+    valid_inner.push(ContentType::ApplicationData as u8);
+    valid_inner.push(0x00); // 1 バイトパディング
+    assert_eq!(valid_inner.len(), MAX_PLAIN_RECORD_PAYLOAD + 1);
+
+    let enc_len = valid_inner.len() + rx.suite.tag_len();
+    let aad_valid = [
+        ContentType::ApplicationData as u8,
+        0x03,
+        0x03,
+        (enc_len >> 8) as u8,
+        (enc_len & 0xff) as u8,
+    ];
+    let nonce_valid = make_nonce(&rx.iv, rx.sequence_number);
+    let ct_valid = rx
+        .suite
+        .seal(&rx.key, &nonce_valid, &aad_valid, &valid_inner)
+        .unwrap();
+
+    let mut record_valid = Vec::new();
+    record_valid.extend_from_slice(&aad_valid);
+    record_valid.extend_from_slice(&ct_valid);
+
+    let (ct, fragment, len) = rx.open_record(&record_valid).unwrap();
+    assert_eq!(ct, ContentType::ApplicationData);
+    assert_eq!(fragment.len(), MAX_PLAIN_RECORD_PAYLOAD - 1);
+    assert_eq!(len, record_valid.len());
+
+    // RFC 8446 §5.4 上限超過 (inner_len = 16,384 + 1 + 64 = 16,449 バイト > 16,385)
+    // 暗号文長は 16,465 バイトで外側暗号文上限 16,640 バイト未満だが、復号後に DecodeError となること
+    let mut oversized_inner = vec![0x88u8; MAX_PLAIN_RECORD_PAYLOAD];
+    oversized_inner.push(ContentType::ApplicationData as u8);
+    oversized_inner.resize(oversized_inner.len() + 64, 0); // 64 バイトパディング
+    assert_eq!(oversized_inner.len(), MAX_PLAIN_RECORD_PAYLOAD + 65);
+
+    let enc_len_over = oversized_inner.len() + rx.suite.tag_len();
+    let aad_over = [
+        ContentType::ApplicationData as u8,
+        0x03,
+        0x03,
+        (enc_len_over >> 8) as u8,
+        (enc_len_over & 0xff) as u8,
+    ];
+    let nonce_over = make_nonce(&rx.iv, rx.sequence_number);
+    let ct_over = rx
+        .suite
+        .seal(&rx.key, &nonce_over, &aad_over, &oversized_inner)
+        .unwrap();
+
+    let mut record_oversized = Vec::new();
+    record_oversized.extend_from_slice(&aad_over);
+    record_oversized.extend_from_slice(&ct_over);
+
+    let res = rx.open_record(&record_oversized);
+    assert_eq!(res, Err(ShieldError::Fatal(AlertDescription::DecodeError)));
+    // AEAD 認証自体は成功しているため、認証失敗によるポイズニングはされないこと
+    assert!(!rx.is_poisoned);
 }
 
 #[test]
