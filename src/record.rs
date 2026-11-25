@@ -166,6 +166,11 @@ impl HandshakeReassembler {
             let record_payload = self.stream_buf[5..full_record_len].to_vec();
             self.stream_buf.drain(..full_record_len);
 
+            // 再構成の途中に他の種別のレコードが割り込んだら unexpected_message
+            if !self.assembled_bytes.is_empty() && header.content_type != ContentType::Handshake {
+                return Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage));
+            }
+
             // 長さ 0 の application_data の検査（暗号化前でも安全のため同様に追跡）
             if header.content_type == ContentType::ApplicationData && record_len == 0 {
                 self.consecutive_empty_app_data += 1;
@@ -175,11 +180,6 @@ impl HandshakeReassembler {
                 continue;
             } else {
                 self.consecutive_empty_app_data = 0;
-            }
-
-            // 再構成の途中に他の種別のレコードが割り込んだら unexpected_message
-            if !self.assembled_bytes.is_empty() && header.content_type != ContentType::Handshake {
-                return Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage));
             }
 
             if header.content_type != ContentType::Handshake {

@@ -209,6 +209,16 @@ fn test_reassemble_interrupted_by_other_content_type() {
         res,
         Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage))
     );
+
+    // 途中に空の application_data レコードが割り込む場合も拒否されること（P2 指摘）
+    let mut reassembler2 = HandshakeReassembler::new();
+    reassembler2.feed_bytes(&rec1).unwrap();
+    let empty_app_data = wrap_in_record(0x17, 0x0303, &[]);
+    let res2 = reassembler2.feed_bytes(&empty_app_data);
+    assert_eq!(
+        res2,
+        Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage))
+    );
 }
 
 #[test]
