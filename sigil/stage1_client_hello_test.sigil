@@ -1,0 +1,787 @@
+module stage1_client_hello_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_alert.alert_description_to_u8;
+use shield_client_hello.ClientHello;
+use shield_client_hello.ServerName;
+use shield_client_hello.client_hello_alpn_protocols;
+use shield_client_hello.client_hello_cipher_suites;
+use shield_client_hello.client_hello_key_shares;
+use shield_client_hello.client_hello_legacy_compression_methods;
+use shield_client_hello.client_hello_legacy_session_id;
+use shield_client_hello.client_hello_legacy_version;
+use shield_client_hello.client_hello_random;
+use shield_client_hello.client_hello_server_name;
+use shield_client_hello.client_hello_supported_groups;
+use shield_client_hello.client_hello_supported_versions;
+use shield_client_hello.ext_key_share;
+use shield_client_hello.ext_pre_shared_key;
+use shield_client_hello.ext_server_name;
+use shield_client_hello.ext_supported_versions;
+use shield_client_hello.group_secp256r1;
+use shield_client_hello.group_x25519;
+use shield_client_hello.key_share_exchange;
+use shield_client_hello.key_share_group;
+use shield_client_hello.parse_and_validate_sni_hostname;
+use shield_client_hello.parse_client_hello;
+use test_support.build_valid_client_hello;
+
+// ClientHello 解析の試験（ADR 0063 決定 4.3）
+
+fn is_ch_fatal_error(res: &Result<ClientHello, ShieldError>, expected: AlertDescription) -> Bool
+  intent "ClientHello のパース結果が指定の致命的アラートであるか確認する"
+  requires none
+  ensures none
+  effects none
+{
+  return match res {
+    Err(e) => match e {
+      ShieldError.Fatal(desc) => alert_description_to_u8(&desc) == alert_description_to_u8(&expected),
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+}
+
+fn update_msg_len(msg: &mut Bytes)
+  intent "メッセージ先頭の 3 バイト長を実際のペイロード長で更新する"
+  requires none
+  ensures none
+  effects none
+{
+  let plen = msg.byte_len() - 4;
+  let _ = msg.set(1, plen / 65536);
+  let _ = msg.set(2, plen / 256 % 256);
+  let _ = msg.set(3, plen % 256);
+}
+
+fn test_valid_client_hello() -> Bool
+  intent "正常な ClientHello の解析を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let msg = build_valid_client_hello();
+  let res = parse_client_hello(&msg);
+  match res {
+    Ok(ch) => {
+      if client_hello_legacy_version(&ch) != 771 {
+        return false;
+      }
+      if client_hello_random(&ch).byte_len() != 32 {
+        return false;
+      }
+      if client_hello_legacy_session_id(&ch).byte_len() != 32 {
+        return false;
+      }
+      if client_hello_cipher_suites(&ch).len() != 3 {
+        return false;
+      }
+      let comp = client_hello_legacy_compression_methods(&ch);
+      if comp.byte_len() != 1 || comp.get(0).unwrap_or(1) != 0 {
+        return false;
+      }
+      let vers = client_hello_supported_versions(&ch);
+      if vers.len() != 1 || vers.get(0).map(|x| x + 0).unwrap_or(0) != 772 {
+        return false;
+      }
+      let grps = client_hello_supported_groups(&ch);
+      if grps.len() != 2 || grps.get(0).map(|x| x + 0).unwrap_or(0) != group_x25519() || grps.get(1).map(|x| x + 0).unwrap_or(0) != group_secp256r1() {
+        return false;
+      }
+      let sn_opt = client_hello_server_name(&ch);
+      match sn_opt {
+        Some(sn) => {
+          match sn {
+            ServerName.Valid(s) => {
+              if s != "example.com" {
+                return false;
+              }
+            }
+            ServerName.Invalid(_) => {
+              return false;
+            }
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+      let ks_list = client_hello_key_shares(&ch);
+      if ks_list.len() != 1 {
+        return false;
+      }
+      match ks_list.get(0) {
+        Some(ks0) => {
+          if key_share_group(&ks0) != group_x25519() || key_share_exchange(&ks0).byte_len() != 32 {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+      let alpn_list = client_hello_alpn_protocols(&ch);
+      if alpn_list.len() != 1 {
+        return false;
+      }
+      match alpn_list.get(0) {
+        Some(alpn0) => {
+          if !ct_eq(&alpn0, &"http/1.1".as_bytes()) {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  return true;
+}
+
+fn test_header_type_and_length() -> Bool
+  intent "メッセージ種別と長さの不一致・超過の検査"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 種別が 0x01 以外 -> UnexpectedMessage
+  let mut bad_type = build_valid_client_hello();
+  let _ = bad_type.set(0, 2);  // ServerHello
+  let res_bt = parse_client_hello(&bad_type);
+  if !is_ch_fatal_error(&res_bt, AlertDescription.UnexpectedMessage) {
+    return false;
+  }
+
+  // 2. 実長より小さい長さ記載（余り） -> DecodeError
+  let mut shorter = build_valid_client_hello();
+  let l0 = shorter.get(1).unwrap_or(0);
+  let l1 = shorter.get(2).unwrap_or(0);
+  let l2 = shorter.get(3).unwrap_or(0);
+  let plen = l0 * 65536 + l1 * 256 + l2;
+  let new_plen = plen - 1;
+  let _ = shorter.set(1, new_plen / 65536);
+  let _ = shorter.set(2, new_plen / 256 % 256);
+  let _ = shorter.set(3, new_plen % 256);
+  let res_sh = parse_client_hello(&shorter);
+  if !is_ch_fatal_error(&res_sh, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  // 3. 実長より大きい長さ記載（不足） -> DecodeError
+  let mut longer = build_valid_client_hello();
+  let lp = plen + 1;
+  let _ = longer.set(1, lp / 65536);
+  let _ = longer.set(2, lp / 256 % 256);
+  let _ = longer.set(3, lp % 256);
+  let res_lg = parse_client_hello(&longer);
+  if !is_ch_fatal_error(&res_lg, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  // 4. 全体長 16 KiB 超過 (16385) -> DecodeError
+  let mut huge = Bytes.with_capacity(16385);
+  huge.push(1);
+  huge.push(0);
+  huge.push(64);
+  huge.push(1);  // 16385 - 4 = 16381
+  let mut h_idx = 0;
+  while h_idx < 16381 {
+    huge.push(0);
+    h_idx = h_idx + 1;
+  }
+  let res_hg = parse_client_hello(&huge);
+  if !is_ch_fatal_error(&res_hg, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_legacy_version() -> Bool
+  intent "legacy_version の検査（0x0303 のみ、違反は illegal_parameter）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut vers = List.new();
+  vers.push(769);  // 0x0301
+  vers.push(770);  // 0x0302
+  vers.push(772);  // 0x0304
+  vers.push(512);  // 0x0200
+
+  let mut i = 0;
+  while i < vers.len() {
+    let ver = vers.get(i).map(|x| x + 0).unwrap_or(0);
+    let mut msg = build_valid_client_hello();
+    let _ = msg.set(4, ver / 256);
+    let _ = msg.set(5, ver % 256);
+    let res = parse_client_hello(&msg);
+    if !is_ch_fatal_error(&res, AlertDescription.IllegalParameter) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn test_legacy_session_id() -> Bool
+  intent "legacy_session_id の境界試験（0 バイト、32 バイト、33 バイト超過）"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 0 バイト session_id -> OK
+  let base = build_valid_client_hello();
+  let sess_len_pos = 38;  // 4 + 2 + 32
+  let mut msg0 = base.slice(0, sess_len_pos).unwrap_or(Bytes.new());
+  msg0.push(0);  // length 0
+  let rest = base.slice(sess_len_pos + 1 + 32, base.byte_len()).unwrap_or(Bytes.new());
+  msg0.extend(&rest);
+  update_msg_len(&mut msg0);
+
+  let res0 = parse_client_hello(&msg0);
+  match res0 {
+    Ok(ch) => {
+      if client_hello_legacy_session_id(&ch).byte_len() != 0 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. 33 バイト session_id -> IllegalParameter
+  let mut msg33 = base.slice(0, sess_len_pos).unwrap_or(Bytes.new());
+  msg33.push(33);
+  let mut s_idx = 0;
+  while s_idx < 33 {
+    msg33.push(17);
+    s_idx = s_idx + 1;
+  }
+  msg33.extend(&rest);
+  update_msg_len(&mut msg33);
+
+  let res33 = parse_client_hello(&msg33);
+  if !is_ch_fatal_error(&res33, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_cipher_suites() -> Bool
+  intent "cipher_suites の境界試験（2 バイト、128 バイト、130 バイト、奇数長）"
+  requires none
+  ensures none
+  effects none
+{
+  let base = build_valid_client_hello();
+  // session_id (32 bytes) の直後が cipher_suites
+  // pos: 4 + 2 + 32 + 1 + 32 = 71
+  let cs_pos = 71;
+  let before_cs = base.slice(0, cs_pos).unwrap_or(Bytes.new());
+  // base では cs_len = 6
+  let after_cs = base.slice(cs_pos + 2 + 6, base.byte_len()).unwrap_or(Bytes.new());
+
+  // 1. 奇数長 (3 バイト) -> DecodeError
+  let mut msg_odd = before_cs.clone();
+  msg_odd.push(0);
+  msg_odd.push(3);
+  msg_odd.push(19);
+  msg_odd.push(3);
+  msg_odd.push(19);
+  msg_odd.extend(&after_cs);
+  update_msg_len(&mut msg_odd);
+  let res_odd = parse_client_hello(&msg_odd);
+  if !is_ch_fatal_error(&res_odd, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  // 2. 長さ 0 -> DecodeError
+  let mut msg_0 = before_cs.clone();
+  msg_0.push(0);
+  msg_0.push(0);
+  msg_0.extend(&after_cs);
+  update_msg_len(&mut msg_0);
+  let res_0 = parse_client_hello(&msg_0);
+  if !is_ch_fatal_error(&res_0, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  // 3. 64 スイート (128 バイト = 上限一致) -> OK
+  let mut msg_128 = before_cs.clone();
+  msg_128.push(0);
+  msg_128.push(128);
+  let mut s = 0;
+  while s < 64 {
+    msg_128.push(19);
+    msg_128.push(1);
+    s = s + 1;
+  }
+  msg_128.extend(&after_cs);
+  update_msg_len(&mut msg_128);
+  let res_128 = parse_client_hello(&msg_128);
+  match res_128 {
+    Ok(ch) => {
+      if client_hello_cipher_suites(&ch).len() != 64 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 65 スイート (130 バイト = 超過) -> DecodeError
+  let mut msg_130 = before_cs.clone();
+  msg_130.push(0);
+  msg_130.push(130);
+  let mut s65 = 0;
+  while s65 < 65 {
+    msg_130.push(19);
+    msg_130.push(1);
+    s65 = s65 + 1;
+  }
+  msg_130.extend(&after_cs);
+  update_msg_len(&mut msg_130);
+  let res_130 = parse_client_hello(&msg_130);
+  if !is_ch_fatal_error(&res_130, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_compression_methods() -> Bool
+  intent "legacy_compression_methods の検査"
+  requires none
+  ensures none
+  effects none
+{
+  let base = build_valid_client_hello();
+  // cs_pos = 71, cs_len = 6 -> comp_pos = 71 + 2 + 6 = 79
+  let comp_pos = 79;
+  let before_comp = base.slice(0, comp_pos).unwrap_or(Bytes.new());
+  let after_comp = base.slice(comp_pos + 2, base.byte_len()).unwrap_or(Bytes.new());
+
+  // 1. 長さ 2 -> IllegalParameter
+  let mut msg_len2 = before_comp.clone();
+  msg_len2.push(2);
+  msg_len2.push(0);
+  msg_len2.push(0);
+  msg_len2.extend(&after_comp);
+  update_msg_len(&mut msg_len2);
+  let res_l2 = parse_client_hello(&msg_len2);
+  if !is_ch_fatal_error(&res_l2, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  // 2. 値が 0 以外 (0x01) -> IllegalParameter
+  let mut msg_val1 = before_comp.clone();
+  msg_val1.push(1);
+  msg_val1.push(1);
+  msg_val1.extend(&after_comp);
+  update_msg_len(&mut msg_val1);
+  let res_v1 = parse_client_hello(&msg_val1);
+  if !is_ch_fatal_error(&res_v1, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_extensions_rules() -> Bool
+  intent "拡張の重複拒否、PSK最後検査、拡張数上限の試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = build_valid_client_hello();
+  // extensions は comp_pos(79) + 2 = 81 から
+  let ext_pos = 81;
+  let before_ext = base.slice(0, ext_pos).unwrap_or(Bytes.new());
+  let old_ext_len = base.get(ext_pos).unwrap_or(0) * 256 + base.get(ext_pos + 1).unwrap_or(0);
+  let ext_body = base.slice(ext_pos + 2, ext_pos + 2 + old_ext_len).unwrap_or(Bytes.new());
+
+  // 1. 拡張の重複（supported_versions をもう一度追加） -> IllegalParameter
+  let mut dup_ext = ext_body.clone();
+  dup_ext.push(0);
+  dup_ext.push(ext_supported_versions());
+  dup_ext.push(0);
+  dup_ext.push(3);
+  dup_ext.push(2);
+  dup_ext.push(3);
+  dup_ext.push(4);
+
+  let mut msg_dup = before_ext.clone();
+  msg_dup.push(dup_ext.byte_len() / 256);
+  msg_dup.push(dup_ext.byte_len() % 256);
+  msg_dup.extend(&dup_ext);
+  update_msg_len(&mut msg_dup);
+
+  let res_dup = parse_client_hello(&msg_dup);
+  if !is_ch_fatal_error(&res_dup, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  // 2. pre_shared_key の後に別の拡張が出現 -> IllegalParameter
+  let mut psk_ext = Bytes.new();
+  // supported_versions
+  psk_ext.push(0);
+  psk_ext.push(ext_supported_versions());
+  psk_ext.push(0);
+  psk_ext.push(3);
+  psk_ext.push(2);
+  psk_ext.push(3);
+  psk_ext.push(4);
+  // pre_shared_key (0x0029, len = 2, dummy data)
+  psk_ext.push(0);
+  psk_ext.push(ext_pre_shared_key());
+  psk_ext.push(0);
+  psk_ext.push(2);
+  psk_ext.push(0);
+  psk_ext.push(0);
+  // server_name (PSK の後ろ)
+  psk_ext.push(0);
+  psk_ext.push(ext_server_name());
+  psk_ext.push(0);
+  psk_ext.push(0);
+
+  let mut msg_psk = before_ext.clone();
+  msg_psk.push(psk_ext.byte_len() / 256);
+  msg_psk.push(psk_ext.byte_len() % 256);
+  msg_psk.extend(&psk_ext);
+  update_msg_len(&mut msg_psk);
+
+  let res_psk = parse_client_hello(&msg_psk);
+  if !is_ch_fatal_error(&res_psk, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  // 3. 拡張 64 個（上限一致） -> OK
+  let mut ext64 = Bytes.new();
+  // 1 つ目は supported_versions
+  ext64.push(0);
+  ext64.push(ext_supported_versions());
+  ext64.push(0);
+  ext64.push(3);
+  ext64.push(2);
+  ext64.push(3);
+  ext64.push(4);
+  // 残り 63 個は未知の拡張 (1000〜1062)
+  let mut e_idx = 1000;
+  while e_idx < 1063 {
+    ext64.push(e_idx / 256);
+    ext64.push(e_idx % 256);
+    ext64.push(0);
+    ext64.push(0);
+    e_idx = e_idx + 1;
+  }
+  let mut msg64 = before_ext.clone();
+  msg64.push(ext64.byte_len() / 256);
+  msg64.push(ext64.byte_len() % 256);
+  msg64.extend(&ext64);
+  update_msg_len(&mut msg64);
+  let res64 = parse_client_hello(&msg64);
+  if res64.is_err() {
+    return false;
+  }
+
+  // 4. 拡張 65 個（超過） -> DecodeError
+  let mut ext65 = ext64.clone();
+  ext65.push(1063 / 256);
+  ext65.push(1063 % 256);
+  ext65.push(0);
+  ext65.push(0);
+  let mut msg65 = before_ext.clone();
+  msg65.push(ext65.byte_len() / 256);
+  msg65.push(ext65.byte_len() % 256);
+  msg65.extend(&ext65);
+  update_msg_len(&mut msg65);
+  let res65 = parse_client_hello(&msg65);
+  if !is_ch_fatal_error(&res65, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_key_share_rules() -> Bool
+  intent "key_share の項目数上限・重複・x25519長・secp256r1曲線上点検証"
+  requires none
+  ensures none
+  effects none
+{
+  let base = build_valid_client_hello();
+  let ext_pos = 81;
+  let before_ext = base.slice(0, ext_pos).unwrap_or(Bytes.new());
+
+  // 1. key_share 重複 (x25519 を 2 つ) -> IllegalParameter
+  let mut ext_dup_ks = Bytes.new();
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(ext_supported_versions());
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(3);
+  ext_dup_ks.push(2);
+  ext_dup_ks.push(3);
+  ext_dup_ks.push(4);
+
+  // key_share extension with 2 x25519 entries: 2 + (4+32) + (4+32) = 74 bytes
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(ext_key_share());
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(74);
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(72);
+  // entry 1
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(group_x25519());
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(32);
+  let mut k1 = 0;
+  while k1 < 32 {
+    ext_dup_ks.push(1);
+    k1 = k1 + 1;
+  }
+  // entry 2 (重複)
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(group_x25519());
+  ext_dup_ks.push(0);
+  ext_dup_ks.push(32);
+  let mut k2 = 0;
+  while k2 < 32 {
+    ext_dup_ks.push(2);
+    k2 = k2 + 1;
+  }
+
+  let mut msg_dup_ks = before_ext.clone();
+  msg_dup_ks.push(ext_dup_ks.byte_len() / 256);
+  msg_dup_ks.push(ext_dup_ks.byte_len() % 256);
+  msg_dup_ks.extend(&ext_dup_ks);
+  update_msg_len(&mut msg_dup_ks);
+
+  let res_dup_ks = parse_client_hello(&msg_dup_ks);
+  if !is_ch_fatal_error(&res_dup_ks, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  // 2. x25519 長さ不正 (31 バイト) -> IllegalParameter
+  let mut ext_bad_len = Bytes.new();
+  ext_bad_len.push(0);
+  ext_bad_len.push(ext_supported_versions());
+  ext_bad_len.push(0);
+  ext_bad_len.push(3);
+  ext_bad_len.push(2);
+  ext_bad_len.push(3);
+  ext_bad_len.push(4);
+
+  ext_bad_len.push(0);
+  ext_bad_len.push(ext_key_share());
+  ext_bad_len.push(0);
+  ext_bad_len.push(37);  // 2 + 4 + 31
+  ext_bad_len.push(0);
+  ext_bad_len.push(35);  // 4 + 31
+  ext_bad_len.push(0);
+  ext_bad_len.push(group_x25519());
+  ext_bad_len.push(0);
+  ext_bad_len.push(31);
+  let mut k31 = 0;
+  while k31 < 31 {
+    ext_bad_len.push(1);
+    k31 = k31 + 1;
+  }
+
+  let mut msg_bad_len = before_ext.clone();
+  msg_bad_len.push(ext_bad_len.byte_len() / 256);
+  msg_bad_len.push(ext_bad_len.byte_len() % 256);
+  msg_bad_len.extend(&ext_bad_len);
+  update_msg_len(&mut msg_bad_len);
+
+  let res_bl = parse_client_hello(&msg_bad_len);
+  if !is_ch_fatal_error(&res_bl, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  // 3. secp256r1 曲線上にない点 (65 バイト、先頭 0x04、残り 0) -> IllegalParameter
+  let mut ext_bad_p256 = Bytes.new();
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(ext_supported_versions());
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(3);
+  ext_bad_p256.push(2);
+  ext_bad_p256.push(3);
+  ext_bad_p256.push(4);
+
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(ext_key_share());
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(71);  // 2 + 4 + 65
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(69);  // 4 + 65
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(group_secp256r1());
+  ext_bad_p256.push(0);
+  ext_bad_p256.push(65);
+  ext_bad_p256.push(4);  // 0x04
+  let mut pz = 0;
+  while pz < 64 {
+    ext_bad_p256.push(0);
+    pz = pz + 1;
+  }
+
+  let mut msg_bad_p256 = before_ext.clone();
+  msg_bad_p256.push(ext_bad_p256.byte_len() / 256);
+  msg_bad_p256.push(ext_bad_p256.byte_len() % 256);
+  msg_bad_p256.extend(&ext_bad_p256);
+  update_msg_len(&mut msg_bad_p256);
+
+  let res_bp = parse_client_hello(&msg_bad_p256);
+  if !is_ch_fatal_error(&res_bp, AlertDescription.IllegalParameter) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_sni_normalization() -> Bool
+  intent "SNI 正規化の試験（決定 2.4）"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 有効なドメイン小文字化: "Example.COM" -> "example.com"
+  let sn1 = parse_and_validate_sni_hostname(&"Example.COM".as_bytes());
+  match sn1 {
+    ServerName.Valid(s) => {
+      if s != "example.com" {
+        return false;
+      }
+    }
+    ServerName.Invalid(_) => {
+      return false;
+    }
+  }
+
+  // 2. 有効なサブドメインとハイフン: "sub-domain.example-host.com" -> Valid
+  let sn2 = parse_and_validate_sni_hostname(&"sub-domain.example-host.com".as_bytes());
+  match sn2 {
+    ServerName.Valid(s) => {
+      if s != "sub-domain.example-host.com" {
+        return false;
+      }
+    }
+    ServerName.Invalid(_) => {
+      return false;
+    }
+  }
+
+  // 3. 末尾ドット: "example.com." -> Invalid
+  let sn_dot = parse_and_validate_sni_hostname(&"example.com.".as_bytes());
+  match sn_dot {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  // 4. 先頭ドット: ".example.com" -> Invalid
+  let sn_fdot = parse_and_validate_sni_hostname(&".example.com".as_bytes());
+  match sn_fdot {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  // 5. 先頭ハイフン: "-example.com" -> Invalid
+  let sn_h1 = parse_and_validate_sni_hostname(&"-example.com".as_bytes());
+  match sn_h1 {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  // 6. 末尾ハイフン: "example.com-" -> Invalid
+  let sn_h2 = parse_and_validate_sni_hostname(&"example.com-".as_bytes());
+  match sn_h2 {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  // 7. 単独ハイフン: "-" -> Invalid
+  let sn_h3 = parse_and_validate_sni_hostname(&"-".as_bytes());
+  match sn_h3 {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  // 8. IPv4 リテラル: "127.0.0.1" -> Invalid
+  let sn_ip = parse_and_validate_sni_hostname(&"127.0.0.1".as_bytes());
+  match sn_ip {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  // 9. IPv6 リテラル: "::1" -> Invalid
+  let sn_ip6 = parse_and_validate_sni_hostname(&"::1".as_bytes());
+  match sn_ip6 {
+    ServerName.Valid(_) => {
+      return false;
+    }
+    ServerName.Invalid(_) => {}
+  }
+
+  return true;
+}
+
+pub fn main() -> Int
+  intent "ClientHello 解析試験のエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_valid_client_hello() {
+    return 1;
+  }
+  if !test_header_type_and_length() {
+    return 2;
+  }
+  if !test_legacy_version() {
+    return 3;
+  }
+  if !test_legacy_session_id() {
+    return 4;
+  }
+  if !test_cipher_suites() {
+    return 5;
+  }
+  if !test_compression_methods() {
+    return 6;
+  }
+  if !test_extensions_rules() {
+    return 7;
+  }
+  if !test_key_share_rules() {
+    return 8;
+  }
+  if !test_sni_normalization() {
+    return 9;
+  }
+  return 0;
+}

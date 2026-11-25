@@ -1,0 +1,316 @@
+module shield_limits
+  targets server
+  trust none
+
+// 資源の上限と設定（ADR 0063 決定 4.4, 4.5）
+// 上限は設定で変えられるが、範囲の外・無制限の値は受け付けず、起動を拒否する。
+
+pub fn max_client_hello_size() -> Int
+  intent "ClientHello の最大バイト数（16 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16384;
+}
+
+pub fn max_handshake_record_count() -> Int
+  intent "ClientHello 再構成の最大レコード数（8 レコード）"
+  requires none
+  ensures none
+  effects none
+{
+  return 8;
+}
+
+pub fn max_handshake_read_total() -> Int
+  intent "ハンドシェイク完了までに読み取る総バイト数上限（32 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 32768;
+}
+
+pub fn max_consecutive_empty_app_data() -> Int
+  intent "暗号化後の長さ 0 の application_data レコードの連続受信回数上限（16 回）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16;
+}
+
+pub fn max_extensions_count() -> Int
+  intent "ClientHello に含められる拡張の最大数（64 個）"
+  requires none
+  ensures none
+  effects none
+{
+  return 64;
+}
+
+pub fn max_cipher_suites_count() -> Int
+  intent "ClientHello に含められる暗号スイートの最大数（64 個）"
+  requires none
+  ensures none
+  effects none
+{
+  return 64;
+}
+
+pub fn max_key_share_entries_count() -> Int
+  intent "key_share 拡張に含まれる項目の最大数（8 項目）"
+  requires none
+  ensures none
+  effects none
+{
+  return 8;
+}
+
+pub fn max_key_update_count() -> Int
+  intent "1 接続で受信可能な KeyUpdate の最大回数（16 回）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16;
+}
+
+pub fn max_cert_chain_count() -> Int
+  intent "証明書チェーンの最大枚数（8 枚）"
+  requires none
+  ensures none
+  effects none
+{
+  return 8;
+}
+
+pub fn max_cert_file_size() -> Int
+  intent "証明書ファイルの最大バイト数（64 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 65536;
+}
+
+pub fn max_server_names_count() -> Int
+  intent "設定可能な名前の最大数（256 個）"
+  requires none
+  ensures none
+  effects none
+{
+  return 256;
+}
+
+pub fn max_san_count() -> Int
+  intent "証明書に含まれる SAN の最大数（100 個）"
+  requires none
+  ensures none
+  effects none
+{
+  return 100;
+}
+
+pub fn max_alpn_total_size() -> Int
+  intent "ALPN 拡張全体の最大バイト数（1 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 1024;
+}
+
+pub fn max_plain_record_payload() -> Int
+  intent "平文 TLS レコードの最大ペイロード長（16 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16384;
+}
+
+pub fn max_encrypted_record_payload() -> Int
+  intent "暗号化後 TLS レコードの最大ペイロード長（16 KiB + 256 バイト）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16640;
+}
+
+pub fn max_memory_estimate_limit() -> Int
+  intent "最悪メモリ使用量の上限（256 MiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 268435456;
+}
+
+pub fn estimated_per_conn_memory() -> Int
+  intent "1 接続あたりの見積もりメモリ使用量（64 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 65536;
+}
+
+pub enum LimitError {
+  OutOfRange(String, Int, Int, Int),
+  MemoryBudgetExceeded(Int, Int),
+}
+
+pub struct ShieldLimits {
+  max_connections: Int,
+  max_handshaking_connections: Int,
+  max_connections_per_source: Int,
+  max_handshaking_per_source: Int,
+  max_concurrent_crypto_tasks: Int,
+  handshake_timeout_secs: Int,
+  idle_timeout_secs: Int,
+  write_timeout_secs: Int,
+  upstream_connect_timeout_secs: Int,
+}
+
+pub fn default_limits() -> ShieldLimits
+  intent "既定の資源上限設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: 1024, max_handshaking_connections: 64, max_connections_per_source: 32, max_handshaking_per_source: 4, max_concurrent_crypto_tasks: 2, handshake_timeout_secs: 10, idle_timeout_secs: 60, write_timeout_secs: 30, upstream_connect_timeout_secs: 3 };
+}
+
+pub fn limits_with_max_connections(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "max_connections を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: v, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_max_handshaking_connections(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "max_handshaking_connections を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: v, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_max_connections_per_source(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "max_connections_per_source を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: v, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_max_handshaking_per_source(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "max_handshaking_per_source を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: v, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_max_concurrent_crypto_tasks(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "max_concurrent_crypto_tasks を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: v, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_handshake_timeout_secs(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "handshake_timeout_secs を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: v, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_idle_timeout_secs(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "idle_timeout_secs を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: v, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_write_timeout_secs(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "write_timeout_secs を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: v, upstream_connect_timeout_secs: l.upstream_connect_timeout_secs };
+}
+
+pub fn limits_with_upstream_connect_timeout_secs(l: &ShieldLimits, v: Int) -> ShieldLimits
+  intent "upstream_connect_timeout_secs を更新した設定を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ShieldLimits { max_connections: l.max_connections, max_handshaking_connections: l.max_handshaking_connections, max_connections_per_source: l.max_connections_per_source, max_handshaking_per_source: l.max_handshaking_per_source, max_concurrent_crypto_tasks: l.max_concurrent_crypto_tasks, handshake_timeout_secs: l.handshake_timeout_secs, idle_timeout_secs: l.idle_timeout_secs, write_timeout_secs: l.write_timeout_secs, upstream_connect_timeout_secs: v };
+}
+
+pub fn validate_limits(limits: &ShieldLimits) -> Result<Bool, LimitError>
+  intent "上限設定の範囲を厳密に検証する（決定 4.4, 4.5）"
+  requires none
+  ensures none
+  effects none
+{
+  if limits.max_connections < 1 || limits.max_connections > 65536 {
+    return Err(LimitError.OutOfRange("max_connections", limits.max_connections, 1, 65536));
+  }
+
+  if limits.max_handshaking_connections < 1 || limits.max_handshaking_connections > 1024 {
+    return Err(LimitError.OutOfRange("max_handshaking_connections", limits.max_handshaking_connections, 1, 1024));
+  }
+
+  if limits.max_connections_per_source < 1 || limits.max_connections_per_source > 1024 {
+    return Err(LimitError.OutOfRange("max_connections_per_source", limits.max_connections_per_source, 1, 1024));
+  }
+
+  if limits.max_handshaking_per_source < 1 || limits.max_handshaking_per_source > 64 {
+    return Err(LimitError.OutOfRange("max_handshaking_per_source", limits.max_handshaking_per_source, 1, 64));
+  }
+
+  if limits.max_concurrent_crypto_tasks < 1 || limits.max_concurrent_crypto_tasks > 64 {
+    return Err(LimitError.OutOfRange("max_concurrent_crypto_tasks", limits.max_concurrent_crypto_tasks, 1, 64));
+  }
+
+  if limits.handshake_timeout_secs < 1 || limits.handshake_timeout_secs > 60 {
+    return Err(LimitError.OutOfRange("handshake_timeout_secs", limits.handshake_timeout_secs, 1, 60));
+  }
+
+  if limits.idle_timeout_secs < 5 || limits.idle_timeout_secs > 3600 {
+    return Err(LimitError.OutOfRange("idle_timeout_secs", limits.idle_timeout_secs, 5, 3600));
+  }
+
+  if limits.write_timeout_secs < 1 || limits.write_timeout_secs > 300 {
+    return Err(LimitError.OutOfRange("write_timeout_secs", limits.write_timeout_secs, 1, 300));
+  }
+
+  if limits.upstream_connect_timeout_secs < 1 || limits.upstream_connect_timeout_secs > 30 {
+    return Err(LimitError.OutOfRange("upstream_connect_timeout_secs", limits.upstream_connect_timeout_secs, 1, 30));
+  }
+
+  let estimated = limits.max_connections * estimated_per_conn_memory();
+  if estimated > max_memory_estimate_limit() {
+    return Err(LimitError.MemoryBudgetExceeded(estimated, max_memory_estimate_limit()));
+  }
+
+  return Ok(true);
+}

@@ -1,0 +1,4 @@
+# Sigil manifest for sigil-shield-tls
+[package]
+name = "sigil-shield-tls"
+version = "0.1.0"

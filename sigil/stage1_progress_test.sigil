@@ -1,0 +1,173 @@
+module stage1_progress_test
+  targets server
+  trust none
+
+use shield_alert.ShieldError;
+use shield_record.new_reassembler;
+use shield_record.reassembler_feed_bytes;
+use shield_record.reassembler_total_read_bytes;
+use test_support.build_valid_client_hello;
+use test_support.wrap_in_record;
+
+// 読み取りの前進と期限の不変条件試験（ADR 0063 決定 4.4）
+
+fn test_zero_bytes_read_terminates_immediately() -> Bool
+  intent "0 バイト読み取りで即座に TimeoutOrNoProgress エラーとなることを検証"
+  requires none
+  ensures none
+  effects none
+{
+  let mut reassembler = new_reassembler();
+  let empty = Bytes.new();
+  let res = reassembler_feed_bytes(&mut reassembler, &empty);
+  return match res {
+    Err(e) => match e {
+      ShieldError.TimeoutOrNoProgress => true,
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+}
+
+fn test_progress_invariant_byte_by_byte() -> Bool
+  intent "1 バイトずつストリーム投入し、消費量と進捗の不変条件を検証"
+  requires none
+  ensures none
+  effects none
+{
+  let client_hello = build_valid_client_hello();
+  let record = wrap_in_record(22, 771, &client_hello);
+
+  let mut reassembler = new_reassembler();
+  let mut last_total = 0;
+  let rec_len = record.byte_len();
+
+  let mut i = 0;
+  while i < rec_len {
+    let b = record.get(i).unwrap_or(0);
+    let mut chunk = Bytes.with_capacity(1);
+    chunk.push(b);
+
+    let res = reassembler_feed_bytes(&mut reassembler, &chunk);
+    let current_total = reassembler_total_read_bytes(&reassembler);
+
+    // 不変条件: 呼び出しごとに入力長 (1 バイト) だけ前進していること
+    if current_total != last_total + 1 {
+      return false;
+    }
+    last_total = current_total;
+
+    let is_last = i == rec_len - 1;
+    match res {
+      Ok(opt) => {
+        match opt {
+          Some(payload) => {
+            if !is_last {
+              return false;
+            }
+            if !ct_eq(&payload, &client_hello) {
+              return false;
+            }
+          }
+          None => {
+            if is_last {
+              return false;
+            }
+          }
+        }
+      }
+      Err(_) => {
+        return false;
+      }
+    }
+
+    i = i + 1;
+  }
+
+  return true;
+}
+
+fn test_progress_invariant_no_infinite_loop_on_partial_data() -> Bool
+  intent "中途半端なヘッダデータで空転せず入力を待つことを検証"
+  requires none
+  ensures none
+  effects none
+{
+  let mut reassembler = new_reassembler();
+
+  // 1. ヘッダ途中のデータ（3 バイト）
+  let mut p1 = Bytes.with_capacity(3);
+  p1.push(22);
+  p1.push(3);
+  p1.push(3);
+
+  let res1 = reassembler_feed_bytes(&mut reassembler, &p1);
+  match res1 {
+    Ok(opt) => {
+      match opt {
+        Some(_) => {
+          return false;
+        }
+        None => {}
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if reassembler_total_read_bytes(&reassembler) != 3 {
+    return false;
+  }
+
+  // 2. さらに 2 バイト投入してヘッダを完成させる（length = 10）
+  let mut p2 = Bytes.with_capacity(2);
+  p2.push(0);
+  p2.push(10);
+
+  let res2 = reassembler_feed_bytes(&mut reassembler, &p2);
+  match res2 {
+    Ok(opt) => {
+      match opt {
+        Some(_) => {
+          return false;
+        }
+        None => {}
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if reassembler_total_read_bytes(&reassembler) != 5 {
+    return false;
+  }
+
+  // 3. ペイロード不足の状態で 0 バイト投入 -> TimeoutOrNoProgress
+  let empty = Bytes.new();
+  let res3 = reassembler_feed_bytes(&mut reassembler, &empty);
+  return match res3 {
+    Err(e) => match e {
+      ShieldError.TimeoutOrNoProgress => true,
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+}
+
+pub fn main() -> Int
+  intent "前進不変条件試験のエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_zero_bytes_read_terminates_immediately() {
+    return 1;
+  }
+  if !test_progress_invariant_byte_by_byte() {
+    return 2;
+  }
+  if !test_progress_invariant_no_infinite_loop_on_partial_data() {
+    return 3;
+  }
+  return 0;
+}

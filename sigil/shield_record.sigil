@@ -1,0 +1,314 @@
+module shield_record
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_limits.max_client_hello_size;
+use shield_limits.max_consecutive_empty_app_data;
+use shield_limits.max_encrypted_record_payload;
+use shield_limits.max_handshake_read_total;
+use shield_limits.max_handshake_record_count;
+use shield_limits.max_plain_record_payload;
+
+// TLS レコード層の読み取りと再構成（ADR 0063 決定 4.2, 4.4）
+
+pub enum ContentType {
+  ChangeCipherSpec,
+  Alert,
+  Handshake,
+  ApplicationData,
+}
+
+pub fn content_type_to_u8(ct: &ContentType) -> Int
+  intent "ContentType をバイト値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  return match ct {
+    ContentType.ChangeCipherSpec => 20,
+    ContentType.Alert => 21,
+    ContentType.Handshake => 22,
+    ContentType.ApplicationData => 23,
+  };
+}
+
+pub fn content_type_from_u8(value: Int) -> Option<ContentType>
+  intent "バイト値から ContentType を復元する"
+  requires none
+  ensures none
+  effects none
+{
+  if value == 20 {
+    return Some(ContentType.ChangeCipherSpec);
+  }
+  if value == 21 {
+    return Some(ContentType.Alert);
+  }
+  if value == 22 {
+    return Some(ContentType.Handshake);
+  }
+  if value == 23 {
+    return Some(ContentType.ApplicationData);
+  }
+  return None;
+}
+
+pub struct RecordHeader {
+  content_type: ContentType,
+  legacy_version: Int,
+  length: Int,
+}
+
+pub fn record_header_content_type(h: &RecordHeader) -> ContentType
+  intent "RecordHeader の content_type を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match h.content_type {
+    ContentType.ChangeCipherSpec => ContentType.ChangeCipherSpec,
+    ContentType.Alert => ContentType.Alert,
+    ContentType.Handshake => ContentType.Handshake,
+    ContentType.ApplicationData => ContentType.ApplicationData,
+  };
+}
+
+pub fn record_header_legacy_version(h: &RecordHeader) -> Int
+  intent "RecordHeader の legacy_version を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.legacy_version;
+}
+
+pub fn record_header_length(h: &RecordHeader) -> Int
+  intent "RecordHeader の length を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return h.length;
+}
+
+pub fn parse_record_header(buf: &Bytes, is_encrypted: Bool) -> Result<RecordHeader, ShieldError>
+  intent "レコードの先頭 5 バイトを検査する（決定 4.2）"
+  requires none
+  ensures none
+  effects none
+{
+  if buf.byte_len() < 5 {
+    return Err(ShieldError.Incomplete(5 - buf.byte_len()));
+  }
+
+  let ct_byte = buf.get(0).unwrap_or(0);
+  let mut content_type = ContentType.Handshake;
+  match content_type_from_u8(ct_byte) {
+    Some(ct) => {
+      content_type = ct;
+    }
+    None => {
+      return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+    }
+  }
+
+  let v_hi = buf.get(1).unwrap_or(0);
+  let v_lo = buf.get(2).unwrap_or(0);
+  let legacy_version = v_hi * 256 + v_lo;
+  if legacy_version != 769 && legacy_version != 771 {
+    return Err(ShieldError.Fatal(AlertDescription.ProtocolVersion));
+  }
+
+  let l_hi = buf.get(3).unwrap_or(0);
+  let l_lo = buf.get(4).unwrap_or(0);
+  let length = l_hi * 256 + l_lo;
+
+  let max_len = match is_encrypted {
+    true => max_encrypted_record_payload(),
+    false => max_plain_record_payload(),
+  };
+
+  if length > max_len {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  match content_type {
+    ContentType.Handshake => {
+      if length == 0 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+    }
+    _ => {}
+  }
+
+  return Ok(RecordHeader { content_type: content_type, legacy_version: legacy_version, length: length });
+}
+
+pub struct HandshakeReassembler {
+  stream_buf: Bytes,
+  assembled_bytes: Bytes,
+  expected_message_len: Option<Int>,
+  record_count: Int,
+  total_read_bytes: Int,
+  consecutive_empty_app_data: Int,
+}
+
+pub fn new_reassembler() -> HandshakeReassembler
+  intent "HandshakeReassembler を初期化する"
+  requires none
+  ensures none
+  effects none
+{
+  return HandshakeReassembler { stream_buf: Bytes.new(), assembled_bytes: Bytes.new(), expected_message_len: None, record_count: 0, total_read_bytes: 0, consecutive_empty_app_data: 0 };
+}
+
+pub fn reassembler_total_read_bytes(r: &HandshakeReassembler) -> Int
+  intent "再構成器が読み取った総バイト数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return r.total_read_bytes;
+}
+
+pub fn reassembler_record_count(r: &HandshakeReassembler) -> Int
+  intent "処理したハンドシェイクレコード数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return r.record_count;
+}
+
+pub fn reassembler_unconsumed_bytes(r: &HandshakeReassembler) -> Bytes
+  intent "未消費の入力バイト列を複製して返す"
+  requires none
+  ensures none
+  effects none
+{
+  return r.stream_buf.clone();
+}
+
+pub fn reassembler_take_unconsumed_bytes(r: &mut HandshakeReassembler) -> Bytes
+  intent "未消費の入力バイト列を取り出してバッファを空にする"
+  requires none
+  ensures none
+  effects none
+{
+  let out = r.stream_buf.clone();
+  r.stream_buf = Bytes.new();
+  return out;
+}
+
+pub fn reassembler_feed_bytes(r: &mut HandshakeReassembler, input: &Bytes) -> Result<Option<Bytes>, ShieldError>
+  intent "入力バイト列を受け取り、再構成を進める（決定 4.2, 4.4）"
+  requires none
+  ensures none
+  effects none
+{
+  if input.is_empty() {
+    return Err(ShieldError.TimeoutOrNoProgress);
+  }
+
+  r.total_read_bytes = r.total_read_bytes + input.byte_len();
+  if r.total_read_bytes > max_handshake_read_total() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  r.stream_buf.extend(&input);
+
+  while true {
+    if r.stream_buf.byte_len() < 5 {
+      return Ok(None);
+    }
+
+    let mut header = RecordHeader { content_type: ContentType.Handshake, legacy_version: 771, length: 0 };
+    match parse_record_header(&r.stream_buf, false) {
+      Ok(h) => {
+        header = h;
+      }
+      Err(err) => {
+        return Err(err);
+      }
+    }
+
+    let record_len = header.length;
+    let full_record_len = 5 + record_len;
+
+    if r.stream_buf.byte_len() < full_record_len {
+      return Ok(None);
+    }
+
+    let record_payload = r.stream_buf.slice(5, full_record_len).unwrap_or(Bytes.new());
+    r.stream_buf = r.stream_buf.slice(full_record_len, r.stream_buf.byte_len()).unwrap_or(Bytes.new());
+
+    if !r.assembled_bytes.is_empty() {
+      match header.content_type {
+        ContentType.Handshake => {}
+        _ => {
+          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+        }
+      }
+    }
+
+    match header.content_type {
+      ContentType.ApplicationData => {
+        if record_len == 0 {
+          r.consecutive_empty_app_data = r.consecutive_empty_app_data + 1;
+          if r.consecutive_empty_app_data > max_consecutive_empty_app_data() {
+            return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+          }
+        } else {
+          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+        }
+      }
+      ContentType.Handshake => {
+        r.consecutive_empty_app_data = 0;
+        r.record_count = r.record_count + 1;
+        if r.record_count > max_handshake_record_count() {
+          return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+        }
+
+        r.assembled_bytes.extend(&record_payload);
+
+        if r.assembled_bytes.byte_len() > max_client_hello_size() {
+          return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+        }
+
+        if r.expected_message_len.is_none() && r.assembled_bytes.byte_len() >= 4 {
+          let b1 = r.assembled_bytes.get(1).unwrap_or(0);
+          let b2 = r.assembled_bytes.get(2).unwrap_or(0);
+          let b3 = r.assembled_bytes.get(3).unwrap_or(0);
+          let msg_len = b1 * 65536 + b2 * 256 + b3;
+          let full_msg_len = 4 + msg_len;
+          if full_msg_len > max_client_hello_size() {
+            return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+          }
+          r.expected_message_len = Some(full_msg_len);
+        }
+
+        match r.expected_message_len {
+          Some(expected_len) => {
+            if r.assembled_bytes.byte_len() == expected_len {
+              let out_msg = r.assembled_bytes.clone();
+              r.assembled_bytes = Bytes.new();
+              r.expected_message_len = None;
+              return Ok(Some(out_msg));
+            }
+            if r.assembled_bytes.byte_len() > expected_len {
+              return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+            }
+          }
+          None => {}
+        }
+      }
+      _ => {
+        return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+      }
+    }
+  }
+
+  return Ok(None);
+}

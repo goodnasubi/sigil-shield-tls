@@ -1,0 +1,274 @@
+module stage1_limits_test
+  targets server
+  trust none
+
+use shield_limits.default_limits;
+use shield_limits.limits_with_handshake_timeout_secs;
+use shield_limits.limits_with_idle_timeout_secs;
+use shield_limits.limits_with_max_concurrent_crypto_tasks;
+use shield_limits.limits_with_max_connections;
+use shield_limits.limits_with_max_connections_per_source;
+use shield_limits.limits_with_max_handshaking_connections;
+use shield_limits.limits_with_max_handshaking_per_source;
+use shield_limits.limits_with_upstream_connect_timeout_secs;
+use shield_limits.limits_with_write_timeout_secs;
+use shield_limits.validate_limits;
+
+// 資源上限の境界試験（ADR 0063 決定 4.5）
+
+fn test_default() -> Bool
+  intent "既定の設定が有効であることを確認する"
+  requires none
+  ensures none
+  effects none
+{
+  let d = default_limits();
+  return validate_limits(&d).is_ok();
+}
+
+fn test_connections() -> Bool
+  intent "同時接続数の境界試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = default_limits();
+  let l0 = limits_with_max_connections(&base, 0);
+  if validate_limits(&l0).is_ok() {
+    return false;
+  }
+  let l1 = limits_with_max_connections(&base, 1);
+  if !validate_limits(&l1).is_ok() {
+    return false;
+  }
+  let l4096 = limits_with_max_connections(&base, 4096);
+  if !validate_limits(&l4096).is_ok() {
+    return false;
+  }
+  let l4097 = limits_with_max_connections(&base, 4097);
+  if validate_limits(&l4097).is_ok() {
+    return false;
+  }
+  let l65537 = limits_with_max_connections(&base, 65537);
+  if validate_limits(&l65537).is_ok() {
+    return false;
+  }
+  return true;
+}
+
+fn test_handshaking_connections() -> Bool
+  intent "ハンドシェイク中同時接続数の境界試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = default_limits();
+  let l0 = limits_with_max_handshaking_connections(&base, 0);
+  if validate_limits(&l0).is_ok() {
+    return false;
+  }
+  let l1 = limits_with_max_handshaking_connections(&base, 1);
+  if !validate_limits(&l1).is_ok() {
+    return false;
+  }
+  let l1024 = limits_with_max_handshaking_connections(&base, 1024);
+  if !validate_limits(&l1024).is_ok() {
+    return false;
+  }
+  let l1025 = limits_with_max_handshaking_connections(&base, 1025);
+  if validate_limits(&l1025).is_ok() {
+    return false;
+  }
+  return true;
+}
+
+fn test_connections_per_source() -> Bool
+  intent "接続元ごとの同時接続数の境界試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = default_limits();
+  let l0 = limits_with_max_connections_per_source(&base, 0);
+  if validate_limits(&l0).is_ok() {
+    return false;
+  }
+  let l1 = limits_with_max_connections_per_source(&base, 1);
+  if !validate_limits(&l1).is_ok() {
+    return false;
+  }
+  let l1024 = limits_with_max_connections_per_source(&base, 1024);
+  if !validate_limits(&l1024).is_ok() {
+    return false;
+  }
+  let l1025 = limits_with_max_connections_per_source(&base, 1025);
+  if validate_limits(&l1025).is_ok() {
+    return false;
+  }
+  return true;
+}
+
+fn test_handshaking_per_source() -> Bool
+  intent "接続元ごとのハンドシェイク中接続数の境界試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = default_limits();
+  let l0 = limits_with_max_handshaking_per_source(&base, 0);
+  if validate_limits(&l0).is_ok() {
+    return false;
+  }
+  let l1 = limits_with_max_handshaking_per_source(&base, 1);
+  if !validate_limits(&l1).is_ok() {
+    return false;
+  }
+  let l64 = limits_with_max_handshaking_per_source(&base, 64);
+  if !validate_limits(&l64).is_ok() {
+    return false;
+  }
+  let l65 = limits_with_max_handshaking_per_source(&base, 65);
+  if validate_limits(&l65).is_ok() {
+    return false;
+  }
+  return true;
+}
+
+fn test_crypto_tasks() -> Bool
+  intent "暗号計算タスク並行数の境界試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = default_limits();
+  let l0 = limits_with_max_concurrent_crypto_tasks(&base, 0);
+  if validate_limits(&l0).is_ok() {
+    return false;
+  }
+  let l1 = limits_with_max_concurrent_crypto_tasks(&base, 1);
+  if !validate_limits(&l1).is_ok() {
+    return false;
+  }
+  let l64 = limits_with_max_concurrent_crypto_tasks(&base, 64);
+  if !validate_limits(&l64).is_ok() {
+    return false;
+  }
+  let l65 = limits_with_max_concurrent_crypto_tasks(&base, 65);
+  if validate_limits(&l65).is_ok() {
+    return false;
+  }
+  return true;
+}
+
+fn test_timeouts() -> Bool
+  intent "各種タイムアウト設定の境界試験"
+  requires none
+  ensures none
+  effects none
+{
+  let base = default_limits();
+
+  // handshake_timeout_secs: 1..=60
+  let h0 = limits_with_handshake_timeout_secs(&base, 0);
+  if validate_limits(&h0).is_ok() {
+    return false;
+  }
+  let h1 = limits_with_handshake_timeout_secs(&base, 1);
+  if !validate_limits(&h1).is_ok() {
+    return false;
+  }
+  let h60 = limits_with_handshake_timeout_secs(&base, 60);
+  if !validate_limits(&h60).is_ok() {
+    return false;
+  }
+  let h61 = limits_with_handshake_timeout_secs(&base, 61);
+  if validate_limits(&h61).is_ok() {
+    return false;
+  }
+
+  // idle_timeout_secs: 5..=3600
+  let i4 = limits_with_idle_timeout_secs(&base, 4);
+  if validate_limits(&i4).is_ok() {
+    return false;
+  }
+  let i5 = limits_with_idle_timeout_secs(&base, 5);
+  if !validate_limits(&i5).is_ok() {
+    return false;
+  }
+  let i3600 = limits_with_idle_timeout_secs(&base, 3600);
+  if !validate_limits(&i3600).is_ok() {
+    return false;
+  }
+  let i3601 = limits_with_idle_timeout_secs(&base, 3601);
+  if validate_limits(&i3601).is_ok() {
+    return false;
+  }
+
+  // write_timeout_secs: 1..=300
+  let w0 = limits_with_write_timeout_secs(&base, 0);
+  if validate_limits(&w0).is_ok() {
+    return false;
+  }
+  let w1 = limits_with_write_timeout_secs(&base, 1);
+  if !validate_limits(&w1).is_ok() {
+    return false;
+  }
+  let w300 = limits_with_write_timeout_secs(&base, 300);
+  if !validate_limits(&w300).is_ok() {
+    return false;
+  }
+  let w301 = limits_with_write_timeout_secs(&base, 301);
+  if validate_limits(&w301).is_ok() {
+    return false;
+  }
+
+  // upstream_connect_timeout_secs: 1..=30
+  let u0 = limits_with_upstream_connect_timeout_secs(&base, 0);
+  if validate_limits(&u0).is_ok() {
+    return false;
+  }
+  let u1 = limits_with_upstream_connect_timeout_secs(&base, 1);
+  if !validate_limits(&u1).is_ok() {
+    return false;
+  }
+  let u30 = limits_with_upstream_connect_timeout_secs(&base, 30);
+  if !validate_limits(&u30).is_ok() {
+    return false;
+  }
+  let u31 = limits_with_upstream_connect_timeout_secs(&base, 31);
+  if validate_limits(&u31).is_ok() {
+    return false;
+  }
+
+  return true;
+}
+
+pub fn main() -> Int
+  intent "上限境界試験のエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_default() {
+    return 1;
+  }
+  if !test_connections() {
+    return 2;
+  }
+  if !test_handshaking_connections() {
+    return 3;
+  }
+  if !test_connections_per_source() {
+    return 4;
+  }
+  if !test_handshaking_per_source() {
+    return 5;
+  }
+  if !test_crypto_tasks() {
+    return 6;
+  }
+  if !test_timeouts() {
+    return 7;
+  }
+  return 0;
+}

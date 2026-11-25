@@ -1,0 +1,791 @@
+module shield_client_hello
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_limits.max_alpn_total_size;
+use shield_limits.max_cipher_suites_count;
+use shield_limits.max_client_hello_size;
+use shield_limits.max_extensions_count;
+use shield_limits.max_key_share_entries_count;
+
+// ClientHello の解析（ADR 0063 決定 4.3）
+
+pub fn ext_server_name() -> Int
+  intent "server_name 拡張種別（0x0000）"
+  requires none
+  ensures none
+  effects none
+{
+  return 0;
+}
+
+pub fn ext_supported_groups() -> Int
+  intent "supported_groups 拡張種別（0x000a）"
+  requires none
+  ensures none
+  effects none
+{
+  return 10;
+}
+
+pub fn ext_signature_algorithms() -> Int
+  intent "signature_algorithms 拡張種別（0x000d）"
+  requires none
+  ensures none
+  effects none
+{
+  return 13;
+}
+
+pub fn ext_alpn() -> Int
+  intent "alpn 拡張種別（0x0010）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16;
+}
+
+pub fn ext_pre_shared_key() -> Int
+  intent "pre_shared_key 拡張種別（0x0029）"
+  requires none
+  ensures none
+  effects none
+{
+  return 41;
+}
+
+pub fn ext_supported_versions() -> Int
+  intent "supported_versions 拡張種別（0x002b）"
+  requires none
+  ensures none
+  effects none
+{
+  return 43;
+}
+
+pub fn ext_key_share() -> Int
+  intent "key_share 拡張種別（0x0033）"
+  requires none
+  ensures none
+  effects none
+{
+  return 51;
+}
+
+pub fn group_secp256r1() -> Int
+  intent "secp256r1 グループ番号（0x0017）"
+  requires none
+  ensures none
+  effects none
+{
+  return 23;
+}
+
+pub fn group_x25519() -> Int
+  intent "x25519 グループ番号（0x001d）"
+  requires none
+  ensures none
+  effects none
+{
+  return 29;
+}
+
+pub enum ServerName {
+  Valid(String),
+  Invalid(Bytes),
+}
+
+pub struct KeyShareEntry {
+  group: Int,
+  key_exchange: Bytes,
+}
+
+pub fn key_share_group(ks: &KeyShareEntry) -> Int
+  intent "KeyShareEntry の group を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ks.group;
+}
+
+pub fn key_share_exchange(ks: &KeyShareEntry) -> Bytes
+  intent "KeyShareEntry の key_exchange を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ks.key_exchange.clone();
+}
+
+pub struct ClientHello {
+  legacy_version: Int,
+  random: Bytes,
+  legacy_session_id: Bytes,
+  cipher_suites: List<Int>,
+  legacy_compression_methods: Bytes,
+  server_name: Option<ServerName>,
+  supported_versions: List<Int>,
+  supported_groups: List<Int>,
+  key_shares: List<KeyShareEntry>,
+  signature_algorithms: List<Int>,
+  alpn_protocols: List<Bytes>,
+  extensions_present: List<Int>,
+}
+
+pub fn client_hello_legacy_version(ch: &ClientHello) -> Int
+  intent "ClientHello の legacy_version を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ch.legacy_version;
+}
+
+pub fn client_hello_random(ch: &ClientHello) -> Bytes
+  intent "ClientHello の random を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ch.random.clone();
+}
+
+pub fn client_hello_legacy_session_id(ch: &ClientHello) -> Bytes
+  intent "ClientHello の legacy_session_id を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ch.legacy_session_id.clone();
+}
+
+pub fn client_hello_cipher_suites(ch: &ClientHello) -> List<Int>
+  intent "ClientHello の cipher_suites を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.cipher_suites.len() {
+    match ch.cipher_suites.get(i) {
+      Some(cs) => {
+        out.push(cs + 0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn client_hello_legacy_compression_methods(ch: &ClientHello) -> Bytes
+  intent "ClientHello の legacy_compression_methods を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return ch.legacy_compression_methods.clone();
+}
+
+pub fn client_hello_server_name(ch: &ClientHello) -> Option<ServerName>
+  intent "ClientHello の server_name を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match ch.server_name {
+    Some(sn) => match sn {
+      ServerName.Valid(s) => Some(ServerName.Valid(s.clone())),
+      ServerName.Invalid(b) => Some(ServerName.Invalid(b.clone())),
+    },
+    None => None,
+  };
+}
+
+pub fn client_hello_supported_versions(ch: &ClientHello) -> List<Int>
+  intent "ClientHello の supported_versions を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.supported_versions.len() {
+    match ch.supported_versions.get(i) {
+      Some(v) => {
+        out.push(v + 0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn client_hello_supported_groups(ch: &ClientHello) -> List<Int>
+  intent "ClientHello の supported_groups を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.supported_groups.len() {
+    match ch.supported_groups.get(i) {
+      Some(g) => {
+        out.push(g + 0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn client_hello_key_shares(ch: &ClientHello) -> List<KeyShareEntry>
+  intent "ClientHello の key_shares を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.key_shares.len() {
+    match ch.key_shares.get(i) {
+      Some(ks) => {
+        out.push(KeyShareEntry { group: ks.group, key_exchange: ks.key_exchange.clone() });
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn client_hello_signature_algorithms(ch: &ClientHello) -> List<Int>
+  intent "ClientHello の signature_algorithms を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.signature_algorithms.len() {
+    match ch.signature_algorithms.get(i) {
+      Some(sa) => {
+        out.push(sa + 0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn client_hello_alpn_protocols(ch: &ClientHello) -> List<Bytes>
+  intent "ClientHello の alpn_protocols を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.alpn_protocols.len() {
+    match ch.alpn_protocols.get(i) {
+      Some(p) => {
+        out.push(p.clone());
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+pub fn client_hello_extensions_present(ch: &ClientHello) -> List<Int>
+  intent "ClientHello に現れた拡張種別の一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < ch.extensions_present.len() {
+    match ch.extensions_present.get(i) {
+      Some(e) => {
+        out.push(e + 0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn list_contains_int(list: &List<Int>, val: Int) -> Bool
+  intent "リストに指定の値が含まれているか調べる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < list.len() {
+    match list.get(i) {
+      Some(item) => {
+        if item == val {
+          return true;
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+pub fn parse_and_validate_sni_hostname(name_bytes: &Bytes) -> ServerName
+  intent "SNI ホスト名を検証・正規化する（決定 2.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let total_len = name_bytes.byte_len();
+  if total_len == 0 || total_len > 253 {
+    return ServerName.Invalid(name_bytes.clone());
+  }
+
+  // 先頭または末尾が '.' (46) は無効
+  if name_bytes.get(0).unwrap_or(0) == 46 || name_bytes.get(total_len - 1).unwrap_or(0) == 46 {
+    return ServerName.Invalid(name_bytes.clone());
+  }
+
+  let mut normalized = Bytes.with_capacity(total_len);
+  let mut pos = 0;
+  let mut label_start = 0;
+  let mut label_count = 0;
+  let mut all_labels_numeric = true;
+
+  while pos <= total_len {
+    let is_sep = match pos == total_len {
+      true => true,
+      false => name_bytes.get(pos).unwrap_or(0) == 46,
+    };
+
+    if is_sep {
+      let label_len = pos - label_start;
+      if label_len == 0 || label_len > 63 {
+        return ServerName.Invalid(name_bytes.clone());
+      }
+
+      // ラベルの先頭または末尾が '-' (45) は不可
+      let first_ch = name_bytes.get(label_start).unwrap_or(0);
+      let last_ch = name_bytes.get(pos - 1).unwrap_or(0);
+      if first_ch == 45 || last_ch == 45 {
+        return ServerName.Invalid(name_bytes.clone());
+      }
+
+      let mut j = label_start;
+      let mut label_numeric = true;
+      let mut num_val = 0;
+
+      while j < pos {
+        let ch = name_bytes.get(j).unwrap_or(0);
+        if ch >= 48 && ch <= 57 {
+          num_val = num_val * 10 + (ch - 48);
+        } else {
+          label_numeric = false;
+        }
+
+        // 英数字とハイフンのみ許可、大文字は小文字に正規化
+        if ch >= 97 && ch <= 122 {
+          normalized.push(ch);
+        } else if ch >= 65 && ch <= 90 {
+          normalized.push(ch + 32);
+        } else if ch >= 48 && ch <= 57 {
+          normalized.push(ch);
+        } else if ch == 45 {
+          normalized.push(45);
+        } else {
+          return ServerName.Invalid(name_bytes.clone());
+        }
+
+        j = j + 1;
+      }
+
+      // IPv4 アドレスリテラル判定用
+      if !label_numeric || num_val > 255 {
+        all_labels_numeric = false;
+      } else if label_len > 1 && first_ch == 48 {
+        // 先頭ゼロの多桁数値（例: 01）は標準 IPv4 リテラルではないが数字のみ
+      }
+
+      label_count = label_count + 1;
+      if pos < total_len {
+        normalized.push(46);
+      }
+      label_start = pos + 1;
+    }
+
+    pos = pos + 1;
+  }
+
+  // ちょうど 4 つの 0..255 の数値ラベルなら IPv4 アドレスリテラル
+  if label_count == 4 && all_labels_numeric {
+    return ServerName.Invalid(name_bytes.clone());
+  }
+
+  return match normalized.to_string_utf8() {
+    Ok(s) => ServerName.Valid(s),
+    Err(_) => ServerName.Invalid(name_bytes.clone()),
+  };
+}
+
+pub fn parse_client_hello(msg: &Bytes) -> Result<ClientHello, ShieldError>
+  intent "ClientHello メッセージを厳密に解析する（決定 4.3）"
+  requires none
+  ensures none
+  effects none
+{
+  if msg.byte_len() > max_client_hello_size() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  if msg.byte_len() < 4 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  if msg.get(0).unwrap_or(0) != 1 {
+    return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+  }
+
+  let l0 = msg.get(1).unwrap_or(0);
+  let l1 = msg.get(2).unwrap_or(0);
+  let l2 = msg.get(3).unwrap_or(0);
+  let msg_len = l0 * 65536 + l1 * 256 + l2;
+  if msg.byte_len() != 4 + msg_len {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let mut pos = 4;
+
+  // legacy_version: 0x0303
+  if pos + 2 > msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let v_hi = msg.get(pos).unwrap_or(0);
+  let v_lo = msg.get(pos + 1).unwrap_or(0);
+  let legacy_version = v_hi * 256 + v_lo;
+  pos = pos + 2;
+  if legacy_version != 771 {
+    return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+  }
+
+  // random: 32 バイト
+  if pos + 32 > msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let random = msg.slice(pos, pos + 32).unwrap_or(Bytes.new());
+  pos = pos + 32;
+
+  // legacy_session_id: 0〜32 バイト
+  if pos >= msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let session_id_len = msg.get(pos).unwrap_or(0);
+  pos = pos + 1;
+  if session_id_len > 32 {
+    return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+  }
+  if pos + session_id_len > msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let legacy_session_id = msg.slice(pos, pos + session_id_len).unwrap_or(Bytes.new());
+  pos = pos + session_id_len;
+
+  // cipher_suites: 偶数長、2〜128 バイト（64 個以下）
+  if pos + 2 > msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let cs_hi = msg.get(pos).unwrap_or(0);
+  let cs_lo = msg.get(pos + 1).unwrap_or(0);
+  let cs_len = cs_hi * 256 + cs_lo;
+  pos = pos + 2;
+
+  if cs_len < 2 || cs_len > max_cipher_suites_count() * 2 || cs_len % 2 != 0 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  if pos + cs_len > msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let mut cipher_suites = List.new();
+  let mut cs_idx = 0;
+  while cs_idx < cs_len {
+    let s_hi = msg.get(pos + cs_idx).unwrap_or(0);
+    let s_lo = msg.get(pos + cs_idx + 1).unwrap_or(0);
+    cipher_suites.push(s_hi * 256 + s_lo);
+    cs_idx = cs_idx + 2;
+  }
+  pos = pos + cs_len;
+
+  // legacy_compression_methods: ちょうど 1 バイトで値は 0
+  if pos >= msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let comp_len = msg.get(pos).unwrap_or(0);
+  pos = pos + 1;
+  if comp_len != 1 {
+    return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+  }
+  if pos >= msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let comp_val = msg.get(pos).unwrap_or(0);
+  if comp_val != 0 {
+    return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+  }
+  let mut legacy_compression_methods = Bytes.new();
+  legacy_compression_methods.push(0);
+  pos = pos + 1;
+
+  // 拡張部
+  if pos == msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.ProtocolVersion));
+  }
+  if pos + 2 > msg.byte_len() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+  let ext_hi = msg.get(pos).unwrap_or(0);
+  let ext_lo = msg.get(pos + 1).unwrap_or(0);
+  let ext_total_len = ext_hi * 256 + ext_lo;
+  pos = pos + 2;
+
+  if ext_total_len != msg.byte_len() - pos {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let ext_end = pos + ext_total_len;
+  let mut ext_count = 0;
+  let mut psk_seen = false;
+
+  let mut server_name = None;
+  let mut supported_versions = List.new();
+  let mut supported_groups = List.new();
+  let mut key_shares = List.new();
+  let mut signature_algorithms = List.new();
+  let mut alpn_protocols = List.new();
+  let mut extensions_present = List.new();
+
+  while pos < ext_end {
+    if pos + 4 > ext_end {
+      return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+    }
+    let t_hi = msg.get(pos).unwrap_or(0);
+    let t_lo = msg.get(pos + 1).unwrap_or(0);
+    let ext_type = t_hi * 256 + t_lo;
+
+    let l_hi = msg.get(pos + 2).unwrap_or(0);
+    let l_lo = msg.get(pos + 3).unwrap_or(0);
+    let ext_len = l_hi * 256 + l_lo;
+    pos = pos + 4;
+
+    if pos + ext_len > ext_end {
+      return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+    }
+
+    ext_count = ext_count + 1;
+    if ext_count > max_extensions_count() {
+      return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+    }
+
+    // 重複チェック
+    if list_contains_int(&extensions_present, ext_type) {
+      return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+    }
+
+    // PSK 後チェック
+    if psk_seen {
+      return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+    }
+    if ext_type == ext_pre_shared_key() {
+      psk_seen = true;
+    }
+
+    extensions_present.push(ext_type);
+    let ext_data = msg.slice(pos, pos + ext_len).unwrap_or(Bytes.new());
+    pos = pos + ext_len;
+
+    if ext_type == ext_supported_versions() {
+      if ext_len == 0 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let list_len = ext_data.get(0).unwrap_or(0);
+      if list_len == 0 || list_len % 2 != 0 || list_len > 254 || list_len + 1 != ext_len {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let mut has_tls13 = false;
+      let mut v_idx = 0;
+      while v_idx < list_len {
+        let h = ext_data.get(1 + v_idx).unwrap_or(0);
+        let l = ext_data.get(1 + v_idx + 1).unwrap_or(0);
+        let v = h * 256 + l;
+        if v == 772 {
+          has_tls13 = true;
+        }
+        supported_versions.push(v);
+        v_idx = v_idx + 2;
+      }
+      if !has_tls13 {
+        return Err(ShieldError.Fatal(AlertDescription.ProtocolVersion));
+      }
+    } else if ext_type == ext_supported_groups() {
+      if ext_len < 2 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let g_hi = ext_data.get(0).unwrap_or(0);
+      let g_lo = ext_data.get(1).unwrap_or(0);
+      let list_len = g_hi * 256 + g_lo;
+      if list_len == 0 || list_len % 2 != 0 || list_len > 128 || list_len + 2 != ext_len {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let mut g_idx = 0;
+      while g_idx < list_len {
+        let h = ext_data.get(2 + g_idx).unwrap_or(0);
+        let l = ext_data.get(2 + g_idx + 1).unwrap_or(0);
+        supported_groups.push(h * 256 + l);
+        g_idx = g_idx + 2;
+      }
+    } else if ext_type == ext_key_share() {
+      if ext_len < 2 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let ks_hi = ext_data.get(0).unwrap_or(0);
+      let ks_lo = ext_data.get(1).unwrap_or(0);
+      let client_shares_len = ks_hi * 256 + ks_lo;
+      if client_shares_len + 2 != ext_len {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let mut ks_pos = 2;
+      let ks_end = 2 + client_shares_len;
+      let mut seen_groups = List.new();
+
+      while ks_pos < ks_end {
+        if ks_pos + 4 > ks_end {
+          return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+        }
+        let grp_hi = ext_data.get(ks_pos).unwrap_or(0);
+        let grp_lo = ext_data.get(ks_pos + 1).unwrap_or(0);
+        let group = grp_hi * 256 + grp_lo;
+
+        let klen_hi = ext_data.get(ks_pos + 2).unwrap_or(0);
+        let klen_lo = ext_data.get(ks_pos + 3).unwrap_or(0);
+        let key_len = klen_hi * 256 + klen_lo;
+        ks_pos = ks_pos + 4;
+
+        if ks_pos + key_len > ks_end {
+          return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+        }
+
+        if key_shares.len() >= max_key_share_entries_count() {
+          return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+        }
+
+        if list_contains_int(&seen_groups, group) {
+          return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+        }
+        seen_groups.push(group);
+
+        let key_exchange = ext_data.slice(ks_pos, ks_pos + key_len).unwrap_or(Bytes.new());
+        ks_pos = ks_pos + key_len;
+
+        if group == group_x25519() {
+          if key_len != 32 {
+            return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+          }
+        } else if group == group_secp256r1() {
+          if key_len != 65 || key_exchange.get(0).unwrap_or(0) != 4 {
+            return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+          }
+          let pk_res = EcdsaP256PublicKey.from_bytes(&key_exchange);
+          if pk_res.is_err() {
+            return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+          }
+        }
+
+        key_shares.push(KeyShareEntry { group: group, key_exchange: key_exchange });
+      }
+    } else if ext_type == ext_signature_algorithms() {
+      if ext_len < 2 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let sa_hi = ext_data.get(0).unwrap_or(0);
+      let sa_lo = ext_data.get(1).unwrap_or(0);
+      let list_len = sa_hi * 256 + sa_lo;
+      if list_len == 0 || list_len % 2 != 0 || list_len > 128 || list_len + 2 != ext_len {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let mut sa_idx = 0;
+      while sa_idx < list_len {
+        let h = ext_data.get(2 + sa_idx).unwrap_or(0);
+        let l = ext_data.get(2 + sa_idx + 1).unwrap_or(0);
+        signature_algorithms.push(h * 256 + l);
+        sa_idx = sa_idx + 2;
+      }
+    } else if ext_type == ext_server_name() {
+      if ext_len < 2 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let sn_hi = ext_data.get(0).unwrap_or(0);
+      let sn_lo = ext_data.get(1).unwrap_or(0);
+      let sn_list_len = sn_hi * 256 + sn_lo;
+      if sn_list_len + 2 != ext_len || sn_list_len < 3 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let name_type = ext_data.get(2).unwrap_or(0);
+      if name_type != 0 {
+        return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+      }
+      let nl_hi = ext_data.get(3).unwrap_or(0);
+      let nl_lo = ext_data.get(4).unwrap_or(0);
+      let name_len = nl_hi * 256 + nl_lo;
+      if 2 + 3 + name_len != ext_len {
+        return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+      }
+      let raw_name = ext_data.slice(5, 5 + name_len).unwrap_or(Bytes.new());
+      server_name = Some(parse_and_validate_sni_hostname(&raw_name));
+    } else if ext_type == ext_alpn() {
+      if ext_len < 2 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let alpn_hi = ext_data.get(0).unwrap_or(0);
+      let alpn_lo = ext_data.get(1).unwrap_or(0);
+      let alpn_list_len = alpn_hi * 256 + alpn_lo;
+      if alpn_list_len + 2 != ext_len || alpn_list_len > max_alpn_total_size() || alpn_list_len == 0 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+      let mut alpn_pos = 2;
+      let alpn_end = 2 + alpn_list_len;
+      while alpn_pos < alpn_end {
+        let proto_len = ext_data.get(alpn_pos).unwrap_or(0);
+        alpn_pos = alpn_pos + 1;
+        if proto_len == 0 || alpn_pos + proto_len > alpn_end {
+          return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+        }
+        let proto = ext_data.slice(alpn_pos, alpn_pos + proto_len).unwrap_or(Bytes.new());
+        alpn_protocols.push(proto);
+        alpn_pos = alpn_pos + proto_len;
+      }
+    }
+  }
+
+  if supported_versions.is_empty() {
+    return Err(ShieldError.Fatal(AlertDescription.ProtocolVersion));
+  }
+
+  return Ok(ClientHello { legacy_version: legacy_version, random: random, legacy_session_id: legacy_session_id, cipher_suites: cipher_suites, legacy_compression_methods: legacy_compression_methods, server_name: server_name, supported_versions: supported_versions, supported_groups: supported_groups, key_shares: key_shares, signature_algorithms: signature_algorithms, alpn_protocols: alpn_protocols, extensions_present: extensions_present });
+}
