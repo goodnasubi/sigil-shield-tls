@@ -36,6 +36,7 @@ use shield_key_schedule.hkdf_expand_label;
 use shield_key_schedule.master_secret;
 use shield_key_schedule.server_application_traffic_secret_0;
 use shield_key_schedule.server_handshake_traffic_secret;
+use shield_limits.max_plain_record_payload;
 use shield_record.ContentType;
 use shield_record.parse_record_header;
 use shield_record.record_header_content_type;
@@ -642,6 +643,7 @@ pub struct HandshakeSession {
   client_app_sec: Bytes,
   server_app_protection: Option<RecordProtection>,
   client_app_protection: Option<RecordProtection>,
+  client_finished_buffer: Bytes,
 }
 
 pub fn new_handshake_session(cert_chain: List<Bytes>, private_key: EcdsaP256PrivateKey) -> HandshakeSession
@@ -650,7 +652,7 @@ pub fn new_handshake_session(cert_chain: List<Bytes>, private_key: EcdsaP256Priv
   ensures none
   effects none
 {
-  return HandshakeSession { phase: HandshakePhase.Initial, cert_chain: cert_chain, private_key: private_key, selected_suite: None, alpn_selected: false, hrr_sent: false, ccs_received: false, transcript: Bytes.new(), ch1_raw: Bytes.new(), ch1_parsed: None, early_sec: Bytes.new(), handshake_sec: Bytes.new(), server_hs_sec: Bytes.new(), client_hs_sec: Bytes.new(), server_hs_protection: None, client_hs_protection: None, master_sec: Bytes.new(), server_app_sec: Bytes.new(), client_app_sec: Bytes.new(), server_app_protection: None, client_app_protection: None };
+  return HandshakeSession { phase: HandshakePhase.Initial, cert_chain: cert_chain, private_key: private_key, selected_suite: None, alpn_selected: false, hrr_sent: false, ccs_received: false, transcript: Bytes.new(), ch1_raw: Bytes.new(), ch1_parsed: None, early_sec: Bytes.new(), handshake_sec: Bytes.new(), server_hs_sec: Bytes.new(), client_hs_sec: Bytes.new(), server_hs_protection: None, client_hs_protection: None, master_sec: Bytes.new(), server_app_sec: Bytes.new(), client_app_sec: Bytes.new(), server_app_protection: None, client_app_protection: None, client_finished_buffer: Bytes.new() };
 }
 
 pub fn handshake_phase(session: &HandshakeSession) -> HandshakePhase
@@ -1019,14 +1021,27 @@ fn emit_1rtt_server_flight(session: &mut HandshakeSession, ch_bytes: &Bytes, ch:
   transcript.extend(&fin_msg);
 
   // 保護レコード封印: EE, Certificate, CertificateVerify, Finished を保護レコード化
-  // (一括フライトまたは個別レコード)
+  // oversized なサーバーフライト（16,384 バイト超）は平文上限サイズでフラグメント分割し順次封印する
   let mut flight_messages = Bytes.new();
   flight_messages.extend(&ee_msg);
   flight_messages.extend(&cert_msg);
   flight_messages.extend(&cv_msg);
   flight_messages.extend(&fin_msg);
 
-  let sealed_flight = seal_record(&mut s_hs_prot, &ContentType.Handshake, &flight_messages, 0)?;
+  let max_frag = max_plain_record_payload();
+  let total_len = flight_messages.byte_len();
+  let mut offset = 0;
+  let mut sealed_records = List.new();
+  while offset < total_len {
+    let mut end = offset + max_frag;
+    if end > total_len {
+      end = total_len;
+    }
+    let chunk = flight_messages.slice(offset, end).unwrap_or(Bytes.new());
+    let sealed_rec = seal_record(&mut s_hs_prot, &ContentType.Handshake, &chunk, 0)?;
+    sealed_records.push(sealed_rec);
+    offset = end;
+  }
 
   // セッション状態更新
   session.phase = HandshakePhase.WaitingFinished;
@@ -1043,7 +1058,16 @@ fn emit_1rtt_server_flight(session: &mut HandshakeSession, ch_bytes: &Bytes, ch:
   let mut records = List.new();
   records.push(sh_rec);
   records.push(ccs_rec);
-  records.push(sealed_flight);
+  let mut i = 0;
+  while i < sealed_records.len() {
+    match sealed_records.get(i) {
+      Some(rec) => {
+        records.push(rec.clone());
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
   return Ok(ServerFlight { records: records });
 }
 
@@ -1182,31 +1206,53 @@ fn process_client_finished_record(session: &mut HandshakeSession, raw_record: &B
         }
       }
 
+      // レコード開封に成功したら受信シーケンス番号を進めた状態を保持
+      session.client_hs_protection = Some(c_prot);
+
       let plaintext = open_outcome_plaintext(&outcome);
-      if plaintext.byte_len() < 4 {
+      session.client_finished_buffer.extend(&plaintext);
+
+      // バッファ過大（平文レコード上限超え）に対する安全策
+      if session.client_finished_buffer.byte_len() > max_plain_record_payload() {
         session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
         return Err(ShieldError.Fatal(AlertDescription.DecodeError));
-      }
-
-      // msg_type == 20 (Finished)
-      if plaintext.get(0).unwrap_or(0) != 20 {
-        session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
-        return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
       }
 
       match session.selected_suite {
         Some(suite) => {
           let hash_len = cipher_suite_hash_len(&suite);
-          let l0 = plaintext.get(1).unwrap_or(0);
-          let l1 = plaintext.get(2).unwrap_or(0);
-          let l2 = plaintext.get(3).unwrap_or(0);
+
+          // まだヘッダ (4 バイト) が揃っていなければ後続レコードを待機
+          if session.client_finished_buffer.byte_len() < 4 {
+            return Ok(None);
+          }
+
+          // msg_type == 20 (Finished)
+          if session.client_finished_buffer.get(0).unwrap_or(0) != 20 {
+            session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+            return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+          }
+
+          let l0 = session.client_finished_buffer.get(1).unwrap_or(0);
+          let l1 = session.client_finished_buffer.get(2).unwrap_or(0);
+          let l2 = session.client_finished_buffer.get(3).unwrap_or(0);
           let body_len = l0 * 65536 + l1 * 256 + l2;
-          if body_len != hash_len || plaintext.byte_len() != 4 + hash_len {
+          if body_len != hash_len {
             session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
             return Err(ShieldError.Fatal(AlertDescription.DecodeError));
           }
 
-          let client_verify_data = plaintext.slice(4, 4 + hash_len).unwrap_or(Bytes.new());
+          let expected_total_len = 4 + hash_len;
+          if session.client_finished_buffer.byte_len() < expected_total_len {
+            // Finished メッセージ本体がまだ揃っていないので後続レコードを待機
+            return Ok(None);
+          }
+          if session.client_finished_buffer.byte_len() > expected_total_len {
+            session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
+            return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+          }
+
+          let client_verify_data = session.client_finished_buffer.slice(4, expected_total_len).unwrap_or(Bytes.new());
 
           // Server Finished までのトランスクリプトハッシュに対して検証
           let th_sf = transcript_hash_for_suite(&suite, &session.transcript);
@@ -1218,20 +1264,18 @@ fn process_client_finished_record(session: &mut HandshakeSession, raw_record: &B
 
           // トランスクリプト更新 (Client Finished 追加)
           let mut transcript = session.transcript.clone();
-          transcript.extend(&plaintext);
+          transcript.extend(&session.client_finished_buffer);
 
-          // アプリケーショントラフィック鍵導出
-          let th_cf = transcript_hash_for_suite(&suite, &transcript);
+          // アプリケーショントラフィック鍵導出: Server Finished 時点のトランスクリプトハッシュ (th_sf) を使用 (RFC 8446 §7.1)
           let ms_sec = master_secret(&suite, &session.handshake_sec);
-          let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_cf);
-          let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_cf);
+          let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+          let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
 
           let s_app_prot = new_record_protection(RecordDirection.Transmit, suite.clone(), s_ap_sec.clone());
           let c_app_prot = new_record_protection(RecordDirection.Receive, suite.clone(), c_ap_sec.clone());
 
           session.phase = HandshakePhase.Connected;
           session.transcript = transcript;
-          session.client_hs_protection = Some(c_prot);
           session.master_sec = ms_sec;
           session.server_app_sec = s_ap_sec;
           session.client_app_sec = c_ap_sec;

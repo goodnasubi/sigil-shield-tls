@@ -107,6 +107,23 @@ fn new_test_session(private_key: &EcdsaP256PrivateKey) -> HandshakeSession
   return new_handshake_session(cert_chain, private_key.clone());
 }
 
+fn new_oversized_test_session(private_key: &EcdsaP256PrivateKey) -> HandshakeSession
+  intent "16,384 バイトを超える証明書チェーンを持つテスト用セッションを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut large_cert = Bytes.with_capacity(18000);
+  let mut i = 0;
+  while i < 18000 {
+    large_cert.push(42);
+    i = i + 1;
+  }
+  let mut cert_chain = List.new();
+  cert_chain.push(large_cert);
+  return new_handshake_session(cert_chain, private_key.clone());
+}
+
 fn slice_bytes(b: &Bytes, start: Int, end: Int) -> Bytes
   intent "バイト列の一部を安全に取り出す"
   requires none
@@ -555,10 +572,9 @@ fn test_live_1rtt_handshake() -> Int
                   }
 
                   client_transcript.extend(&c_fin_msg);
-                  let th_cf = transcript_hash_for_suite(&suite, &client_transcript);
                   let ms_sec = master_secret(&suite, &hs_sec);
-                  let exp_c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_cf);
-                  let exp_s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_cf);
+                  let exp_c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+                  let exp_s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
 
                   let c_sec = handshake_client_app_sec(&session);
                   let s_sec = handshake_server_app_sec(&session);
@@ -1006,6 +1022,268 @@ fn test_handshake_rule_negatives() -> Int
   }
 }
 
+fn test_oversized_server_flight_fragmentation() -> Int
+  intent "16,384 バイト超のサーバーフライトが複数レコードに分割封印される試験 (P2 指摘対応)"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_oversized_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  // SH (0), CCS (1), sealed frag 1 (2), sealed frag 2 (3) で計 4 レコード
+                  if records.len() != 4 {
+                    return 601;
+                  }
+
+                  let sh_rec = get_record(&records, 0);
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+
+                  let sealed_frag1 = get_record(&records, 2);
+                  let sealed_frag2 = get_record(&records, 3);
+
+                  let pt1 = open_record_pt(&mut client_rx_hs, &sealed_frag1);
+                  if pt1.byte_len() != 16384 {
+                    return 602;
+                  }
+
+                  let pt2 = open_record_pt(&mut client_rx_hs, &sealed_frag2);
+                  if pt2.byte_len() == 0 {
+                    return 603;
+                  }
+
+                  // 合計サイズが 18,000 バイト超（証明書 18,000 + その他）
+                  if pt1.byte_len() + pt2.byte_len() <= 18000 {
+                    return 604;
+                  }
+
+                  return 0;
+                }
+                Err(_) => {
+                  return 600;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_client_finished_reassembly_across_records() -> Int
+  intent "Client Finished が複数保護レコードに分割された場合の再組み立て試験 (P2 指摘対応)"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  let sh_rec = get_record(&records, 0);
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let enc_flight_rec = get_record(&records, 2);
+
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                  let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                  let pt = open_record_pt(&mut client_rx_hs, &enc_flight_rec);
+                  if pt.byte_len() == 0 {
+                    return 701;
+                  }
+                  client_transcript.extend(&pt);
+
+                  // CCS 送信
+                  let c_ccs_rec = build_ccs_record();
+                  match handle_client_record(&mut session, &c_ccs_rec) {
+                    Ok(None) => {}
+                    _ => {
+                      return 702;
+                    }
+                  }
+
+                  // Client Finished (36 バイト) を構築
+                  let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                  let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+
+                  // 3 分割テスト:
+                  // 断片 1: 2 バイト (ヘッダ途中)
+                  // 断片 2: 12 バイト (ヘッダ残り + verify_data 一部)
+                  // 断片 3: 22 バイト (verify_data 残り)
+                  let frag1 = slice_bytes(&c_fin_msg, 0, 2);
+                  let frag2 = slice_bytes(&c_fin_msg, 2, 14);
+                  let frag3 = slice_bytes(&c_fin_msg, 14, 36);
+
+                  let rec1 = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &frag1, 0);
+                  let rec2 = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &frag2, 0);
+                  let rec3 = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &frag3, 0);
+
+                  // 断片 1 投入 -> まだ WaitingFinished
+                  match handle_client_record(&mut session, &rec1) {
+                    Ok(None) => {}
+                    _ => {
+                      return 703;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.WaitingFinished => {}
+                    _ => {
+                      return 704;
+                    }
+                  }
+
+                  // 断片 2 投入 -> まだ WaitingFinished
+                  match handle_client_record(&mut session, &rec2) {
+                    Ok(None) => {}
+                    _ => {
+                      return 705;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.WaitingFinished => {}
+                    _ => {
+                      return 706;
+                    }
+                  }
+
+                  // 断片 3 投入 -> Connected へ遷移！
+                  match handle_client_record(&mut session, &rec3) {
+                    Ok(None) => {}
+                    _ => {
+                      return 707;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.Connected => {}
+                    _ => {
+                      return 708;
+                    }
+                  }
+
+                  // 接続後のアプリケーションデータ疎通確認
+                  let ms_sec = master_secret(&suite, &hs_sec);
+                  let exp_c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+                  let exp_s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+
+                  let mut client_app_tx = new_record_protection(RecordDirection.Transmit, suite.clone(), exp_c_ap_sec.clone());
+                  let mut client_app_rx = new_record_protection(RecordDirection.Receive, suite.clone(), exp_s_ap_sec.clone());
+
+                  match handshake_client_app_protection(&session) {
+                    Some(s_app_rx) => {
+                      let mut server_rx = s_app_rx;
+                      let req = "POST /api HTTP/1.1\r\n\r\n".as_bytes();
+                      let c_rec = seal_record_bytes(&mut client_app_tx, &ContentType.ApplicationData, &req, 0);
+                      let s_pt = open_record_pt(&mut server_rx, &c_rec);
+                      if !bytes_eq(&s_pt, &req) {
+                        return 709;
+                      }
+                    }
+                    None => {
+                      return 710;
+                    }
+                  }
+
+                  return 0;
+                }
+                Err(_) => {
+                  return 700;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
 pub fn main() -> Int
   intent "Stage 3 ハンドシェイク状態機械の全テストを実行する"
   requires none
@@ -1035,6 +1313,16 @@ pub fn main() -> Int
   let r5 = test_handshake_rule_negatives();
   if r5 != 0 {
     return r5;
+  }
+
+  let r6 = test_oversized_server_flight_fragmentation();
+  if r6 != 0 {
+    return r6;
+  }
+
+  let r7 = test_client_finished_reassembly_across_records();
+  if r7 != 0 {
+    return r7;
   }
 
   return 0;
