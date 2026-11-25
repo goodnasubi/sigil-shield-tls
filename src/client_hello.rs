@@ -430,7 +430,7 @@ pub fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, ShieldError> {
 ///
 /// 名前は ASCII の小文字に正規化する。
 /// 末尾の `.`、IP アドレスのリテラル、使えない文字、253 バイトを超える長さ、
-/// 63 バイトを超えるラベルは「一致しない名前と同じ（Invalid）」扱いにする。
+/// 63 バイトを超えるラベル、先頭・末尾がハイフンのラベルは「一致しない名前と同じ（Invalid）」扱いにする。
 fn parse_and_validate_sni_hostname(raw: &[u8]) -> ServerName {
     if raw.is_empty() || raw.len() > 253 {
         return ServerName::Invalid(raw.to_vec());
@@ -461,6 +461,11 @@ fn parse_and_validate_sni_hostname(raw: &[u8]) -> ServerName {
             return ServerName::Invalid(raw.to_vec());
         }
 
+        // 各ラベルは英数字で始まり英数字で終わる必要がある（先頭・末尾のハイフンは拒絶）
+        if label.starts_with('-') || label.ends_with('-') {
+            return ServerName::Invalid(raw.to_vec());
+        }
+
         if !first_label {
             normalized.push('.');
         }
@@ -476,4 +481,41 @@ fn parse_and_validate_sni_hostname(raw: &[u8]) -> ServerName {
     }
 
     ServerName::Valid(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sni_hyphen_validation() {
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"-xample.com"),
+            ServerName::Invalid(b"-xample.com".to_vec())
+        );
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"example-.com"),
+            ServerName::Invalid(b"example-.com".to_vec())
+        );
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"example.-com"),
+            ServerName::Invalid(b"example.-com".to_vec())
+        );
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"example.com-"),
+            ServerName::Invalid(b"example.com-".to_vec())
+        );
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"-"),
+            ServerName::Invalid(b"-".to_vec())
+        );
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"example.com"),
+            ServerName::Valid("example.com".to_string())
+        );
+        assert_eq!(
+            parse_and_validate_sni_hostname(b"sub-domain.example-host.com"),
+            ServerName::Valid("sub-domain.example-host.com".to_string())
+        );
+    }
 }
