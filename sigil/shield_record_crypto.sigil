@@ -1,0 +1,370 @@
+module shield_record_crypto
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_cipher_suite.aead_open;
+use shield_cipher_suite.aead_seal;
+use shield_cipher_suite.cipher_suite_tag_len;
+use shield_key_schedule.derive_traffic_iv;
+use shield_key_schedule.derive_traffic_key;
+use shield_key_schedule.next_traffic_secret;
+use shield_limits.max_encrypted_record_payload;
+use shield_limits.max_plain_record_payload;
+use shield_record.ContentType;
+use shield_record.content_type_from_u8;
+use shield_record.content_type_to_u8;
+use shield_record.parse_record_header;
+
+// TLS 1.3 保護レコード（ADR 0063 決定 1.3, RFC 8446 §5.2, §5.3）
+//
+// - 方向別の 64 ビットシーケンス番号（1 つの鍵ごとに 0 から開始、鍵更新で 0 にリセット）
+// - Nonce の構成 (12 バイト IV と 64 ビットシーケンス番号の XOR)
+// - レコード暗号化 (5 バイトヘッダ AAD、内部平文構築、末尾パディング対応)
+// - レコード復号と検査:
+//   - 内部平文 2^14 + 1 (16,385) バイト以下、平文断片 2^14 (16,384) バイト以下、暗号文 2^14 + 256 (16,640) バイト以下
+//   - 内部平文種別は Handshake, Alert, ApplicationData に限定 (ChangeCipherSpec は unexpected_message, RFC 8446 §5)
+//   - 内部平文が全ゼロなら unexpected_message
+//   - ハンドシェイクの平文断片長 0 なら decode_error (RFC 8446 §5.1)
+//   - AEAD 認証失敗時は bad_record_mac で即座に終了し読み続けない (poisoning)
+
+pub enum RecordDirection {
+  Transmit,
+  Receive,
+}
+
+pub fn make_nonce(iv: &Bytes, sequence_number: Int) -> Bytes
+  intent "64 ビットシーケンス番号と 12 バイト IV から Nonce を構成する (RFC 8446 §5.3)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut nonce = Bytes.with_capacity(12);
+  let mut i = 0;
+  while i < 4 {
+    nonce.push(iv.get(i).unwrap_or(0));
+    i = i + 1;
+  }
+  let s0 = sequence_number >> 56 & 255;
+  let s1 = sequence_number >> 48 & 255;
+  let s2 = sequence_number >> 40 & 255;
+  let s3 = sequence_number >> 32 & 255;
+  let s4 = sequence_number >> 24 & 255;
+  let s5 = sequence_number >> 16 & 255;
+  let s6 = sequence_number >> 8 & 255;
+  let s7 = sequence_number & 255;
+
+  nonce.push(iv.get(4).unwrap_or(0) ^ s0);
+  nonce.push(iv.get(5).unwrap_or(0) ^ s1);
+  nonce.push(iv.get(6).unwrap_or(0) ^ s2);
+  nonce.push(iv.get(7).unwrap_or(0) ^ s3);
+  nonce.push(iv.get(8).unwrap_or(0) ^ s4);
+  nonce.push(iv.get(9).unwrap_or(0) ^ s5);
+  nonce.push(iv.get(10).unwrap_or(0) ^ s6);
+  nonce.push(iv.get(11).unwrap_or(0) ^ s7);
+  return nonce;
+}
+
+pub struct RecordProtection {
+  direction: RecordDirection,
+  suite: CipherSuite,
+  traffic_secret: Bytes,
+  key: Bytes,
+  iv: Bytes,
+  sequence_number: Int,
+  is_poisoned: Bool,
+}
+
+pub fn new_record_protection(direction: RecordDirection, suite: CipherSuite, traffic_secret: Bytes) -> RecordProtection
+  intent "RecordProtection インスタンスを作成する"
+  requires none
+  ensures none
+  effects none
+{
+  let key = derive_traffic_key(&suite, &traffic_secret);
+  let iv = derive_traffic_iv(&suite, &traffic_secret);
+  return RecordProtection { direction: direction, suite: suite, traffic_secret: traffic_secret, key: key, iv: iv, sequence_number: 0, is_poisoned: false };
+}
+
+pub fn record_protection_sequence_number(prot: &RecordProtection) -> Int
+  intent "現在のシーケンス番号を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return prot.sequence_number;
+}
+
+pub fn record_protection_is_poisoned(prot: &RecordProtection) -> Bool
+  intent "毒入れフラグを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return prot.is_poisoned;
+}
+
+pub fn record_protection_key(prot: &RecordProtection) -> Bytes
+  intent "現在の暗号鍵を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return prot.key.clone();
+}
+
+pub fn record_protection_iv(prot: &RecordProtection) -> Bytes
+  intent "現在の IV を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return prot.iv.clone();
+}
+
+pub fn record_protection_traffic_secret(prot: &RecordProtection) -> Bytes
+  intent "現在の Traffic Secret を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return prot.traffic_secret.clone();
+}
+
+pub fn record_protection_suite(prot: &RecordProtection) -> CipherSuite
+  intent "現在の CipherSuite を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return prot.suite.clone();
+}
+
+pub fn set_record_protection_sequence_number(prot: &mut RecordProtection, seq: Int)
+  intent "シーケンス番号を設定する（テスト用）"
+  requires none
+  ensures none
+  effects none
+{
+  prot.sequence_number = seq;
+}
+
+pub fn seal_record(prot: &mut RecordProtection, content_type: &ContentType, plaintext: &Bytes, padding_len: Int) -> Result<Bytes, ShieldError>
+  intent "レコードの暗号化を行う（外側 5 バイトヘッダ + 暗号文 + 16 バイト認証タグ）"
+  requires none
+  ensures none
+  effects none
+{
+  if prot.is_poisoned {
+    return Err(ShieldError.Fatal(AlertDescription.InternalError));
+  }
+
+  // 平文断片長検査 (2^14 バイト以下)
+  if plaintext.byte_len() > max_plain_record_payload() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  // 保護レコードの内側種別は Handshake, Alert, ApplicationData に限定 (RFC 8446 §5)
+  // ChangeCipherSpec は保護レコード内では許可されない
+  let ct_val = content_type_to_u8(&content_type);
+  if ct_val != 21 && ct_val != 22 && ct_val != 23 {
+    return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+  }
+
+  // 長さ 0 のハンドシェイク断片は拒否する (RFC 8446 §5.1)
+  if ct_val == 22 && plaintext.byte_len() == 0 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let inner_len = plaintext.byte_len() + 1 + padding_len;
+  if inner_len > max_plain_record_payload() + 1 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let encrypted_len = inner_len + cipher_suite_tag_len(&prot.suite);
+  if encrypted_len > max_encrypted_record_payload() {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let mut inner_plaintext = Bytes.with_capacity(inner_len);
+  inner_plaintext.extend(&plaintext);
+  inner_plaintext.push(ct_val);
+  let mut p = 0;
+  while p < padding_len {
+    inner_plaintext.push(0);
+    p = p + 1;
+  }
+
+  // 外側レコードヘッダ (5 バイト): ContentType::ApplicationData (0x17), 0x0303, encrypted_len
+  let mut aad = Bytes.with_capacity(5);
+  aad.push(23);
+  aad.push(3);
+  aad.push(3);
+  aad.push(encrypted_len / 256);
+  aad.push(encrypted_len % 256);
+
+  let nonce = make_nonce(&prot.iv, prot.sequence_number);
+  match aead_seal(&prot.suite, &prot.key, &nonce, &aad, &inner_plaintext) {
+    Ok(ciphertext_and_tag) => {
+      prot.sequence_number = prot.sequence_number + 1;
+      let mut record = Bytes.with_capacity(5 + ciphertext_and_tag.byte_len());
+      record.extend(&aad);
+      record.extend(&ciphertext_and_tag);
+      return Ok(record);
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+}
+
+pub struct OpenRecordOutcome {
+  content_type: ContentType,
+  plaintext: Bytes,
+  consumed_len: Int,
+}
+
+pub fn open_outcome_content_type(outcome: &OpenRecordOutcome) -> ContentType
+  intent "OpenRecordOutcome から ContentType を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return outcome.content_type.clone();
+}
+
+pub fn open_outcome_plaintext(outcome: &OpenRecordOutcome) -> Bytes
+  intent "OpenRecordOutcome から復号平文を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return outcome.plaintext.clone();
+}
+
+pub fn open_outcome_consumed_len(outcome: &OpenRecordOutcome) -> Int
+  intent "OpenRecordOutcome から消費バイト数を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return outcome.consumed_len;
+}
+
+pub fn open_record(prot: &mut RecordProtection, record_bytes: &Bytes) -> Result<OpenRecordOutcome, ShieldError>
+  intent "保護レコードの復号と検査を行う"
+  requires none
+  ensures none
+  effects none
+{
+  if prot.is_poisoned {
+    return Err(ShieldError.Fatal(AlertDescription.BadRecordMac));
+  }
+
+  if record_bytes.byte_len() < 5 {
+    return Err(ShieldError.Incomplete(5 - record_bytes.byte_len()));
+  }
+
+  // 先頭 5 バイトの厳密検査
+  match parse_record_header(&record_bytes, true) {
+    Ok(header) => {
+      // 保護レコードの外側種別は application_data (23) でなければならない
+      if content_type_to_u8(&header.content_type) != 23 {
+        return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+      }
+
+      let encrypted_len = header.length;
+      let tag_len = cipher_suite_tag_len(&prot.suite);
+      if encrypted_len < tag_len + 1 {
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+
+      let total_record_len = 5 + encrypted_len;
+      if record_bytes.byte_len() < total_record_len {
+        return Err(ShieldError.Incomplete(total_record_len - record_bytes.byte_len()));
+      }
+
+      let aad = record_bytes.slice(0, 5).unwrap_or(Bytes.new());
+      let ciphertext_and_tag = record_bytes.slice(5, total_record_len).unwrap_or(Bytes.new());
+      let nonce = make_nonce(&prot.iv, prot.sequence_number);
+
+      match aead_open(&prot.suite, &prot.key, &nonce, &aad, &ciphertext_and_tag) {
+        Ok(inner_plaintext) => {
+          // RFC 8446 §5.4: TLSInnerPlaintext の長さは 2^14 + 1 バイト以下
+          if inner_plaintext.byte_len() > max_plain_record_payload() + 1 {
+            return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+          }
+
+          // 内部平文パース: 末尾の 0 パディングを除去し最後の非ゼロバイトを種別とする
+          let mut last_nonzero = -1;
+          let mut idx = inner_plaintext.byte_len() - 1;
+          while idx >= 0 {
+            if inner_plaintext.get(idx).unwrap_or(0) != 0 {
+              last_nonzero = idx;
+              idx = -1;
+            } else {
+              idx = idx - 1;
+            }
+          }
+
+          if last_nonzero < 0 {
+            // 内部平文が全ゼロ（種別を持たない） -> unexpected_message
+            return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+          }
+
+          let inner_type_byte = inner_plaintext.get(last_nonzero).unwrap_or(0);
+          match content_type_from_u8(inner_type_byte) {
+            Some(inner_ct) => {
+              // 保護レコードの内側種別は Handshake, Alert, ApplicationData に限定 (RFC 8446 §5)
+              // ChangeCipherSpec (20) 等は unexpected_message アラートで終了する
+              let inner_val = content_type_to_u8(&inner_ct);
+              if inner_val != 21 && inner_val != 22 && inner_val != 23 {
+                return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+              }
+
+              let plain_fragment = inner_plaintext.slice(0, last_nonzero).unwrap_or(Bytes.new());
+
+              // 長さ 0 のハンドシェイク断片は拒否する (RFC 8446 §5.1)
+              if inner_val == 22 && plain_fragment.byte_len() == 0 {
+                return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+              }
+
+              // 平文断片長検査 (2^14 バイト以下)
+              if plain_fragment.byte_len() > max_plain_record_payload() {
+                return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+              }
+
+              prot.sequence_number = prot.sequence_number + 1;
+
+              return Ok(OpenRecordOutcome { content_type: inner_ct, plaintext: plain_fragment, consumed_len: total_record_len });
+            }
+            None => {
+              return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+            }
+          }
+        }
+        Err(e) => {
+          prot.is_poisoned = true;
+          return Err(e);
+        }
+      }
+    }
+    Err(e) => {
+      return Err(e);
+    }
+  }
+}
+
+pub fn update_record_protection_key(prot: &mut RecordProtection)
+  intent "鍵更新を適用する: 次世代 Traffic Secret を導出し key, iv を再計算してシーケンス番号を 0 にリセット"
+  requires none
+  ensures none
+  effects none
+{
+  prot.traffic_secret = next_traffic_secret(&prot.suite, &prot.traffic_secret);
+  prot.key = derive_traffic_key(&prot.suite, &prot.traffic_secret);
+  prot.iv = derive_traffic_iv(&prot.suite, &prot.traffic_secret);
+  prot.sequence_number = 0;
+}

@@ -5,7 +5,7 @@ module shield_cipher_suite
 use shield_alert.AlertDescription;
 use shield_alert.ShieldError;
 
-// TLS 1.3 暗号スイート定義と選択（ADR 0063 決定 1, RFC 8446 §B.4）
+// 暗号スイート定義と選択（ADR 0063 決定 1, RFC 8446 §B.4）
 //
 // 3 スイート対応:
 // - TLS_CHACHA20_POLY1305_SHA256 (0x1303)
@@ -20,17 +20,8 @@ pub enum CipherSuite {
   TlsAes256GcmSha384,
 }
 
-pub fn cipher_suite_code_chacha20_poly1305_sha256() -> Int
-  intent "TLS_CHACHA20_POLY1305_SHA256 (0x1303)"
-  requires none
-  ensures none
-  effects none
-{
-  return 4867;
-}
-
-pub fn cipher_suite_code_aes_128_gcm_sha256() -> Int
-  intent "TLS_AES_128_GCM_SHA256 (0x1301)"
+pub fn tls_aes_128_gcm_sha256_code() -> Int
+  intent "TLS_AES_128_GCM_SHA256 のスイートコード（0x1301）"
   requires none
   ensures none
   effects none
@@ -38,8 +29,8 @@ pub fn cipher_suite_code_aes_128_gcm_sha256() -> Int
   return 4865;
 }
 
-pub fn cipher_suite_code_aes_256_gcm_sha384() -> Int
-  intent "TLS_AES_256_GCM_SHA384 (0x1302)"
+pub fn tls_aes_256_gcm_sha384_code() -> Int
+  intent "TLS_AES_256_GCM_SHA384 のスイートコード（0x1302）"
   requires none
   ensures none
   effects none
@@ -47,8 +38,17 @@ pub fn cipher_suite_code_aes_256_gcm_sha384() -> Int
   return 4866;
 }
 
+pub fn tls_chacha20_poly1305_sha256_code() -> Int
+  intent "TLS_CHACHA20_POLY1305_SHA256 のスイートコード（0x1303）"
+  requires none
+  ensures none
+  effects none
+{
+  return 4867;
+}
+
 pub fn cipher_suite_from_u16(code: Int) -> Option<CipherSuite>
-  intent "スイート番号から暗号スイートを取得する"
+  intent "16 ビット整数コードから CipherSuite を復元する"
   requires none
   ensures none
   effects none
@@ -65,8 +65,8 @@ pub fn cipher_suite_from_u16(code: Int) -> Option<CipherSuite>
   return None;
 }
 
-pub fn cipher_suite_as_u16(suite: &CipherSuite) -> Int
-  intent "暗号スイートの 16 ビット識別子を返す"
+pub fn cipher_suite_to_u16(suite: &CipherSuite) -> Int
+  intent "CipherSuite を 16 ビット整数コードに変換する"
   requires none
   ensures none
   effects none
@@ -79,7 +79,7 @@ pub fn cipher_suite_as_u16(suite: &CipherSuite) -> Int
 }
 
 pub fn cipher_suite_name(suite: &CipherSuite) -> String
-  intent "暗号スイートの名前を返す"
+  intent "CipherSuite の文字列表現を返す"
   requires none
   ensures none
   effects none
@@ -136,118 +136,110 @@ pub fn cipher_suite_hash_len(suite: &CipherSuite) -> Int
 }
 
 pub fn select_cipher_suite(client_suites: &List<Int>) -> Result<CipherSuite, ShieldError>
-  intent "クライアント提示スイート一覧からサーバー優先順で最初の 1 つを選択する"
+  intent "クライアント提示スイート一覧からサーバー優先順に基づき最初の 1 つを選択する"
   requires none
   ensures none
   effects none
 {
-  // サーバー優先順: ChaCha20-Poly1305 > AES-128-GCM > AES-256-GCM (ADR 0063 決定 1)
-  let chacha_code = cipher_suite_code_chacha20_poly1305_sha256();
+  // サーバー優先順 1: ChaCha20-Poly1305 (4867)
   let mut i = 0;
   while i < client_suites.len() {
-    let c = client_suites.get(i).map(|x| x + 0).unwrap_or(0);
-    if c == chacha_code {
+    if client_suites.get(i).map(|x| x + 0).unwrap_or(0) == 4867 {
       return Ok(CipherSuite.TlsChacha20Poly1305Sha256);
     }
     i = i + 1;
   }
 
-  let aes128_code = cipher_suite_code_aes_128_gcm_sha256();
-  let mut j = 0;
-  while j < client_suites.len() {
-    let c = client_suites.get(j).map(|x| x + 0).unwrap_or(0);
-    if c == aes128_code {
+  // サーバー優先順 2: AES-128-GCM (4865)
+  i = 0;
+  while i < client_suites.len() {
+    if client_suites.get(i).map(|x| x + 0).unwrap_or(0) == 4865 {
       return Ok(CipherSuite.TlsAes128GcmSha256);
     }
-    j = j + 1;
+    i = i + 1;
   }
 
-  let aes256_code = cipher_suite_code_aes_256_gcm_sha384();
-  let mut k = 0;
-  while k < client_suites.len() {
-    let c = client_suites.get(k).map(|x| x + 0).unwrap_or(0);
-    if c == aes256_code {
+  // サーバー優先順 3: AES-256-GCM (4866)
+  i = 0;
+  while i < client_suites.len() {
+    if client_suites.get(i).map(|x| x + 0).unwrap_or(0) == 4866 {
       return Ok(CipherSuite.TlsAes256GcmSha384);
     }
-    k = k + 1;
+    i = i + 1;
   }
 
   return Err(ShieldError.Fatal(AlertDescription.HandshakeFailure));
 }
 
-pub fn cipher_suite_seal(suite: &CipherSuite, key: &Secret, iv: &Bytes, aad: &Bytes, plaintext: &Secret) -> Result<Bytes, ShieldError>
-  intent "暗号スイートに応じた AEAD 暗号化を行う"
+pub fn aead_seal(suite: &CipherSuite, key: &Bytes, nonce_bytes: &Bytes, aad: &Bytes, plaintext: &Bytes) -> Result<Bytes, ShieldError>
+  intent "AEAD 暗号化を行い暗号文と 16 バイト認証タグの連結バイト列を返す"
   requires none
   ensures none
   effects none
 {
-  return match Nonce96.from_slice(&iv) {
-    Ok(nonce) => match suite {
-      CipherSuite.TlsChacha20Poly1305Sha256 => match ChaCha20Poly1305Key.from_secret(key.clone()) {
-        Ok(k) => match chacha20_poly1305_seal(&k, nonce, &aad, &plaintext) {
-          Ok(ct) => Ok(ct),
-          Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+  match Nonce96.from_slice(&nonce_bytes) {
+    Err(_) => {
+      return Err(ShieldError.Fatal(AlertDescription.InternalError));
+    }
+    Ok(nonce) => {
+      let secret_pt = Secret.from_bytes(plaintext.clone());
+      return match suite {
+        CipherSuite.TlsChacha20Poly1305Sha256 => match ChaCha20Poly1305Key.from_secret(Secret.from_bytes(key.clone())) {
+          Err(_) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+          Ok(k) => match chacha20_poly1305_seal(&k, nonce, &aad, &secret_pt) {
+            Ok(ct) => Ok(ct),
+            Err(_) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+          },
         },
-        Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
-      },
-      CipherSuite.TlsAes128GcmSha256 => match Aes128GcmKey.from_secret(key.clone()) {
-        Ok(k) => match aes128_gcm_seal(&k, nonce, &aad, &plaintext) {
-          Ok(ct) => Ok(ct),
-          Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+        CipherSuite.TlsAes128GcmSha256 => match Aes128GcmKey.from_secret(Secret.from_bytes(key.clone())) {
+          Err(_) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+          Ok(k) => match aes128_gcm_seal(&k, nonce, &aad, &secret_pt) {
+            Ok(ct) => Ok(ct),
+            Err(_) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+          },
         },
-        Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
-      },
-      CipherSuite.TlsAes256GcmSha384 => match Aes256GcmKey.from_secret(key.clone()) {
-        Ok(k) => match aes256_gcm_seal(&k, nonce, &aad, &plaintext) {
-          Ok(ct) => Ok(ct),
-          Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+        CipherSuite.TlsAes256GcmSha384 => match Aes256GcmKey.from_secret(Secret.from_bytes(key.clone())) {
+          Err(_) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+          Ok(k) => match aes256_gcm_seal(&k, nonce, &aad, &secret_pt) {
+            Ok(ct) => Ok(ct),
+            Err(_) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
+          },
         },
-        Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
-      },
-    },
-    Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
-  };
+      };
+    }
+  }
 }
 
-pub fn cipher_suite_open(suite: &CipherSuite, key: &Secret, iv: &Bytes, aad: &Bytes, ciphertext_and_tag: &Bytes) -> Result<Secret, ShieldError>
-  intent "暗号スイートに応じた AEAD 復号および認証を行う"
+pub fn aead_open(suite: &CipherSuite, key: &Bytes, nonce_bytes: &Bytes, aad: &Bytes, ciphertext_and_tag: &Bytes) -> Result<Bytes, ShieldError>
+  intent "AEAD 復号とタグ検証を行い成功時に平文バイト列を返す。失敗時は bad_record_mac"
   requires none
   ensures none
   effects none
 {
-  return match Nonce96.from_slice(&iv) {
+  return match Nonce96.from_slice(&nonce_bytes) {
+    Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
     Ok(nonce) => match suite {
-      CipherSuite.TlsChacha20Poly1305Sha256 => match ChaCha20Poly1305Key.from_secret(key.clone()) {
+      CipherSuite.TlsChacha20Poly1305Sha256 => match ChaCha20Poly1305Key.from_secret(Secret.from_bytes(key.clone())) {
+        Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
         Ok(k) => match chacha20_poly1305_open(&k, &nonce, &aad, &ciphertext_and_tag) {
-          Ok(pt) => Ok(pt),
-          Err(e) => match e {
-            AeadError.AuthenticationFailed => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
-            _ => Err(ShieldError.Fatal(AlertDescription.DecodeError)),
-          },
+          Ok(pt_secret) => Ok(pt_secret.expose()),
+          Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
         },
-        Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
       },
-      CipherSuite.TlsAes128GcmSha256 => match Aes128GcmKey.from_secret(key.clone()) {
+      CipherSuite.TlsAes128GcmSha256 => match Aes128GcmKey.from_secret(Secret.from_bytes(key.clone())) {
+        Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
         Ok(k) => match aes128_gcm_open(&k, &nonce, &aad, &ciphertext_and_tag) {
-          Ok(pt) => Ok(pt),
-          Err(e) => match e {
-            AeadError.AuthenticationFailed => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
-            _ => Err(ShieldError.Fatal(AlertDescription.DecodeError)),
-          },
+          Ok(pt_secret) => Ok(pt_secret.expose()),
+          Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
         },
-        Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
       },
-      CipherSuite.TlsAes256GcmSha384 => match Aes256GcmKey.from_secret(key.clone()) {
+      CipherSuite.TlsAes256GcmSha384 => match Aes256GcmKey.from_secret(Secret.from_bytes(key.clone())) {
+        Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
         Ok(k) => match aes256_gcm_open(&k, &nonce, &aad, &ciphertext_and_tag) {
-          Ok(pt) => Ok(pt),
-          Err(e) => match e {
-            AeadError.AuthenticationFailed => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
-            _ => Err(ShieldError.Fatal(AlertDescription.DecodeError)),
-          },
+          Ok(pt_secret) => Ok(pt_secret.expose()),
+          Err(_) => Err(ShieldError.Fatal(AlertDescription.BadRecordMac)),
         },
-        Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
       },
     },
-    Err(e) => Err(ShieldError.Fatal(AlertDescription.InternalError)),
   };
 }
