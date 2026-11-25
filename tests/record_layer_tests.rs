@@ -258,3 +258,33 @@ fn test_reassemble_message_size_exceeds_16kib() {
     let res = reassembler.feed_bytes(&rec);
     assert_eq!(res, Err(ShieldError::Fatal(AlertDescription::DecodeError)));
 }
+
+#[test]
+fn test_reassemble_coalesced_records_unconsumed_bytes() {
+    let mut reassembler = HandshakeReassembler::new();
+    let ch_bytes = build_valid_client_hello();
+    let ch_record = wrap_in_record(0x16, 0x0303, &ch_bytes);
+
+    // ClientHello レコードの後ろに ChangeCipherSpec レコード [0x14, 0x03, 0x03, 0x00, 0x01, 0x01] が連結
+    let ccs_record = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+    let mut coalesced = ch_record;
+    coalesced.extend_from_slice(&ccs_record);
+
+    let res = reassembler
+        .feed_bytes(&coalesced)
+        .expect("feed coalesced input");
+    assert_eq!(res, Some(ch_bytes));
+
+    // 未消費のバッファに ccs_record が残っていることを確認
+    assert_eq!(reassembler.unconsumed_bytes(), &ccs_record);
+
+    // take_unconsumed_bytes で取り出すとバッファが空になること
+    let unconsumed = reassembler.take_unconsumed_bytes();
+    assert_eq!(unconsumed, ccs_record);
+    assert!(reassembler.unconsumed_bytes().is_empty());
+
+    // into_unconsumed_bytes の動作検証
+    let mut reassembler2 = HandshakeReassembler::new();
+    reassembler2.feed_bytes(&coalesced).unwrap();
+    assert_eq!(reassembler2.into_unconsumed_bytes(), ccs_record);
+}

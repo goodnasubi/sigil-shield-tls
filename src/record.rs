@@ -119,6 +119,21 @@ impl HandshakeReassembler {
         self.record_count
     }
 
+    /// 現在バッファに残っている未消費の入力バイト列への参照を返す。
+    pub fn unconsumed_bytes(&self) -> &[u8] {
+        &self.stream_buf
+    }
+
+    /// バッファに残っている未消費の入力バイト列を取り出してバッファを空にする。
+    pub fn take_unconsumed_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.stream_buf)
+    }
+
+    /// 再構成器を消費し、バッファに残っている未消費の入力バイト列を返す。
+    pub fn into_unconsumed_bytes(self) -> Vec<u8> {
+        self.stream_buf
+    }
+
     /// 入力バイト列を受け取り、再構成を進める。
     ///
     /// 不変条件（決定 4.4）:
@@ -127,6 +142,9 @@ impl HandshakeReassembler {
     ///
     /// 完全な ClientHello メッセージが完成した場合、4 バイトのハンドシェイクヘッダを含む
     /// バイト列を `Some(Vec<u8>)` で返す。
+    /// ClientHello レコードの後ろに後続レコード等の未消費データが連結していた場合、
+    /// そのバイト列は内部バッファに残るため、[`take_unconsumed_bytes`] や [`into_unconsumed_bytes`]
+    /// 等で取り出して次段の処理に引き継ぐことができる。
     pub fn feed_bytes(&mut self, input: &[u8]) -> Result<Option<Vec<u8>>, ShieldError> {
         if input.is_empty() {
             // 入力 0 バイトで前進しない呼び出しは終了
