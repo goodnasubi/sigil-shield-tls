@@ -111,13 +111,14 @@ pub fn poly1305_mac(key: &[u8; 32], message: &[u8]) -> [u8; 16] {
     g3 &= 0x3ffffff;
     let g4 = h4 + c;
 
-    let mask = (g4 >> 26).wrapping_neg() & 1;
-    let not_mask = 1 ^ mask;
+    let mask = (g4 >> 26).wrapping_neg();
+    let not_mask = !mask;
+    let g4_masked = g4 & 0x3ffffff;
     h0 = (h0 & not_mask) | (g0 & mask);
     h1 = (h1 & not_mask) | (g1 & mask);
     h2 = (h2 & not_mask) | (g2 & mask);
     h3 = (h3 & not_mask) | (g3 & mask);
-    h4 = (h4 & not_mask) | ((g4 & 0x3ffffff) & mask);
+    h4 = (h4 & not_mask) | (g4_masked & mask);
 
     let w0 = ((h0 | (h1 << 26)) & 0xffffffff) as u32;
     let w1 = (((h1 >> 6) | (h2 << 20)) & 0xffffffff) as u32;

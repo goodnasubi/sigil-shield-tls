@@ -401,3 +401,79 @@ fn test_key_update_message_encoding_decoding() {
         Err(ShieldError::Fatal(AlertDescription::DecodeError))
     );
 }
+
+#[test]
+fn test_poly1305_codex_reproduced_tamper_rejected() {
+    // Codex Cloud レビュー P1 指摘の再現テスト:
+    // 全ゼロ鍵・ノンス、AAD "aad"、64 バイトのゼロ平文で、
+    // 最初の暗号文バイトに 31 を XOR した場合に確実に BadRecordMac で拒否されること
+    use sigil_shield_tls::crypto::{chacha20_poly1305_open, chacha20_poly1305_seal};
+
+    let key = [0u8; 32];
+    let nonce = [0u8; 12];
+    let aad = b"aad";
+    let pt = [0u8; 64];
+
+    let mut sealed = chacha20_poly1305_seal(&key, &nonce, aad, &pt).unwrap();
+
+    // 最初の暗号文バイトを 31 で XOR
+    sealed[0] ^= 31;
+
+    let res = chacha20_poly1305_open(&key, &nonce, aad, &sealed);
+    assert_eq!(
+        res,
+        Err(ShieldError::Fatal(AlertDescription::BadRecordMac)),
+        "改ざんされた暗号文は必ず BadRecordMac で拒否されなければならない"
+    );
+}
+
+#[test]
+fn test_poly1305_known_answers() {
+    // Poly1305 既知回答テスト (RFC 8439 付録 A.3 ベクタ)
+    use sigil_shield_tls::crypto::poly1305_mac;
+
+    // Vector #1: key 32 バイト全ゼロ、msg 64 バイト全ゼロ -> tag 16 バイト全ゼロ
+    let k1 = [0u8; 32];
+    let m1 = [0u8; 64];
+    assert_eq!(poly1305_mac(&k1, &m1), [0u8; 16]);
+
+    // Vector #5: r = [2, 0, ...], s = [0; 16], msg = [0xff; 16] -> tag = [3, 0, ...]
+    let mut k5 = [0u8; 32];
+    k5[0] = 2;
+    let m5 = [0xffu8; 16];
+    let mut expected5 = [0u8; 16];
+    expected5[0] = 3;
+    assert_eq!(poly1305_mac(&k5, &m5), expected5);
+
+    // Vector #9: r = [2, 0, ...], s = [0; 16], msg = [0xfd, 0xff, ..., 0xff] -> tag = [0xfa, 0xff, ..., 0xff]
+    let mut k9 = [0u8; 32];
+    k9[0] = 2;
+    let mut m9 = [0xffu8; 16];
+    m9[0] = 0xfd;
+    let mut expected9 = [0xffu8; 16];
+    expected9[0] = 0xfa;
+    assert_eq!(poly1305_mac(&k9, &m9), expected9);
+}
+
+#[test]
+fn test_chacha20_poly1305_tamper_every_byte() {
+    use sigil_shield_tls::crypto::{chacha20_poly1305_open, chacha20_poly1305_seal};
+
+    let key = [0x42u8; 32];
+    let nonce = [0x24u8; 12];
+    let aad = b"test authenticated data";
+    let pt = b"the quick brown fox jumps over the lazy dog";
+
+    let sealed = chacha20_poly1305_seal(&key, &nonce, aad, pt).unwrap();
+
+    // 暗号文とタグの全バイトについて、各バイトの改変が例外なく検知されること
+    for i in 0..sealed.len() {
+        let mut tampered = sealed.clone();
+        tampered[i] ^= 0x01;
+        assert_eq!(
+            chacha20_poly1305_open(&key, &nonce, aad, &tampered),
+            Err(ShieldError::Fatal(AlertDescription::BadRecordMac)),
+            "byte index {i} 改ざんが検出されませんでした"
+        );
+    }
+}
