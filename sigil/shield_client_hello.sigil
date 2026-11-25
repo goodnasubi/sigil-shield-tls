@@ -396,7 +396,14 @@ pub fn parse_and_validate_sni_hostname(name_bytes: &Bytes) -> ServerName
       while j < pos {
         let ch = name_bytes.get(j).unwrap_or(0);
         if ch >= 48 && ch <= 57 {
-          num_val = num_val * 10 + (ch - 48);
+          if label_numeric && num_val <= 255 {
+            let next_val = num_val * 10 + (ch - 48);
+            if next_val > 255 {
+              num_val = 256;
+            } else {
+              num_val = next_val;
+            }
+          }
         } else {
           label_numeric = false;
         }

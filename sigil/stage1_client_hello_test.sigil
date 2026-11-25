@@ -747,6 +747,45 @@ fn test_sni_normalization() -> Bool
     ServerName.Invalid(_) => {}
   }
 
+  // 10. 64ビット整数境界を超える数値ラベルを含むホスト名（IPv4 誤判定やオーバーフローが起きないこと）
+  let sn_long_num = parse_and_validate_sni_hostname(&"18446744073709551616.1.1.1".as_bytes());
+  match sn_long_num {
+    ServerName.Valid(s) => {
+      if s != "18446744073709551616.1.1.1" {
+        return false;
+      }
+    }
+    ServerName.Invalid(_) => {
+      return false;
+    }
+  }
+
+  // 11. 最大63桁の数字ラベルを含むホスト名
+  let sn_63_digits = parse_and_validate_sni_hostname(&"123456789012345678901234567890123456789012345678901234567890123.example.com".as_bytes());
+  match sn_63_digits {
+    ServerName.Valid(s) => {
+      if s != "123456789012345678901234567890123456789012345678901234567890123.example.com" {
+        return false;
+      }
+    }
+    ServerName.Invalid(_) => {
+      return false;
+    }
+  }
+
+  // 12. 多数の数字を含む長い英数字ラベルのホスト名
+  let sn_long_alnum = parse_and_validate_sni_hostname(&"a12345678901234567890123456789012345678901234567890123456789012.example.com".as_bytes());
+  match sn_long_alnum {
+    ServerName.Valid(s) => {
+      if s != "a12345678901234567890123456789012345678901234567890123456789012.example.com" {
+        return false;
+      }
+    }
+    ServerName.Invalid(_) => {
+      return false;
+    }
+  }
+
   return true;
 }
 
