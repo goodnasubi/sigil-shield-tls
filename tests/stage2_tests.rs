@@ -483,6 +483,116 @@ fn test_empty_handshake_fragment_rejected_on_open() {
 }
 
 #[test]
+fn test_protected_change_cipher_spec_rejected_on_seal_and_open() {
+    let suite = CipherSuite::TlsAes128GcmSha256;
+    let ks = KeySchedule::new(suite);
+    let secret = vec![0x88u8; suite.hash_len()];
+    let mut tx = RecordProtection::new(RecordDirection::Transmit, suite, secret.clone(), &ks);
+    let mut rx = RecordProtection::new(RecordDirection::Receive, suite, secret, &ks);
+
+    // 1. 送信側 (seal_record): ChangeCipherSpec は unexpected_message で拒否
+    assert_eq!(
+        tx.seal_record(ContentType::ChangeCipherSpec, &[1], 0),
+        Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage))
+    );
+    assert_eq!(
+        tx.seal_record(ContentType::ChangeCipherSpec, &[1], 16),
+        Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage))
+    );
+
+    // 2. 送信側: Handshake, Alert, ApplicationData は正常に暗号化可能
+    assert!(tx.seal_record(ContentType::Handshake, &[1], 0).is_ok());
+    assert!(tx.seal_record(ContentType::Alert, &[2, 0], 0).is_ok());
+    assert!(tx
+        .seal_record(ContentType::ApplicationData, &[42], 0)
+        .is_ok());
+
+    // 3. 受信側 (open_record): 暗号化された ChangeCipherSpec は unexpected_message で拒否
+    let inner_ccs = [0x01, ContentType::ChangeCipherSpec as u8];
+    let enc_len = inner_ccs.len() + rx.suite.tag_len();
+    let aad = [
+        ContentType::ApplicationData as u8,
+        0x03,
+        0x03,
+        (enc_len >> 8) as u8,
+        (enc_len & 0xff) as u8,
+    ];
+    let nonce = make_nonce(&rx.iv, rx.sequence_number);
+    let ct = rx.suite.seal(&rx.key, &nonce, &aad, &inner_ccs).unwrap();
+
+    let mut record = Vec::new();
+    record.extend_from_slice(&aad);
+    record.extend_from_slice(&ct);
+
+    let res = rx.open_record(&record);
+    assert_eq!(
+        res,
+        Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage))
+    );
+    assert!(!rx.is_poisoned);
+
+    // パディング付きの暗号化 ChangeCipherSpec も unexpected_message で拒否
+    let inner_ccs_padded = [0x01, ContentType::ChangeCipherSpec as u8, 0, 0, 0];
+    let enc_len_padded = inner_ccs_padded.len() + rx.suite.tag_len();
+    let aad_padded = [
+        ContentType::ApplicationData as u8,
+        0x03,
+        0x03,
+        (enc_len_padded >> 8) as u8,
+        (enc_len_padded & 0xff) as u8,
+    ];
+    let nonce_padded = make_nonce(&rx.iv, rx.sequence_number);
+    let ct_padded = rx
+        .suite
+        .seal(&rx.key, &nonce_padded, &aad_padded, &inner_ccs_padded)
+        .unwrap();
+
+    let mut record_padded = Vec::new();
+    record_padded.extend_from_slice(&aad_padded);
+    record_padded.extend_from_slice(&ct_padded);
+
+    let res_padded = rx.open_record(&record_padded);
+    assert_eq!(
+        res_padded,
+        Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage))
+    );
+    assert!(!rx.is_poisoned);
+
+    // 4. 受信側: Handshake, Alert, ApplicationData は正常に復号可能
+    let mut tx2 = RecordProtection::new(
+        RecordDirection::Transmit,
+        suite,
+        vec![0x99u8; suite.hash_len()],
+        &ks,
+    );
+    let mut rx2 = RecordProtection::new(
+        RecordDirection::Receive,
+        suite,
+        vec![0x99u8; suite.hash_len()],
+        &ks,
+    );
+
+    let hs_record = tx2
+        .seal_record(ContentType::Handshake, &[10, 11], 0)
+        .unwrap();
+    let (ct_hs, frag_hs, _) = rx2.open_record(&hs_record).unwrap();
+    assert_eq!(ct_hs, ContentType::Handshake);
+    assert_eq!(frag_hs, vec![10, 11]);
+
+    let alert_record = tx2.seal_record(ContentType::Alert, &[1, 0], 8).unwrap();
+    let (ct_al, frag_al, _) = rx2.open_record(&alert_record).unwrap();
+    assert_eq!(ct_al, ContentType::Alert);
+    assert_eq!(frag_al, vec![1, 0]);
+
+    let app_record = tx2
+        .seal_record(ContentType::ApplicationData, &[99], 4)
+        .unwrap();
+    let (ct_ap, frag_ap, _) = rx2.open_record(&app_record).unwrap();
+    assert_eq!(ct_ap, ContentType::ApplicationData);
+    assert_eq!(frag_ap, vec![99]);
+}
+
+#[test]
 fn test_key_update_record_and_sequence_number_reset() {
     let suite = CipherSuite::TlsAes256GcmSha384;
     let ks = KeySchedule::new(suite);

@@ -5,6 +5,7 @@
 //! - レコード暗号化 (5 バイトヘッダ AAD、内部平文構築、末尾パディング対応)
 //! - レコード復号と検査:
 //!   - 内部平文 2^14 + 1 (16,385) バイト以下、平文断片 2^14 (16,384) バイト以下、暗号文 2^14 + 256 (16,640) バイト以下
+//!   - 内部平文種別は Handshake, Alert, ApplicationData に限定 (ChangeCipherSpec は unexpected_message, RFC 8446 §5)
 //!   - 内部平文が全ゼロなら unexpected_message
 //!   - ハンドシェイクの平文断片長 0 なら decode_error (RFC 8446 §5.1)
 //!   - AEAD 認証失敗時は bad_record_mac で即座に終了し読み続けない (poisoning)
@@ -80,6 +81,15 @@ impl RecordProtection {
         // 平文断片長検査 (2^14 バイト以下)
         if plaintext.len() > MAX_PLAIN_RECORD_PAYLOAD {
             return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+        }
+
+        // 保護レコードの内側種別は Handshake, Alert, ApplicationData に限定 (RFC 8446 §5)
+        // ChangeCipherSpec は保護レコード内では許可されない
+        if !matches!(
+            content_type,
+            ContentType::Handshake | ContentType::Alert | ContentType::ApplicationData
+        ) {
+            return Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage));
         }
 
         // 長さ 0 のハンドシェイク断片は拒否する (RFC 8446 §5.1)
@@ -202,6 +212,15 @@ impl RecordProtection {
         let inner_type_byte = inner_plaintext[type_idx];
         let inner_content_type = ContentType::from_u8(inner_type_byte)
             .ok_or(ShieldError::Fatal(AlertDescription::UnexpectedMessage))?;
+
+        // 保護レコードの内側種別は Handshake, Alert, ApplicationData に限定 (RFC 8446 §5)
+        // ChangeCipherSpec を含むそれ以外の種別は unexpected_message アラートで終了する
+        if !matches!(
+            inner_content_type,
+            ContentType::Handshake | ContentType::Alert | ContentType::ApplicationData
+        ) {
+            return Err(ShieldError::Fatal(AlertDescription::UnexpectedMessage));
+        }
 
         let plain_fragment = &inner_plaintext[..type_idx];
 
