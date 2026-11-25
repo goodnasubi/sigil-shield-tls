@@ -69,4 +69,6 @@ run_entry stage2_key_schedule_test "Stage 2 key schedule derivation and RFC 8448
 run_entry stage2_record_crypto_test "Stage 2 record protection and RFC 8448 records"
 run_entry stage2_key_update_test "Stage 2 key update and limits"
 
-printf 'All Stage 1 and Stage 2 evaluator and native tests passed.\n'
+run_entry stage3_handshake_test "Stage 3 handshake state machine and RFC 8448 traces"
+
+printf 'All Stage 1, Stage 2, and Stage 3 evaluator and native tests passed.\n'

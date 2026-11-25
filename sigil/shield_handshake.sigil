@@ -1,0 +1,1254 @@
+module shield_handshake
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_cipher_suite.cipher_suite_hash_len;
+use shield_cipher_suite.cipher_suite_to_u16;
+use shield_cipher_suite.select_cipher_suite;
+use shield_client_hello.ClientHello;
+use shield_client_hello.ServerName;
+use shield_client_hello.client_hello_alpn_protocols;
+use shield_client_hello.client_hello_cipher_suites;
+use shield_client_hello.client_hello_key_shares;
+use shield_client_hello.client_hello_legacy_compression_methods;
+use shield_client_hello.client_hello_legacy_session_id;
+use shield_client_hello.client_hello_legacy_version;
+use shield_client_hello.client_hello_random;
+use shield_client_hello.client_hello_server_name;
+use shield_client_hello.client_hello_signature_algorithms;
+use shield_client_hello.client_hello_supported_groups;
+use shield_client_hello.client_hello_supported_versions;
+use shield_client_hello.ext_alpn;
+use shield_client_hello.ext_key_share;
+use shield_client_hello.ext_supported_versions;
+use shield_client_hello.group_x25519;
+use shield_client_hello.key_share_exchange;
+use shield_client_hello.key_share_group;
+use shield_client_hello.parse_client_hello;
+use shield_key_schedule.client_application_traffic_secret_0;
+use shield_key_schedule.client_handshake_traffic_secret;
+use shield_key_schedule.early_secret;
+use shield_key_schedule.handshake_secret;
+use shield_key_schedule.hkdf_expand_label;
+use shield_key_schedule.master_secret;
+use shield_key_schedule.server_application_traffic_secret_0;
+use shield_key_schedule.server_handshake_traffic_secret;
+use shield_record.ContentType;
+use shield_record.parse_record_header;
+use shield_record.record_header_content_type;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.RecordProtection;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_content_type;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_record_crypto.seal_record;
+
+// TLS 1.3 ハンドシェイク状態機械（ADR 0063 決定 1.2, 決定 6 段 3）
+//
+// - ServerHello, HelloRetryRequest, EncryptedExtensions, Certificate, CertificateVerify, Finished の送受信
+// - 鍵交換: x25519 のみ対応（P-256 は段 6 で追加）
+// - サーバー署名: ecdsa_secp256r1_sha256 のみ対応
+// - ALPN: 提示があれば "http/1.1" のみ選定、含まなければ no_application_protocol。提示なしなら "http/1.1" 扱い
+// - PSK / 0-RTT: 構造のみ検査して受理せず完全ハンドシェイクを実行。早期レコードは致命的アラートで終了
+
+pub fn magic_hrr_random() -> Bytes
+  intent "RFC 8446 §4.1.3 定義の HelloRetryRequest 固定ランダムバイト列を返す"
+  requires none
+  ensures result.byte_len() == 32
+  effects none
+{
+  let mut out = Bytes.with_capacity(32);
+  out.push(207);
+  out.push(33);
+  out.push(173);
+  out.push(116);
+  out.push(229);
+  out.push(154);
+  out.push(97);
+  out.push(17);
+  out.push(190);
+  out.push(29);
+  out.push(140);
+  out.push(2);
+  out.push(30);
+  out.push(101);
+  out.push(184);
+  out.push(145);
+  out.push(194);
+  out.push(162);
+  out.push(17);
+  out.push(22);
+  out.push(122);
+  out.push(187);
+  out.push(140);
+  out.push(94);
+  out.push(7);
+  out.push(158);
+  out.push(9);
+  out.push(226);
+  out.push(200);
+  out.push(168);
+  out.push(51);
+  out.push(156);
+  return out;
+}
+
+pub fn sig_alg_ecdsa_secp256r1_sha256() -> Int
+  intent "ecdsa_secp256r1_sha256 署名アルゴリズム識別子（0x0403）"
+  requires none
+  ensures none
+  effects none
+{
+  return 1027;
+}
+
+fn bytes_eq(a: &Bytes, b: &Bytes) -> Bool
+  intent "2 つの Bytes が一致するか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn int_list_eq(a: &List<Int>, b: &List<Int>) -> Bool
+  intent "2 つの List<Int> が一致するか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    match a.get(i) {
+      Some(va) => {
+        match b.get(i) {
+          Some(vb) => {
+            if va != vb {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn bytes_list_eq(a: &List<Bytes>, b: &List<Bytes>) -> Bool
+  intent "2 つの List<Bytes> が一致するか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    match a.get(i) {
+      Some(ba) => {
+        match b.get(i) {
+          Some(bb) => {
+            if !bytes_eq(&ba, &bb) {
+              return false;
+            }
+          }
+          None => {
+            return false;
+          }
+        }
+      }
+      None => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn hmac_sha256_internal(key: &Bytes, message: &Bytes) -> Bytes
+  intent "任意長鍵で HMAC-SHA-256 を計算する"
+  requires none
+  ensures result.byte_len() == 32
+  effects none
+{
+  let mut kb = key.clone();
+  if kb.byte_len() > 64 {
+    kb = sha256(&kb);
+  }
+  while kb.byte_len() < 64 {
+    kb.push(0);
+  }
+  let mut ipad = Bytes.with_capacity(64 + message.byte_len());
+  let mut opad = Bytes.with_capacity(64 + 32);
+  let mut i = 0;
+  while i < 64 {
+    let b = kb.get(i).unwrap_or(0);
+    ipad.push(b ^ 54);
+    opad.push(b ^ 92);
+    i = i + 1;
+  }
+  ipad.extend(&message);
+  let inner_hash = sha256(&ipad);
+  opad.extend(&inner_hash);
+  return sha256(&opad);
+}
+
+fn hmac_sha384_internal(key: &Bytes, message: &Bytes) -> Bytes
+  intent "任意長鍵で HMAC-SHA-384 を計算する"
+  requires none
+  ensures result.byte_len() == 48
+  effects none
+{
+  let mut kb = key.clone();
+  if kb.byte_len() > 128 {
+    kb = sha384(&kb);
+  }
+  while kb.byte_len() < 128 {
+    kb.push(0);
+  }
+  let mut ipad = Bytes.with_capacity(128 + message.byte_len());
+  let mut opad = Bytes.with_capacity(128 + 48);
+  let mut i = 0;
+  while i < 128 {
+    let b = kb.get(i).unwrap_or(0);
+    ipad.push(b ^ 54);
+    opad.push(b ^ 92);
+    i = i + 1;
+  }
+  ipad.extend(&message);
+  let inner_hash = sha384(&ipad);
+  opad.extend(&inner_hash);
+  return sha384(&opad);
+}
+
+pub fn hmac_for_suite(suite: &CipherSuite, key: &Bytes, message: &Bytes) -> Bytes
+  intent "CipherSuite に適合するハッシュ関数で HMAC を計算する"
+  requires none
+  ensures none
+  effects none
+{
+  return match suite {
+    CipherSuite.TlsAes256GcmSha384 => hmac_sha384_internal(&key, &message),
+    _ => hmac_sha256_internal(&key, &message),
+  };
+}
+
+pub fn transcript_hash_for_suite(suite: &CipherSuite, messages: &Bytes) -> Bytes
+  intent "CipherSuite に適合するトランスクリプトハッシュを計算する"
+  requires none
+  ensures none
+  effects none
+{
+  return match suite {
+    CipherSuite.TlsAes256GcmSha384 => sha384(&messages),
+    _ => sha256(&messages),
+  };
+}
+
+pub fn build_server_hello(random: &Bytes, legacy_session_id: &Bytes, cipher_suite: &CipherSuite, server_share: Option<Bytes>, selected_group: Int) -> Bytes
+  intent "ServerHello ハンドシェイクメッセージ（ハンドシェイクヘッダ含む）を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  // legacy_version: 0x0303
+  payload.push(3);
+  payload.push(3);
+
+  // random (32 bytes)
+  payload.extend(&random);
+
+  // legacy_session_id_echo
+  payload.push(legacy_session_id.byte_len());
+  payload.extend(&legacy_session_id);
+
+  // cipher_suite
+  let suite_code = cipher_suite_to_u16(&cipher_suite);
+  payload.push(suite_code / 256);
+  payload.push(suite_code % 256);
+
+  // legacy_compression_method: 0x00
+  payload.push(0);
+
+  // extensions
+  let mut extensions = Bytes.new();
+
+  // 1. supported_versions (0x002b): 0x0304
+  extensions.push(0);
+  extensions.push(ext_supported_versions());
+  extensions.push(0);
+  extensions.push(2);
+  extensions.push(3);
+  extensions.push(4);
+
+  // 2. key_share (0x0033)
+  match server_share {
+    Some(share) => {
+      // 通常の ServerHello: KeyShareEntry (group: 2 bytes, key_exchange length: 2 bytes, data)
+      let share_entry_len = 4 + share.byte_len();
+      extensions.push(0);
+      extensions.push(ext_key_share());
+      extensions.push(share_entry_len / 256);
+      extensions.push(share_entry_len % 256);
+      extensions.push(selected_group / 256);
+      extensions.push(selected_group % 256);
+      extensions.push(share.byte_len() / 256);
+      extensions.push(share.byte_len() % 256);
+      extensions.extend(&share);
+    }
+    None => {
+      // HelloRetryRequest: selected_group のみ (2 bytes)
+      extensions.push(0);
+      extensions.push(ext_key_share());
+      extensions.push(0);
+      extensions.push(2);
+      extensions.push(selected_group / 256);
+      extensions.push(selected_group % 256);
+    }
+  }
+
+  payload.push(extensions.byte_len() / 256);
+  payload.push(extensions.byte_len() % 256);
+  payload.extend(&extensions);
+
+  // ハンドシェイクヘッダ（4 バイト: msg_type = 2, length = 3 bytes）
+  let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+  msg.push(2);
+  let plen = payload.byte_len();
+  msg.push(plen / 65536);
+  msg.push(plen / 256 % 256);
+  msg.push(plen % 256);
+  msg.extend(&payload);
+  return msg;
+}
+
+pub fn build_ccs_record() -> Bytes
+  intent "互換モード用 ChangeCipherSpec レコード（6 バイト）を構築する"
+  requires none
+  ensures result.byte_len() == 6
+  effects none
+{
+  let mut out = Bytes.with_capacity(6);
+  out.push(20);
+  out.push(3);
+  out.push(3);
+  out.push(0);
+  out.push(1);
+  out.push(1);
+  return out;
+}
+
+pub fn build_encrypted_extensions(alpn_selected: Bool) -> Bytes
+  intent "EncryptedExtensions メッセージ（ハンドシェイクヘッダ含む）を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut extensions = Bytes.new();
+  if alpn_selected {
+    let alpn = "http/1.1".as_bytes();
+    let alpn_list_len = 1 + alpn.byte_len();
+    let ext_len = 2 + alpn_list_len;
+    extensions.push(0);
+    extensions.push(ext_alpn());
+    extensions.push(ext_len / 256);
+    extensions.push(ext_len % 256);
+    extensions.push(alpn_list_len / 256);
+    extensions.push(alpn_list_len % 256);
+    extensions.push(alpn.byte_len());
+    extensions.extend(&alpn);
+  }
+
+  let mut payload = Bytes.new();
+  payload.push(extensions.byte_len() / 256);
+  payload.push(extensions.byte_len() % 256);
+  payload.extend(&extensions);
+
+  let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+  msg.push(8);
+  let plen = payload.byte_len();
+  msg.push(plen / 65536);
+  msg.push(plen / 256 % 256);
+  msg.push(plen % 256);
+  msg.extend(&payload);
+  return msg;
+}
+
+pub fn build_certificate(cert_chain: &List<Bytes>) -> Bytes
+  intent "Certificate ハンドシェイクメッセージ（ハンドシェイクヘッダ含む）を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cert_list = Bytes.new();
+  let mut i = 0;
+  while i < cert_chain.len() {
+    match cert_chain.get(i) {
+      Some(cert_der) => {
+        let clen = cert_der.byte_len();
+        cert_list.push(clen / 65536);
+        cert_list.push(clen / 256 % 256);
+        cert_list.push(clen % 256);
+        cert_list.extend(&cert_der);
+        cert_list.push(0);
+        cert_list.push(0);
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  let mut payload = Bytes.new();
+  payload.push(0);
+  let clist_len = cert_list.byte_len();
+  payload.push(clist_len / 65536);
+  payload.push(clist_len / 256 % 256);
+  payload.push(clist_len % 256);
+  payload.extend(&cert_list);
+
+  let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+  msg.push(11);
+  let plen = payload.byte_len();
+  msg.push(plen / 65536);
+  msg.push(plen / 256 % 256);
+  msg.push(plen % 256);
+  msg.extend(&payload);
+  return msg;
+}
+
+pub fn build_certificate_verify(private_key: &EcdsaP256PrivateKey, transcript_hash: &Bytes) -> Result<Bytes, ShieldError>
+  intent "CertificateVerify ハンドシェイクメッセージを構築する（RFC 8446 §4.4.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut verify_input = Bytes.new();
+  let mut i = 0;
+  while i < 64 {
+    verify_input.push(32);
+    i = i + 1;
+  }
+  let ctx = "TLS 1.3, server CertificateVerify".as_bytes();
+  verify_input.extend(&ctx);
+  verify_input.push(0);
+  verify_input.extend(&transcript_hash);
+
+  match ecdsa_p256_sign(&private_key, &verify_input) {
+    Ok(sig) => {
+      let sig_der = sig.to_der();
+      let mut payload = Bytes.new();
+      payload.push(4);
+      payload.push(3);
+      payload.push(sig_der.byte_len() / 256);
+      payload.push(sig_der.byte_len() % 256);
+      payload.extend(&sig_der);
+
+      let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+      msg.push(15);
+      let plen = payload.byte_len();
+      msg.push(plen / 65536);
+      msg.push(plen / 256 % 256);
+      msg.push(plen % 256);
+      msg.extend(&payload);
+      return Ok(msg);
+    }
+    Err(_) => {
+      return Err(ShieldError.Fatal(AlertDescription.InternalError));
+    }
+  }
+}
+
+pub fn finished_verify_data(suite: &CipherSuite, base_key: &Bytes, transcript_hash: &Bytes) -> Bytes
+  intent "Finished の verify_data を計算する（RFC 8446 §4.4.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let hash_len = cipher_suite_hash_len(&suite);
+  let empty = Bytes.new();
+  let finished_key = hkdf_expand_label(&suite, &base_key, "finished", &empty, hash_len);
+  return hmac_for_suite(&suite, &finished_key, &transcript_hash);
+}
+
+pub fn build_finished(suite: &CipherSuite, base_key: &Bytes, transcript_hash: &Bytes) -> Bytes
+  intent "Finished ハンドシェイクメッセージを構築する（RFC 8446 §4.4.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let verify_data = finished_verify_data(&suite, &base_key, &transcript_hash);
+  let mut msg = Bytes.with_capacity(4 + verify_data.byte_len());
+  msg.push(20);
+  msg.push(0);
+  msg.push(0);
+  msg.push(verify_data.byte_len());
+  msg.extend(&verify_data);
+  return msg;
+}
+
+pub fn verify_finished_data(suite: &CipherSuite, base_key: &Bytes, transcript_hash: &Bytes, expected_verify_data: &Bytes) -> Bool
+  intent "Finished の verify_data を検証する（RFC 8446 §4.4.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let computed = finished_verify_data(&suite, &base_key, &transcript_hash);
+  return ct_eq(&computed, &expected_verify_data);
+}
+
+pub fn wrap_in_handshake_record(payload: &Bytes) -> Bytes
+  intent "ハンドシェイクメッセージを平文 TLS レコード（0x16, 0x0303）で包む"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(5 + payload.byte_len());
+  out.push(22);
+  out.push(3);
+  out.push(3);
+  out.push(payload.byte_len() / 256);
+  out.push(payload.byte_len() % 256);
+  out.extend(&payload);
+  return out;
+}
+
+pub fn compare_client_hellos(ch1: &ClientHello, ch2: &ClientHello) -> Bool
+  intent "HRR 後の 2 つの ClientHello が key_share 以外で一致するか検証する（決定 1.2）"
+  requires none
+  ensures none
+  effects none
+{
+  if client_hello_legacy_version(&ch1) != client_hello_legacy_version(&ch2) {
+    return false;
+  }
+  let r1 = client_hello_random(&ch1);
+  let r2 = client_hello_random(&ch2);
+  if !bytes_eq(&r1, &r2) {
+    return false;
+  }
+  let sid1 = client_hello_legacy_session_id(&ch1);
+  let sid2 = client_hello_legacy_session_id(&ch2);
+  if !bytes_eq(&sid1, &sid2) {
+    return false;
+  }
+  let comp1 = client_hello_legacy_compression_methods(&ch1);
+  let comp2 = client_hello_legacy_compression_methods(&ch2);
+  if !bytes_eq(&comp1, &comp2) {
+    return false;
+  }
+  let cs1 = client_hello_cipher_suites(&ch1);
+  let cs2 = client_hello_cipher_suites(&ch2);
+  if !int_list_eq(&cs1, &cs2) {
+    return false;
+  }
+  let sv1 = client_hello_supported_versions(&ch1);
+  let sv2 = client_hello_supported_versions(&ch2);
+  if !int_list_eq(&sv1, &sv2) {
+    return false;
+  }
+  let sg1 = client_hello_supported_groups(&ch1);
+  let sg2 = client_hello_supported_groups(&ch2);
+  if !int_list_eq(&sg1, &sg2) {
+    return false;
+  }
+  let sa1 = client_hello_signature_algorithms(&ch1);
+  let sa2 = client_hello_signature_algorithms(&ch2);
+  if !int_list_eq(&sa1, &sa2) {
+    return false;
+  }
+  let alpn1 = client_hello_alpn_protocols(&ch1);
+  let alpn2 = client_hello_alpn_protocols(&ch2);
+  if !bytes_list_eq(&alpn1, &alpn2) {
+    return false;
+  }
+  let sn1 = client_hello_server_name(&ch1);
+  let sn2 = client_hello_server_name(&ch2);
+  let sn_ok = match sn1 {
+    Some(s1) => match sn2 {
+      Some(s2) => match s1 {
+        ServerName.Valid(str1) => match s2 {
+          ServerName.Valid(str2) => str1 == str2,
+          _ => false,
+        },
+        ServerName.Invalid(b1) => match s2 {
+          ServerName.Invalid(b2) => bytes_eq(&b1, &b2),
+          _ => false,
+        },
+      },
+      None => false,
+    },
+    None => match sn2 {
+      Some(_) => false,
+      None => true,
+    },
+  };
+  return sn_ok;
+}
+
+pub enum HandshakePhase {
+  Initial,
+  WaitingClientHello2,
+  WaitingFinished,
+  Connected,
+  Failed(AlertDescription),
+}
+
+pub struct HandshakeSession {
+  phase: HandshakePhase,
+  cert_chain: List<Bytes>,
+  private_key: EcdsaP256PrivateKey,
+  selected_suite: Option<CipherSuite>,
+  alpn_selected: Bool,
+  hrr_sent: Bool,
+  ccs_received: Bool,
+  transcript: Bytes,
+  ch1_raw: Bytes,
+  ch1_parsed: Option<ClientHello>,
+  early_sec: Bytes,
+  handshake_sec: Bytes,
+  server_hs_sec: Bytes,
+  client_hs_sec: Bytes,
+  server_hs_protection: Option<RecordProtection>,
+  client_hs_protection: Option<RecordProtection>,
+  master_sec: Bytes,
+  server_app_sec: Bytes,
+  client_app_sec: Bytes,
+  server_app_protection: Option<RecordProtection>,
+  client_app_protection: Option<RecordProtection>,
+}
+
+pub fn new_handshake_session(cert_chain: List<Bytes>, private_key: EcdsaP256PrivateKey) -> HandshakeSession
+  intent "新規ハンドシェイクセッションを作成する"
+  requires none
+  ensures none
+  effects none
+{
+  return HandshakeSession { phase: HandshakePhase.Initial, cert_chain: cert_chain, private_key: private_key, selected_suite: None, alpn_selected: false, hrr_sent: false, ccs_received: false, transcript: Bytes.new(), ch1_raw: Bytes.new(), ch1_parsed: None, early_sec: Bytes.new(), handshake_sec: Bytes.new(), server_hs_sec: Bytes.new(), client_hs_sec: Bytes.new(), server_hs_protection: None, client_hs_protection: None, master_sec: Bytes.new(), server_app_sec: Bytes.new(), client_app_sec: Bytes.new(), server_app_protection: None, client_app_protection: None };
+}
+
+pub fn handshake_phase(session: &HandshakeSession) -> HandshakePhase
+  intent "現在のハンドシェイクフェーズを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.phase.clone();
+}
+
+pub fn handshake_selected_suite(session: &HandshakeSession) -> Option<CipherSuite>
+  intent "合意した CipherSuite を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.selected_suite.clone();
+}
+
+pub fn handshake_alpn_selected(session: &HandshakeSession) -> Bool
+  intent "ALPN で http/1.1 が合意されたかを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.alpn_selected;
+}
+
+pub fn handshake_server_app_protection(session: &HandshakeSession) -> Option<RecordProtection>
+  intent "確立されたサーバーアプリケーション保護コンテキストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.server_app_protection.clone();
+}
+
+pub fn handshake_client_app_protection(session: &HandshakeSession) -> Option<RecordProtection>
+  intent "確立されたクライアントアプリケーション保護コンテキストを返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.client_app_protection.clone();
+}
+
+pub fn handshake_server_app_sec(session: &HandshakeSession) -> Bytes
+  intent "確立されたサーバーアプリケーショントラフィック秘密を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.server_app_sec.clone();
+}
+
+pub fn handshake_client_app_sec(session: &HandshakeSession) -> Bytes
+  intent "確立されたクライアントアプリケーショントラフィック秘密を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return session.client_app_sec.clone();
+}
+
+// サーバー応答フライトの戻り値
+pub struct ServerFlight {
+  records: List<Bytes>,
+}
+
+pub fn flight_records(flight: &ServerFlight) -> List<Bytes>
+  intent "ServerFlight に含まれるレコード一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = List.new();
+  let mut i = 0;
+  while i < flight.records.len() {
+    match flight.records.get(i) {
+      Some(r) => {
+        out.push(r.clone());
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn check_supported_versions(ch: &ClientHello) -> Result<Bool, ShieldError>
+  intent "supported_versions に TLS 1.3 (0x0304) が含まれるか検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let vers = client_hello_supported_versions(&ch);
+  let mut i = 0;
+  while i < vers.len() {
+    match vers.get(i) {
+      Some(v) => {
+        if v == 772 {
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(ShieldError.Fatal(AlertDescription.ProtocolVersion));
+}
+
+fn check_signature_algorithms(ch: &ClientHello) -> Result<Bool, ShieldError>
+  intent "signature_algorithms に ecdsa_secp256r1_sha256 が含まれるか検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let sigs = client_hello_signature_algorithms(&ch);
+  let target = sig_alg_ecdsa_secp256r1_sha256();
+  let mut i = 0;
+  while i < sigs.len() {
+    match sigs.get(i) {
+      Some(s) => {
+        if s == target {
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(ShieldError.Fatal(AlertDescription.HandshakeFailure));
+}
+
+fn check_supported_groups(ch: &ClientHello) -> Result<Bool, ShieldError>
+  intent "supported_groups に x25519 が含まれるか検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let groups = client_hello_supported_groups(&ch);
+  let target = group_x25519();
+  let mut i = 0;
+  while i < groups.len() {
+    match groups.get(i) {
+      Some(g) => {
+        if g == target {
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return Err(ShieldError.Fatal(AlertDescription.HandshakeFailure));
+}
+
+fn check_alpn(ch: &ClientHello) -> Result<Bool, ShieldError>
+  intent "ALPN プロトコルを検証し、http/1.1 合意可否を判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let alpn_list = client_hello_alpn_protocols(&ch);
+  if alpn_list.is_empty() {
+    // 提示なし: http/1.1 扱いだが EncryptedExtensions には載せない
+    return Ok(false);
+  }
+
+  let expected = "http/1.1".as_bytes();
+  let mut i = 0;
+  while i < alpn_list.len() {
+    match alpn_list.get(i) {
+      Some(proto) => {
+        if bytes_eq(&proto, &expected) {
+          return Ok(true);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+
+  // 提示があったが http/1.1 を含まない
+  return Err(ShieldError.Fatal(AlertDescription.NoApplicationProtocol));
+}
+
+fn find_x25519_key_share(ch: &ClientHello) -> Option<Bytes>
+  intent "key_share 拡張から x25519 の公開鍵バイト列（32 バイト）を抽出する"
+  requires none
+  ensures none
+  effects none
+{
+  let shares = client_hello_key_shares(&ch);
+  let target_group = group_x25519();
+  let mut i = 0;
+  while i < shares.len() {
+    match shares.get(i) {
+      Some(ks) => {
+        if key_share_group(&ks) == target_group {
+          let exchange = key_share_exchange(&ks);
+          if exchange.byte_len() == 32 {
+            return Some(exchange);
+          }
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+pub fn handle_client_hello_explicit(session: &mut HandshakeSession, ch_bytes: &Bytes, server_random: &Bytes, server_x25519_priv: &X25519PrivateKey) -> Result<ServerFlight, ShieldError>
+  intent "明示的な鍵・乱数パラメータを用いて ClientHello を処理し応答フライトを生成する（RFC 8448 ベクタ照合用）"
+  requires none
+  ensures none
+  effects none
+{
+  let ch = parse_client_hello(&ch_bytes)?;
+
+  // 1. supported_versions 検査
+  check_supported_versions(&ch)?;
+
+  // 2. 暗号スイート選択
+  let client_suites = client_hello_cipher_suites(&ch);
+  let suite = select_cipher_suite(&client_suites)?;
+
+  // 3. 署名方式検査 (ecdsa_secp256r1_sha256 必須)
+  check_signature_algorithms(&ch)?;
+
+  // 4. supported_groups 検査 (x25519 必須)
+  check_supported_groups(&ch)?;
+
+  // 5. ALPN 検査
+  let alpn_selected = check_alpn(&ch)?;
+
+  // 6. x25519 key_share の有無
+  let client_share_opt = find_x25519_key_share(&ch);
+  match client_share_opt {
+    Some(client_pub_bytes) => {
+      // 1-RTT フライト生成
+      return emit_1rtt_server_flight(&mut session, &ch_bytes, &ch, suite, alpn_selected, &server_random, &server_x25519_priv, &client_pub_bytes);
+    }
+    None => {
+      // key_share に x25519 がない
+      if session.hrr_sent {
+        session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+        return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+      }
+      return emit_hrr_server_flight(&mut session, &ch_bytes, ch, suite);
+    }
+  }
+}
+
+fn emit_hrr_server_flight(session: &mut HandshakeSession, ch1_raw: &Bytes, ch1_parsed: ClientHello, suite: CipherSuite) -> Result<ServerFlight, ShieldError>
+  intent "HelloRetryRequest フライトを生成し状態を WaitingClientHello2 に移行する"
+  requires none
+  ensures none
+  effects none
+{
+  let hrr_rand = magic_hrr_random();
+  let sid = client_hello_legacy_session_id(&ch1_parsed);
+  let hrr_msg = build_server_hello(&hrr_rand, &sid, &suite, None, group_x25519());
+  let hrr_rec = wrap_in_handshake_record(&hrr_msg);
+  let ccs_rec = build_ccs_record();
+
+  // トランスクリプト更新:
+  // message_hash(sha256(ClientHello1)) || HelloRetryRequest
+  let ch1_hash = transcript_hash_for_suite(&suite, &ch1_raw);
+  let mut synth = Bytes.with_capacity(4 + ch1_hash.byte_len());
+  synth.push(254);
+  synth.push(0);
+  synth.push(0);
+  synth.push(ch1_hash.byte_len());
+  synth.extend(&ch1_hash);
+
+  let mut transcript = Bytes.new();
+  transcript.extend(&synth);
+  transcript.extend(&hrr_msg);
+
+  session.phase = HandshakePhase.WaitingClientHello2;
+  session.selected_suite = Some(suite);
+  session.hrr_sent = true;
+  session.transcript = transcript;
+  session.ch1_raw = ch1_raw.clone();
+  session.ch1_parsed = Some(ch1_parsed);
+
+  let mut records = List.new();
+  records.push(hrr_rec);
+  records.push(ccs_rec);
+  return Ok(ServerFlight { records: records });
+}
+
+fn emit_1rtt_server_flight(session: &mut HandshakeSession, ch_bytes: &Bytes, ch: &ClientHello, suite: CipherSuite, alpn_selected: Bool, server_random: &Bytes, server_x25519_priv: &X25519PrivateKey, client_pub_bytes: &Bytes) -> Result<ServerFlight, ShieldError>
+  intent "1-RTT ServerHello から Finished までのフライトを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let server_pub = x25519_public_key(&server_x25519_priv);
+  let server_pub_bytes = server_pub.as_bytes();
+
+  let mut shared_secret_opt = None;
+  match X25519PublicKey.from_bytes(client_pub_bytes.clone()) {
+    Ok(client_pub) => {
+      match x25519_shared_secret(&server_x25519_priv, &client_pub) {
+        Ok(s) => {
+          shared_secret_opt = Some(s.expose());
+        }
+        Err(_) => {
+          session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+          return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+        }
+      }
+    }
+    Err(_) => {
+      session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+      return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+    }
+  }
+  let shared_secret = shared_secret_opt.unwrap_or(Bytes.new());
+
+  // 鍵スケジュール
+  let early_sec = early_secret(&suite);
+  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+  // トランスクリプト更新
+  // HRR があった場合は既に synth || HRR が入っている
+  let mut transcript = session.transcript.clone();
+  transcript.extend(&ch_bytes);
+
+  // ServerHello メッセージ構築
+  let sid = client_hello_legacy_session_id(&ch);
+  let sh_msg = build_server_hello(&server_random, &sid, &suite, Some(server_pub_bytes), group_x25519());
+  let sh_rec = wrap_in_handshake_record(&sh_msg);
+  let ccs_rec = build_ccs_record();
+
+  transcript.extend(&sh_msg);
+
+  // ハンドシェイクトラフィック秘密導出
+  let th_sh = transcript_hash_for_suite(&suite, &transcript);
+  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+  let mut s_hs_prot = new_record_protection(RecordDirection.Transmit, suite.clone(), s_hs_sec.clone());
+  let c_hs_prot = new_record_protection(RecordDirection.Receive, suite.clone(), c_hs_sec.clone());
+
+  // EncryptedExtensions
+  let ee_msg = build_encrypted_extensions(alpn_selected);
+  transcript.extend(&ee_msg);
+
+  // Certificate
+  let cert_msg = build_certificate(&session.cert_chain);
+  transcript.extend(&cert_msg);
+
+  // CertificateVerify
+  let th_cert = transcript_hash_for_suite(&suite, &transcript);
+  let cv_msg = build_certificate_verify(&session.private_key, &th_cert)?;
+  transcript.extend(&cv_msg);
+
+  // Server Finished
+  let th_cv = transcript_hash_for_suite(&suite, &transcript);
+  let fin_msg = build_finished(&suite, &s_hs_sec, &th_cv);
+  transcript.extend(&fin_msg);
+
+  // 保護レコード封印: EE, Certificate, CertificateVerify, Finished を保護レコード化
+  // (一括フライトまたは個別レコード)
+  let mut flight_messages = Bytes.new();
+  flight_messages.extend(&ee_msg);
+  flight_messages.extend(&cert_msg);
+  flight_messages.extend(&cv_msg);
+  flight_messages.extend(&fin_msg);
+
+  let sealed_flight = seal_record(&mut s_hs_prot, &ContentType.Handshake, &flight_messages, 0)?;
+
+  // セッション状態更新
+  session.phase = HandshakePhase.WaitingFinished;
+  session.selected_suite = Some(suite);
+  session.alpn_selected = alpn_selected;
+  session.transcript = transcript;
+  session.early_sec = early_sec;
+  session.handshake_sec = hs_sec;
+  session.server_hs_sec = s_hs_sec;
+  session.client_hs_sec = c_hs_sec;
+  session.server_hs_protection = Some(s_hs_prot);
+  session.client_hs_protection = Some(c_hs_prot);
+
+  let mut records = List.new();
+  records.push(sh_rec);
+  records.push(ccs_rec);
+  records.push(sealed_flight);
+  return Ok(ServerFlight { records: records });
+}
+
+pub fn handle_client_hello2_explicit(session: &mut HandshakeSession, ch2_bytes: &Bytes, server_random: &Bytes, server_x25519_priv: &X25519PrivateKey) -> Result<ServerFlight, ShieldError>
+  intent "HRR 後の ClientHello2 を処理し 1-RTT フライトを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  match session.phase {
+    HandshakePhase.WaitingClientHello2 => {}
+    _ => {
+      session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+      return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+    }
+  }
+
+  let ch2 = parse_client_hello(&ch2_bytes)?;
+
+  // ClientHello1 との整合性検査 (key_share 以外の一致)
+  match session.ch1_parsed {
+    Some(ch1) => {
+      if !compare_client_hellos(&ch1, &ch2) {
+        session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+        return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+      }
+    }
+    None => {
+      session.phase = HandshakePhase.Failed(AlertDescription.InternalError);
+      return Err(ShieldError.Fatal(AlertDescription.InternalError));
+    }
+  }
+
+  // x25519 key_share が存在しなければ illegal_parameter
+  let client_share_opt = find_x25519_key_share(&ch2);
+  let mut client_pub_bytes_opt = None;
+  match client_share_opt {
+    Some(s) => {
+      client_pub_bytes_opt = Some(s);
+    }
+    None => {
+      session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+      return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+    }
+  }
+  let client_pub_bytes = client_pub_bytes_opt.unwrap_or(Bytes.new());
+
+  let mut suite_opt = None;
+  match session.selected_suite {
+    Some(s) => {
+      suite_opt = Some(s.clone());
+    }
+    None => {
+      session.phase = HandshakePhase.Failed(AlertDescription.InternalError);
+      return Err(ShieldError.Fatal(AlertDescription.InternalError));
+    }
+  }
+  let suite = suite_opt.unwrap_or(CipherSuite.TlsAes128GcmSha256);
+
+  let alpn_selected = check_alpn(&ch2)?;
+
+  return emit_1rtt_server_flight(&mut session, &ch2_bytes, &ch2, suite, alpn_selected, &server_random, &server_x25519_priv, &client_pub_bytes);
+}
+
+pub fn handle_client_record(session: &mut HandshakeSession, raw_record: &Bytes) -> Result<Option<ServerFlight>, ShieldError>
+  intent "受信レコード（ChangeCipherSpec または Client Finished）を処理する"
+  requires none
+  ensures none
+  effects none
+{
+  let is_enc = match session.client_hs_protection {
+    Some(_) => true,
+    None => false,
+  };
+  let header = parse_record_header(&raw_record, is_enc)?;
+  let ct = record_header_content_type(&header);
+
+  match ct {
+    ContentType.ChangeCipherSpec => {
+      // ChangeCipherSpec は ClientHello 後から Finished 前までに 1 回だけ受理して破棄
+      if session.ccs_received {
+        session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+        return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+      }
+      match session.phase {
+        HandshakePhase.WaitingClientHello2 => {
+          session.ccs_received = true;
+          return Ok(None);
+        }
+        HandshakePhase.WaitingFinished => {
+          session.ccs_received = true;
+          return Ok(None);
+        }
+        _ => {
+          session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+        }
+      }
+    }
+    ContentType.ApplicationData => {
+      // WaitingFinished 時の Client Finished 保護レコード
+      match session.phase {
+        HandshakePhase.WaitingFinished => {
+          return process_client_finished_record(&mut session, &raw_record);
+        }
+        _ => {
+          // 0-RTT や想定外フェーズでの ApplicationData は拒否（決定 1.2）
+          session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+        }
+      }
+    }
+    _ => {
+      session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+      return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+    }
+  }
+}
+
+fn process_client_finished_record(session: &mut HandshakeSession, raw_record: &Bytes) -> Result<Option<ServerFlight>, ShieldError>
+  intent "Client Finished 保護レコードを復号・照合しアプリケーション保護コンテキストを確立する"
+  requires none
+  ensures none
+  effects none
+{
+  match session.client_hs_protection {
+    Some(p) => {
+      let mut c_prot = p.clone();
+      let outcome = open_record(&mut c_prot, &raw_record)?;
+      let inner_ct = open_outcome_content_type(&outcome);
+      match inner_ct {
+        ContentType.Handshake => {}
+        _ => {
+          session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+        }
+      }
+
+      let plaintext = open_outcome_plaintext(&outcome);
+      if plaintext.byte_len() < 4 {
+        session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
+        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+      }
+
+      // msg_type == 20 (Finished)
+      if plaintext.get(0).unwrap_or(0) != 20 {
+        session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+        return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+      }
+
+      match session.selected_suite {
+        Some(suite) => {
+          let hash_len = cipher_suite_hash_len(&suite);
+          let l0 = plaintext.get(1).unwrap_or(0);
+          let l1 = plaintext.get(2).unwrap_or(0);
+          let l2 = plaintext.get(3).unwrap_or(0);
+          let body_len = l0 * 65536 + l1 * 256 + l2;
+          if body_len != hash_len || plaintext.byte_len() != 4 + hash_len {
+            session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
+            return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+          }
+
+          let client_verify_data = plaintext.slice(4, 4 + hash_len).unwrap_or(Bytes.new());
+
+          // Server Finished までのトランスクリプトハッシュに対して検証
+          let th_sf = transcript_hash_for_suite(&suite, &session.transcript);
+          let ok = verify_finished_data(&suite, &session.client_hs_sec, &th_sf, &client_verify_data);
+          if !ok {
+            session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+            return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+          }
+
+          // トランスクリプト更新 (Client Finished 追加)
+          let mut transcript = session.transcript.clone();
+          transcript.extend(&plaintext);
+
+          // アプリケーショントラフィック鍵導出
+          let th_cf = transcript_hash_for_suite(&suite, &transcript);
+          let ms_sec = master_secret(&suite, &session.handshake_sec);
+          let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_cf);
+          let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_cf);
+
+          let s_app_prot = new_record_protection(RecordDirection.Transmit, suite.clone(), s_ap_sec.clone());
+          let c_app_prot = new_record_protection(RecordDirection.Receive, suite.clone(), c_ap_sec.clone());
+
+          session.phase = HandshakePhase.Connected;
+          session.transcript = transcript;
+          session.client_hs_protection = Some(c_prot);
+          session.master_sec = ms_sec;
+          session.server_app_sec = s_ap_sec;
+          session.client_app_sec = c_ap_sec;
+          session.server_app_protection = Some(s_app_prot);
+          session.client_app_protection = Some(c_app_prot);
+
+          return Ok(None);
+        }
+        None => {
+          session.phase = HandshakePhase.Failed(AlertDescription.InternalError);
+          return Err(ShieldError.Fatal(AlertDescription.InternalError));
+        }
+      }
+    }
+    None => {
+      session.phase = HandshakePhase.Failed(AlertDescription.InternalError);
+      return Err(ShieldError.Fatal(AlertDescription.InternalError));
+    }
+  }
+}
