@@ -1,3 +1,22 @@
 # sigil-shield-tls
-TLS termination component for Sigil services
+
+TLS 終端部品（平文 HTTP で待ち受ける Sigil 製サービスの前段に配置する TLS 終端）。
+
+設計方針と仕様は [ADR 0063](https://github.com/goodnasubi/sigil/blob/main/docs/decisions/0063-shield-tls.md) に基づく。
+
 - [nginx の脆弱性から得た設計教訓](docs/nginx2root-lessons.md)
+
+## 適合の限界（ADR 0063 決定 1.1）
+
+本コンポーネントは **RFC 8446（TLS 1.3）の完全準拠を主張しない**。
+RSA 署名に対応せず（ECDSA P-256 のみ）、鍵交換は X25519 で開始し P-256 は後段で追加する。また、0-RTT・セッション再開・チケット・クライアント証明書は持たない。
+
+## 段 1: 入口の解析（決定 4.2〜4.5）
+
+- レコード層の読み取りと先頭 5 バイトの厳密検査
+- ハンドシェイクメッセージの再構成（最大 16 KiB・最大 8 レコード）
+- ClientHello の解析（決定 4.3 の全行の規則）
+- 致命的アラートと接続終了（fail-closed）
+- 読み取りの前進と期限（決定 4.4: 1 バイト以上消費するか終了、消費せず繰り返さない）
+- 資源の上限とメモリ予算の検査（決定 4.5）
+- ファジング対象（ClientHello 解析、レコード層再構成）
