@@ -142,9 +142,9 @@ pub fn add_mod_p(a: &U256, b: &U256) -> U256 {
     let p = U256(P256_P);
     let mut sum = [0u64; 4];
     let mut carry = 0u128;
-    for i in 0..4 {
+    for (i, sum_i) in sum.iter_mut().enumerate() {
         let s = (a.0[i] as u128) + (b.0[i] as u128) + carry;
-        sum[i] = s as u64;
+        *sum_i = s as u64;
         carry = s >> 64;
     }
     let res = U256(sum);
@@ -172,9 +172,9 @@ pub fn sub_mod_p(a: &U256, b: &U256) -> U256 {
         let a_plus_p = {
             let mut sum = [0u64; 4];
             let mut carry = 0u128;
-            for i in 0..4 {
+            for (i, sum_i) in sum.iter_mut().enumerate() {
                 let s = (a.0[i] as u128) + (p.0[i] as u128) + carry;
-                sum[i] = s as u64;
+                *sum_i = s as u64;
                 carry = s >> 64;
             }
             sum
@@ -192,11 +192,11 @@ pub fn sub_mod_p(a: &U256, b: &U256) -> U256 {
     } else {
         let mut diff = [0u64; 4];
         let mut borrow = 0u128;
-        for i in 0..4 {
+        for (i, diff_i) in diff.iter_mut().enumerate() {
             let d = (a.0[i] as u128)
                 .wrapping_sub(b.0[i] as u128)
                 .wrapping_sub(borrow);
-            diff[i] = d as u64;
+            *diff_i = d as u64;
             borrow = (d >> 127) & 1;
         }
         U256(diff)
