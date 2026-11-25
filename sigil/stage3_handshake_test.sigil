@@ -968,6 +968,51 @@ fn test_handshake_rule_negatives() -> Int
             }
           }
 
+          // 7.1 HRR 後の ClientHello2 で不正な形式 (パース失敗) -> DecodeError で Failed に遷移し、後続の有効な ClientHello2 も拒絶されること (P2 指摘対応)
+          let mut s7_1 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s7_1, &ch7_1, &server_rand, &server_priv);
+          let mut malformed_ch2 = Bytes.new();
+          malformed_ch2.push(1);
+          malformed_ch2.push(0);
+          malformed_ch2.push(0);
+          malformed_ch2.push(10);
+          malformed_ch2.push(3);
+          let res7_1_mal = handle_client_hello2_explicit(&mut s7_1, &malformed_ch2, &server_rand, &server_priv);
+          match res7_1_mal {
+            Err(ShieldError.Fatal(AlertDescription.DecodeError)) => {}
+            _ => {
+              return 536;
+            }
+          }
+          match handshake_phase(&s7_1) {
+            HandshakePhase.Failed(AlertDescription.DecodeError) => {}
+            _ => {
+              return 537;
+            }
+          }
+          let mut ciphers7_v = List.new();
+          ciphers7_v.push(4865);
+          let mut sigs7_v = List.new();
+          sigs7_v.push(1027);
+          let mut groups7_v = List.new();
+          groups7_v.push(29);
+          let mut alpn7_v = List.new();
+          alpn7_v.push("http/1.1");
+          let valid_ch2 = build_client_hello_custom(true, ciphers7_v, sigs7_v, groups7_v, Some(client_pub.clone()), alpn7_v, None);
+          let res7_1_retry = handle_client_hello2_explicit(&mut s7_1, &valid_ch2, &server_rand, &server_priv);
+          match res7_1_retry {
+            Err(ShieldError.Fatal(AlertDescription.DecodeError)) => {}
+            _ => {
+              return 538;
+            }
+          }
+          match handshake_phase(&s7_1) {
+            HandshakePhase.Failed(AlertDescription.DecodeError) => {}
+            _ => {
+              return 539;
+            }
+          }
+
           // 8. 重複 ChangeCipherSpec -> UnexpectedMessage
           let mut s8 = new_test_session(&ecdsa_priv);
           let mut ciphers8 = List.new();
