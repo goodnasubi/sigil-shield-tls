@@ -555,6 +555,39 @@ fn test_boundary_and_negative_cases() -> Bool
     }
   }
 
+  // 負のパディング長 (-1, -100) は DecodeError で拒否し、シーケンス番号を進めない
+  let seq_before = record_protection_sequence_number(&tx);
+  match seal_record(&mut tx, &ContentType.ApplicationData, &one_byte, -1) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+  match seal_record(&mut tx, &ContentType.ApplicationData, &one_byte, -100) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+  let seq_after = record_protection_sequence_number(&tx);
+  if seq_before != seq_after {
+    return false;
+  }
+
   return true;
 }
 

@@ -178,6 +178,11 @@ pub fn seal_record(prot: &mut RecordProtection, content_type: &ContentType, plai
     return Err(ShieldError.Fatal(AlertDescription.DecodeError));
   }
 
+  // 負のパディング長は拒否する
+  if padding_len < 0 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
   let inner_len = plaintext.byte_len() + 1 + padding_len;
   if inner_len > max_plain_record_payload() + 1 {
     return Err(ShieldError.Fatal(AlertDescription.DecodeError));
