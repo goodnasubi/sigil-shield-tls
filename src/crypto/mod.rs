@@ -14,6 +14,7 @@
 pub mod aes;
 pub mod chacha20;
 pub mod chacha20_poly1305;
+pub mod ecdsa_p256;
 pub mod gcm;
 pub mod ghash;
 pub mod hkdf;
@@ -22,10 +23,15 @@ pub mod mod_common;
 pub mod poly1305;
 pub mod sha256;
 pub mod sha384;
+pub mod x25519;
 
 pub use aes::{aes_encrypt_block, aes_expand_key, aes_gmul, aes_sbox, aes_xtime};
 pub use chacha20::{chacha20_block, chacha20_xor};
 pub use chacha20_poly1305::{chacha20_poly1305_open, chacha20_poly1305_seal};
+pub use ecdsa_p256::{
+    ecdsa_p256_public_key, ecdsa_p256_sign, ecdsa_p256_verify, scalar_in_range, signature_to_der,
+    RawSignature,
+};
 pub use gcm::{aes_gcm_open, aes_gcm_seal};
 pub use ghash::{ghash, ghash_mul};
 pub use hkdf::{
@@ -33,7 +39,8 @@ pub use hkdf::{
     hkdf_expand_sha384, hkdf_extract_sha256, hkdf_extract_sha384,
 };
 pub use hmac::{hmac_sha256, hmac_sha384};
-pub use mod_common::ct_eq;
+pub use mod_common::{ct_eq, wipe};
 pub use poly1305::poly1305_mac;
 pub use sha256::{sha256, Sha256};
 pub use sha384::{sha384, Sha384};
+pub use x25519::{x25519, x25519_public_key};

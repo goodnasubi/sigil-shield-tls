@@ -22,6 +22,7 @@ pub enum AlertDescription {
     HandshakeFailure = 40,
     IllegalParameter = 47,
     DecodeError = 50,
+    DecryptError = 51,
     ProtocolVersion = 70,
     InternalError = 80,
     UnrecognizedName = 112,
@@ -37,6 +38,7 @@ impl AlertDescription {
             40 => Some(Self::HandshakeFailure),
             47 => Some(Self::IllegalParameter),
             50 => Some(Self::DecodeError),
+            51 => Some(Self::DecryptError),
             70 => Some(Self::ProtocolVersion),
             80 => Some(Self::InternalError),
             112 => Some(Self::UnrecognizedName),
@@ -109,6 +111,10 @@ impl ShieldError {
 
     pub fn unexpected_message() -> Self {
         Self::Fatal(AlertDescription::UnexpectedMessage)
+    }
+
+    pub fn decrypt_error() -> Self {
+        Self::Fatal(AlertDescription::DecryptError)
     }
 
     pub fn protocol_version() -> Self {

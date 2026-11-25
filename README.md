@@ -30,3 +30,18 @@ RSA 署名に対応せず（ECDSA P-256 のみ）、鍵交換は X25519 で開�
 - 保護レコード処理（方向別 64 ビットシーケンス番号、12 バイト IV XOR Nonce、平文長 2^14 以下、暗号文長 2^14 + 256 以下、認証失敗時 `bad_record_mac` で即座に終了）
 - 鍵更新（KeyUpdate メッセージ送受信、送信 2^23 回到達前の更新および超過時終了、受信 16 回制限）
 
+## 段 3: ハンドシェイクの状態機械（決定 1、決定 1.2、決定 1.4）
+
+- サーバー側の TLS 1.3 の 1-RTT ハンドシェイク（`handshake::ServerHandshake`）:
+  ServerHello、HelloRetryRequest（1 接続に 1 回）、EncryptedExtensions、Certificate、CertificateVerify、Finished、クライアントの Finished
+- 鍵交換は `x25519`（`crypto::x25519`、RFC 7748）。`secp256r1` は段 6
+- サーバー署名は `ecdsa_secp256r1_sha256` のみ（`crypto::ecdsa_p256`、SHA-256、RFC 6979 の決定的 nonce）
+- ALPN は `http/1.1` だけを選ぶ（提示がなければ `http/1.1` として扱う）
+- PSK・0-RTT は受理しない（`pre_shared_key` は構造だけ検査して無視し、完全ハンドシェイクを行う。早期データのレコードは致命的アラートで終える）
+- 互換モード（RFC 8446 付録 D.4）: `legacy_session_id` を返し、サーバーの最初のハンドシェイクメッセージの直後に ChangeCipherSpec を 1 つ送る
+- 乱数・署名・鍵交換は差し込み（`RandomSource`・`Signer`・`KeyAgreement`）。状態機械は入出力を持たない
+- 検証: RFC 8448 の 1-RTT・HelloRetryRequest・互換モードのトレースとのバイト単位の照合（`tests/handshake_rfc8448.rs`）、
+  規則の試験（`tests/handshake_rules.rs`）、ファジング（`tests/fuzz_handshake.rs`）
+
+ECDSA P-256 の署名は、この Rust の部品として実装している（`std.crypto` の署名は Sigil 用で、このクレートからは呼べない）。
+定数時間の作りにしているが、ADR 0058 決定 3 の実測（`ct_measure`）はこのクレートではまだ行っていない。

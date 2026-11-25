@@ -23,6 +23,9 @@ pub mod extension_type {
     pub const PRE_SHARED_KEY: u16 = 0x0029;
     pub const SUPPORTED_VERSIONS: u16 = 0x002b;
     pub const KEY_SHARE: u16 = 0x0033;
+    pub const EARLY_DATA: u16 = 0x002a;
+    pub const COOKIE: u16 = 0x002c;
+    pub const PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 }
 
 /// NamedGroup の定数
@@ -63,6 +66,8 @@ pub struct ClientHello {
     pub signature_algorithms: Vec<u16>,
     pub alpn_protocols: Vec<Vec<u8>>,
     pub extensions_present: Vec<u16>,
+    /// `cookie` 拡張の値（HelloRetryRequest への応答でだけ現れる）
+    pub cookie: Option<Vec<u8>>,
 }
 
 /// ClientHello メッセージ（4 バイトのハンドシェイクヘッダ含む）を解析する
@@ -167,6 +172,8 @@ pub fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, ShieldError> {
     let mut signature_algorithms = Vec::new();
     let mut alpn_protocols = Vec::new();
     let mut extensions_present = Vec::new();
+    let mut cookie = None;
+    let mut psk_data: Option<&[u8]> = None;
 
     if pos == payload.len() {
         // 拡張部がない場合、supported_versions が欠如しているため protocol_version
@@ -400,10 +407,52 @@ pub fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, ShieldError> {
                     alpn_pos += proto_len;
                 }
             }
+            extension_type::PRE_SHARED_KEY => {
+                // 受理はしないが、構造は検査する（決定 1.2）。
+                // identities<7..2^16-1>（各 identity<1..2^16-1> + obfuscated_ticket_age 4 バイト）と
+                // binders<33..2^16-1>（各 binder<32..255>）。項目数は一致する。
+                // （「最後であること」の検査を先に済ませるため、検査はループの後で行う）
+                psk_data = Some(ext_data);
+            }
+            extension_type::PSK_KEY_EXCHANGE_MODES => {
+                // ke_modes<1..255>
+                if ext_data.is_empty()
+                    || ext_data[0] == 0
+                    || ext_data[0] as usize + 1 != ext_data.len()
+                {
+                    return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+                }
+            }
+            extension_type::EARLY_DATA => {
+                // ClientHello の early_data は空
+                if !ext_data.is_empty() {
+                    return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+                }
+            }
+            extension_type::COOKIE => {
+                // opaque cookie<1..2^16-1>
+                if ext_data.len() < 3
+                    || u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize + 2 != ext_data.len()
+                {
+                    return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+                }
+                cookie = Some(ext_data[2..].to_vec());
+            }
             _ => {
                 // 未知の拡張は長さだけ検査して読み飛ばす
             }
         }
+    }
+
+    if let Some(data) = psk_data {
+        validate_pre_shared_key(data)?;
+    }
+
+    // pre_shared_key があれば psk_key_exchange_modes も必要（RFC 8446 §4.2.9）
+    if extensions_present.contains(&extension_type::PRE_SHARED_KEY)
+        && !extensions_present.contains(&extension_type::PSK_KEY_EXCHANGE_MODES)
+    {
+        return Err(ShieldError::Fatal(AlertDescription::IllegalParameter));
     }
 
     // supported_versions は必須
@@ -423,7 +472,54 @@ pub fn parse_client_hello(msg: &[u8]) -> Result<ClientHello, ShieldError> {
         signature_algorithms,
         alpn_protocols,
         extensions_present,
+        cookie,
     })
+}
+
+/// `pre_shared_key`（ClientHello 形式）の構造だけを検査する。PSK は受理しない。
+fn validate_pre_shared_key(data: &[u8]) -> Result<(), ShieldError> {
+    let bad = || ShieldError::Fatal(AlertDescription::DecodeError);
+    if data.len() < 2 {
+        return Err(bad());
+    }
+    let identities_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    if identities_len < 7 || 2 + identities_len + 2 > data.len() {
+        return Err(bad());
+    }
+    let mut pos = 2;
+    let identities_end = 2 + identities_len;
+    let mut identities = 0usize;
+    while pos < identities_end {
+        if pos + 2 > identities_end {
+            return Err(bad());
+        }
+        let id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
+        if id_len == 0 || pos + id_len + 4 > identities_end {
+            return Err(bad());
+        }
+        pos += id_len + 4;
+        identities += 1;
+    }
+    let binders_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    if binders_len < 33 || pos + binders_len != data.len() {
+        return Err(bad());
+    }
+    let mut binders = 0usize;
+    while pos < data.len() {
+        let len = data[pos] as usize;
+        pos += 1;
+        if len < 32 || pos + len > data.len() {
+            return Err(bad());
+        }
+        pos += len;
+        binders += 1;
+    }
+    if identities != binders {
+        return Err(ShieldError::Fatal(AlertDescription::IllegalParameter));
+    }
+    Ok(())
 }
 
 /// SNI ホスト名を検証・正規化する（決定 2.4）
