@@ -1,0 +1,165 @@
+module stage1_fuzz_test
+  targets server
+  trust none
+
+use shield_client_hello.parse_client_hello;
+use shield_record.new_reassembler;
+use shield_record.parse_record_header;
+use shield_record.reassembler_feed_bytes;
+use test_support.build_valid_client_hello;
+use test_support.rng_below;
+use test_support.rng_mutate;
+use test_support.rng_new;
+use test_support.rng_random_bytes;
+use test_support.wrap_in_record;
+
+// ClientHello 解析およびレコード層再構成のファジングハーネス（ADR 0020 決定 2, ADR 0063 決定 4.7）
+// 短い実行（100 回反復）で、クラッシュやパニックせず Result を返す性質を検証する
+
+fn fuzz_client_hello(iters: Int, seed: Int) -> Bool
+  intent "ClientHello 解析に対するファジング"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rng = rng_new(seed);
+  let corpus_valid = build_valid_client_hello();
+
+  let mut i = 0;
+  while i < iters {
+    let mode = rng_below(&mut rng, 3);
+    let mut input = Bytes.new();
+    match mode {
+      0 => {
+        // 完全ランダムなバイト列 (0〜512 バイト)
+        let len = rng_below(&mut rng, 512);
+        input = rng_random_bytes(&mut rng, len);
+      }
+      1 => {
+        // 有効な ClientHello を変異させたバイト列
+        input = rng_mutate(&mut rng, &corpus_valid);
+      }
+      _ => {
+        // 先頭だけハンドシェイクヘッダ (0x01 + 3 バイト長) にしてペイロードを変異/ランダム化
+        let len = rng_below(&mut rng, 256);
+        let mut b = Bytes.with_capacity(4 + len);
+        b.push(1);
+        b.push(len / 65536);
+        b.push(len / 256 % 256);
+        b.push(len % 256);
+        let body = rng_random_bytes(&mut rng, len);
+        b.extend(&body);
+        input = b;
+      }
+    }
+
+    // パニック・クラッシュせずに Result が返ることを検証
+    let _ = parse_client_hello(&input);
+    i = i + 1;
+  }
+  return true;
+}
+
+fn fuzz_record_layer(iters: Int, seed: Int) -> Bool
+  intent "レコード層の読み取りと再構成に対するファジング"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rng = rng_new(seed);
+  let valid_ch = build_valid_client_hello();
+  let valid_record = wrap_in_record(22, 771, &valid_ch);
+
+  let mut i = 0;
+  while i < iters {
+    // 1. レコードヘッダ単体パースのファジング
+    let raw_hdr = rng_random_bytes(&mut rng, 10);
+    let is_enc = rng_below(&mut rng, 2) == 0;
+    let _ = parse_record_header(&raw_hdr, is_enc);
+
+    // 2. HandshakeReassembler のファジング
+    let mut reassembler = new_reassembler();
+    let mode = rng_below(&mut rng, 3);
+
+    match mode {
+      0 => {
+        // 完全ランダムなストリームを複数チャンクで投入
+        let num_chunks = 1 + rng_below(&mut rng, 4);
+        let mut c_idx = 0;
+        while c_idx < num_chunks {
+          let chunk_len = rng_below(&mut rng, 128);
+          let chunk = rng_random_bytes(&mut rng, chunk_len);
+          if chunk.byte_len() == 0 {
+            let _ = reassembler_feed_bytes(&mut reassembler, &chunk);
+            c_idx = num_chunks;
+          } else {
+            let res = reassembler_feed_bytes(&mut reassembler, &chunk);
+            match res {
+              Err(_) => {
+                c_idx = num_chunks;
+              }
+              Ok(_) => {
+                c_idx = c_idx + 1;
+              }
+            }
+          }
+        }
+      }
+      1 => {
+        // 有効なレコードを変異させて投入
+        let mutated = rng_mutate(&mut rng, &valid_record);
+        let _ = reassembler_feed_bytes(&mut reassembler, &mutated);
+      }
+      _ => {
+        // 有効なレコードをランダムな位置で複数に切り刻んで投入し、最終的に同一の ClientHello が再構成されること
+        let mut pos = 0;
+        let vlen = valid_record.byte_len();
+        while pos < vlen {
+          let rem = vlen - pos;
+          let chunk_len = 1 + rng_below(&mut rng, rem);
+          let chunk = valid_record.slice(pos, pos + chunk_len).unwrap_or(Bytes.new());
+          pos = pos + chunk_len;
+          let res = reassembler_feed_bytes(&mut reassembler, &chunk);
+          match res {
+            Ok(opt) => {
+              match opt {
+                Some(msg) => {
+                  if !ct_eq(&msg, &valid_ch) {
+                    return false;
+                  }
+                  pos = vlen;
+                }
+                None => {}
+              }
+            }
+            Err(_) => {
+              // 有効なレコードを分割投入しているためエラーにはならないはず
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn main() -> Int
+  intent "ファジング試験のエントリポイント（100 回反復）"
+  requires none
+  ensures none
+  effects none
+{
+  let iters = 100;
+  let seed = 123456789;
+
+  if !fuzz_client_hello(iters, seed) {
+    return 1;
+  }
+  if !fuzz_record_layer(iters, seed) {
+    return 2;
+  }
+  return 0;
+}

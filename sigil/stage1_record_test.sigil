@@ -1,0 +1,596 @@
+module stage1_record_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_alert.alert_description_to_u8;
+use shield_record.ContentType;
+use shield_record.RecordHeader;
+use shield_record.content_type_from_u8;
+use shield_record.new_reassembler;
+use shield_record.parse_record_header;
+use shield_record.reassembler_feed_bytes;
+use shield_record.reassembler_record_count;
+use shield_record.reassembler_take_unconsumed_bytes;
+use shield_record.reassembler_total_read_bytes;
+use shield_record.reassembler_unconsumed_bytes;
+use shield_record.record_header_content_type;
+use shield_record.record_header_legacy_version;
+use shield_record.record_header_length;
+use test_support.build_valid_client_hello;
+use test_support.wrap_in_record;
+
+// レコード層の読み取りと再構成の試験（ADR 0063 決定 4.2）
+
+fn is_fatal_error(res: &Result<RecordHeader, ShieldError>, expected: AlertDescription) -> Bool
+  intent "Result が指定の致命的アラート記述子であるか確認する"
+  requires none
+  ensures none
+  effects none
+{
+  return match res {
+    Err(e) => match e {
+      ShieldError.Fatal(desc) => alert_description_to_u8(&desc) == alert_description_to_u8(&expected),
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+}
+
+fn is_feed_fatal_error(res: &Result<Option<Bytes>, ShieldError>, expected: AlertDescription) -> Bool
+  intent "feed_bytes の Result が指定の致命的アラートであるか確認する"
+  requires none
+  ensures none
+  effects none
+{
+  return match res {
+    Err(e) => match e {
+      ShieldError.Fatal(desc) => alert_description_to_u8(&desc) == alert_description_to_u8(&expected),
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+}
+
+fn test_header_valid() -> Bool
+  intent "正常な 4 種別、旧版 0x0301 と 0x0303 のパース"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cts = List.new();
+  cts.push(20);
+  cts.push(21);
+  cts.push(22);
+  cts.push(23);
+
+  let mut vers = List.new();
+  vers.push(769);  // 0x0301
+  vers.push(771);  // 0x0303
+
+  let mut ci = 0;
+  while ci < cts.len() {
+    let ct = cts.get(ci).map(|x| x + 0).unwrap_or(0);
+    let mut vi = 0;
+    while vi < vers.len() {
+      let ver = vers.get(vi).map(|x| x + 0).unwrap_or(0);
+      let mut buf = Bytes.new();
+      buf.push(ct);
+      buf.push(ver / 256);
+      buf.push(ver % 256);
+      buf.push(0);
+      buf.push(16);
+
+      let res = parse_record_header(&buf, false);
+      match res {
+        Ok(h) => {
+          if record_header_legacy_version(&h) != ver || record_header_length(&h) != 16 {
+            return false;
+          }
+          let parsed_ct = record_header_content_type(&h);
+          let expected_ct = match content_type_from_u8(ct) {
+            Some(c) => c,
+            None => ContentType.Alert,
+          };
+          match parsed_ct {
+            ContentType.ChangeCipherSpec => {
+              match expected_ct {
+                ContentType.ChangeCipherSpec => {}
+                _ => {
+                  return false;
+                }
+              }
+            }
+            ContentType.Alert => {
+              match expected_ct {
+                ContentType.Alert => {}
+                _ => {
+                  return false;
+                }
+              }
+            }
+            ContentType.Handshake => {
+              match expected_ct {
+                ContentType.Handshake => {}
+                _ => {
+                  return false;
+                }
+              }
+            }
+            ContentType.ApplicationData => {
+              match expected_ct {
+                ContentType.ApplicationData => {}
+                _ => {
+                  return false;
+                }
+              }
+            }
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+      vi = vi + 1;
+    }
+    ci = ci + 1;
+  }
+  return true;
+}
+
+fn test_header_invalid_content_type() -> Bool
+  intent "未知の種別で unexpected_message となること"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bad_cts = List.new();
+  bad_cts.push(0);
+  bad_cts.push(19);
+  bad_cts.push(24);
+  bad_cts.push(32);
+  bad_cts.push(255);
+
+  let mut i = 0;
+  while i < bad_cts.len() {
+    let mut buf = Bytes.new();
+    buf.push(bad_cts.get(i).map(|x| x + 0).unwrap_or(0));
+    buf.push(3);
+    buf.push(3);
+    buf.push(0);
+    buf.push(5);
+
+    let res = parse_record_header(&buf, false);
+    if !is_fatal_error(&res, AlertDescription.UnexpectedMessage) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn test_header_invalid_legacy_version() -> Bool
+  intent "0x0301, 0x0303 以外の旧版で protocol_version となること"
+  requires none
+  ensures none
+  effects none
+{
+  let mut bad_vers = List.new();
+  bad_vers.push(512);  // 0x0200
+  bad_vers.push(768);  // 0x0300
+  bad_vers.push(770);  // 0x0302
+  bad_vers.push(772);  // 0x0304
+  bad_vers.push(1024);  // 0x0400
+
+  let mut i = 0;
+  while i < bad_vers.len() {
+    let ver = bad_vers.get(i).map(|x| x + 0).unwrap_or(0);
+    let mut buf = Bytes.new();
+    buf.push(22);
+    buf.push(ver / 256);
+    buf.push(ver % 256);
+    buf.push(0);
+    buf.push(5);
+
+    let res = parse_record_header(&buf, false);
+    if !is_fatal_error(&res, AlertDescription.ProtocolVersion) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn test_header_length_limits() -> Bool
+  intent "平文・暗号化後のペイロード長上限および超過の検査"
+  requires none
+  ensures none
+  effects none
+{
+  // 平文最大長 16384 (0x4000) -> OK
+  let mut plain_ok = Bytes.new();
+  plain_ok.push(22);
+  plain_ok.push(3);
+  plain_ok.push(3);
+  plain_ok.push(64);
+  plain_ok.push(0);
+  if parse_record_header(&plain_ok, false).is_err() {
+    return false;
+  }
+
+  // 平文超過 16385 (0x4001) -> DecodeError
+  let mut plain_over = Bytes.new();
+  plain_over.push(22);
+  plain_over.push(3);
+  plain_over.push(3);
+  plain_over.push(64);
+  plain_over.push(1);
+  let res_po = parse_record_header(&plain_over, false);
+  if !is_fatal_error(&res_po, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  // 暗号化後最大長 16640 (0x4100) -> OK
+  let mut enc_ok = Bytes.new();
+  enc_ok.push(23);
+  enc_ok.push(3);
+  enc_ok.push(3);
+  enc_ok.push(65);
+  enc_ok.push(0);
+  if parse_record_header(&enc_ok, true).is_err() {
+    return false;
+  }
+
+  // 暗号化後超過 16641 (0x4101) -> DecodeError
+  let mut enc_over = Bytes.new();
+  enc_over.push(23);
+  enc_over.push(3);
+  enc_over.push(3);
+  enc_over.push(65);
+  enc_over.push(1);
+  let res_eo = parse_record_header(&enc_over, true);
+  if !is_fatal_error(&res_eo, AlertDescription.DecodeError) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_header_zero_length_handshake() -> Bool
+  intent "長さ 0 のハンドシェイクレコードが拒絶されること"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  buf.push(22);
+  buf.push(3);
+  buf.push(3);
+  buf.push(0);
+  buf.push(0);
+  let res = parse_record_header(&buf, false);
+  return is_fatal_error(&res, AlertDescription.DecodeError);
+}
+
+fn test_header_all_zeros() -> Bool
+  intent "全ゼロ入力で unexpected_message となること"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  let mut i = 0;
+  while i < 5 {
+    buf.push(0);
+    i = i + 1;
+  }
+  let res = parse_record_header(&buf, false);
+  return is_fatal_error(&res, AlertDescription.UnexpectedMessage);
+}
+
+fn test_reassembler_single() -> Bool
+  intent "単一レコードで ClientHello が再構成されること"
+  requires none
+  ensures none
+  effects none
+{
+  let ch = build_valid_client_hello();
+  let rec = wrap_in_record(22, 771, &ch);
+
+  let mut r = new_reassembler();
+  let res = reassembler_feed_bytes(&mut r, &rec);
+  if reassembler_record_count(&r) != 1 || reassembler_total_read_bytes(&r) != rec.byte_len() {
+    return false;
+  }
+  return match res {
+    Ok(opt) => match opt {
+      Some(msg) => ct_eq(&msg, &ch),
+      None => false,
+    },
+    Err(_) => false,
+  };
+}
+
+fn test_reassembler_split() -> Bool
+  intent "2 つのレコードに分割された ClientHello の再構成"
+  requires none
+  ensures none
+  effects none
+{
+  let ch = build_valid_client_hello();
+  let half = ch.byte_len() / 2;
+  let part1 = ch.slice(0, half).unwrap_or(Bytes.new());
+  let part2 = ch.slice(half, ch.byte_len()).unwrap_or(Bytes.new());
+
+  let rec1 = wrap_in_record(22, 771, &part1);
+  let rec2 = wrap_in_record(22, 771, &part2);
+
+  let mut r = new_reassembler();
+  let res1 = reassembler_feed_bytes(&mut r, &rec1);
+  match res1 {
+    Ok(opt) => {
+      if opt.is_some() {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let res2 = reassembler_feed_bytes(&mut r, &rec2);
+  return match res2 {
+    Ok(opt) => match opt {
+      Some(msg) => ct_eq(&msg, &ch),
+      None => false,
+    },
+    Err(_) => false,
+  };
+}
+
+fn test_reassembler_max_records() -> Bool
+  intent "最大 8 レコード（上限一致）および 9 レコード（超過拒絶）の試験"
+  requires none
+  ensures none
+  effects none
+{
+  let ch = build_valid_client_hello();
+  let chunk_len = ch.byte_len() / 8;
+
+  // 8 レコードに分割（上限一致 -> OK）
+  let mut r8 = new_reassembler();
+  let mut pos = 0;
+  let mut idx = 0;
+  while idx < 8 {
+    let end = match idx == 7 {
+      true => ch.byte_len(),
+      false => pos + chunk_len,
+    };
+    let part = ch.slice(pos, end).unwrap_or(Bytes.new());
+    let rec = wrap_in_record(22, 771, &part);
+    let res = reassembler_feed_bytes(&mut r8, &rec);
+
+    if idx < 7 {
+      match res {
+        Ok(opt) => {
+          if opt.is_some() {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    } else {
+      match res {
+        Ok(opt) => {
+          match opt {
+            Some(msg) => {
+              if !ct_eq(&msg, &ch) {
+                return false;
+              }
+            }
+            None => {
+              return false;
+            }
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    pos = end;
+    idx = idx + 1;
+  }
+
+  // 9 レコードに分割（超過 -> DecodeError）
+  let mut r9 = new_reassembler();
+  let c9 = ch.byte_len() / 9;
+  let mut p9 = 0;
+  let mut j = 0;
+  while j < 9 {
+    let end = match j == 8 {
+      true => ch.byte_len(),
+      false => p9 + c9,
+    };
+    let part = ch.slice(p9, end).unwrap_or(Bytes.new());
+    let rec = wrap_in_record(22, 771, &part);
+    let res = reassembler_feed_bytes(&mut r9, &rec);
+
+    if j < 8 {
+      match res {
+        Ok(opt) => {
+          if opt.is_some() {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    } else {
+      // 9 回目で DecodeError
+      if !is_feed_fatal_error(&res, AlertDescription.DecodeError) {
+        return false;
+      }
+    }
+    p9 = end;
+    j = j + 1;
+  }
+
+  return true;
+}
+
+fn test_reassembler_interleaving() -> Bool
+  intent "再構成途中の他種別レコード割り込みが拒絶されること"
+  requires none
+  ensures none
+  effects none
+{
+  let ch = build_valid_client_hello();
+  let half = ch.byte_len() / 2;
+  let part1 = ch.slice(0, half).unwrap_or(Bytes.new());
+  let rec1 = wrap_in_record(22, 771, &part1);
+
+  // 割り込みアラートレコード
+  let mut alert_payload = Bytes.new();
+  alert_payload.push(1);
+  alert_payload.push(0);
+  let alert_rec = wrap_in_record(21, 771, &alert_payload);
+
+  let mut r = new_reassembler();
+  let _ = reassembler_feed_bytes(&mut r, &rec1);
+  let res = reassembler_feed_bytes(&mut r, &alert_rec);
+  return is_feed_fatal_error(&res, AlertDescription.UnexpectedMessage);
+}
+
+fn test_reassembler_empty_app_data() -> Bool
+  intent "長さ 0 の application_data 連続 16 個（上限一致）と 17 個（超過拒絶）"
+  requires none
+  ensures none
+  effects none
+{
+  let empty_app = wrap_in_record(23, 771, &Bytes.new());
+
+  // 16 個連続 -> OK
+  let mut r16 = new_reassembler();
+  let mut i = 0;
+  while i < 16 {
+    let res = reassembler_feed_bytes(&mut r16, &empty_app);
+    match res {
+      Ok(opt) => {
+        if opt.is_some() {
+          return false;
+        }
+      }
+      Err(_) => {
+        return false;
+      }
+    }
+    i = i + 1;
+  }
+
+  // 17 個目 -> unexpected_message
+  let res17 = reassembler_feed_bytes(&mut r16, &empty_app);
+  if !is_feed_fatal_error(&res17, AlertDescription.UnexpectedMessage) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_reassembler_unconsumed() -> Bool
+  intent "ClientHello レコード後の未消費データ保持と引き継ぎ"
+  requires none
+  ensures none
+  effects none
+{
+  let ch = build_valid_client_hello();
+  let mut rec = wrap_in_record(22, 771, &ch);
+
+  // 後続データ
+  let mut trailing = Bytes.new();
+  trailing.push(20);
+  trailing.push(3);
+  trailing.push(3);
+  trailing.push(0);
+  trailing.push(1);
+  trailing.push(1);
+
+  rec.extend(&trailing);
+
+  let mut r = new_reassembler();
+  let res = reassembler_feed_bytes(&mut r, &rec);
+  match res {
+    Ok(opt) => {
+      match opt {
+        Some(msg) => {
+          if !ct_eq(&msg, &ch) {
+            return false;
+          }
+        }
+        None => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  let unconsumed_ref = reassembler_unconsumed_bytes(&r);
+  if !ct_eq(&unconsumed_ref, &trailing) {
+    return false;
+  }
+
+  let unconsumed = reassembler_take_unconsumed_bytes(&mut r);
+  return ct_eq(&unconsumed, &trailing);
+}
+
+pub fn main() -> Int
+  intent "レコード層試験のエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_header_valid() {
+    return 1;
+  }
+  if !test_header_invalid_content_type() {
+    return 2;
+  }
+  if !test_header_invalid_legacy_version() {
+    return 3;
+  }
+  if !test_header_length_limits() {
+    return 4;
+  }
+  if !test_header_zero_length_handshake() {
+    return 5;
+  }
+  if !test_header_all_zeros() {
+    return 6;
+  }
+  if !test_reassembler_single() {
+    return 7;
+  }
+  if !test_reassembler_split() {
+    return 8;
+  }
+  if !test_reassembler_max_records() {
+    return 9;
+  }
+  if !test_reassembler_interleaving() {
+    return 10;
+  }
+  if !test_reassembler_empty_app_data() {
+    return 11;
+  }
+  if !test_reassembler_unconsumed() {
+    return 12;
+  }
+  return 0;
+}
