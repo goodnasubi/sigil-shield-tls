@@ -375,6 +375,114 @@ fn test_tls_inner_plaintext_length_limit_open() {
 }
 
 #[test]
+fn test_empty_handshake_fragment_rejected_on_seal() {
+    let suite = CipherSuite::TlsAes128GcmSha256;
+    let ks = KeySchedule::new(suite);
+    let secret = vec![0x66u8; suite.hash_len()];
+    let mut tx = RecordProtection::new(RecordDirection::Transmit, suite, secret, &ks);
+
+    // 長さ 0 の Handshake 断片（パディング 0）は送信側で DecodeError
+    assert_eq!(
+        tx.seal_record(ContentType::Handshake, &[], 0),
+        Err(ShieldError::Fatal(AlertDescription::DecodeError))
+    );
+
+    // 長さ 0 の Handshake 断片（パディング 64、指摘の再現例）も送信側で DecodeError
+    assert_eq!(
+        tx.seal_record(ContentType::Handshake, &[], 64),
+        Err(ShieldError::Fatal(AlertDescription::DecodeError))
+    );
+
+    // 1 バイト以上の Handshake 断片は送信可能
+    assert!(tx.seal_record(ContentType::Handshake, &[0x01], 0).is_ok());
+
+    // ApplicationData の空断片（トラフィック解析対策パディング）は送信可能
+    assert!(tx.seal_record(ContentType::ApplicationData, &[], 0).is_ok());
+    assert!(tx
+        .seal_record(ContentType::ApplicationData, &[], 64)
+        .is_ok());
+}
+
+#[test]
+fn test_empty_handshake_fragment_rejected_on_open() {
+    let suite = CipherSuite::TlsChacha20Poly1305Sha256;
+    let ks = KeySchedule::new(suite);
+    let secret = vec![0x77u8; suite.hash_len()];
+    let mut rx = RecordProtection::new(RecordDirection::Receive, suite, secret, &ks);
+
+    // 1. Handshake 種別バイトのみ（平文断片長 0、パディング 0）の保護レコード
+    let inner_empty_no_pad = [ContentType::Handshake as u8];
+    let enc_len1 = inner_empty_no_pad.len() + rx.suite.tag_len();
+    let aad1 = [
+        ContentType::ApplicationData as u8,
+        0x03,
+        0x03,
+        (enc_len1 >> 8) as u8,
+        (enc_len1 & 0xff) as u8,
+    ];
+    let nonce1 = make_nonce(&rx.iv, rx.sequence_number);
+    let ct1 = rx
+        .suite
+        .seal(&rx.key, &nonce1, &aad1, &inner_empty_no_pad)
+        .unwrap();
+
+    let mut record1 = Vec::new();
+    record1.extend_from_slice(&aad1);
+    record1.extend_from_slice(&ct1);
+
+    let res1 = rx.open_record(&record1);
+    assert_eq!(res1, Err(ShieldError::Fatal(AlertDescription::DecodeError)));
+    assert!(!rx.is_poisoned);
+
+    // 2. Handshake 種別バイト + 64 バイトゼロパディング（平文断片長 0、指摘の再現例）の保護レコード
+    let mut inner_empty_padded = vec![ContentType::Handshake as u8];
+    inner_empty_padded.resize(1 + 64, 0);
+    let enc_len2 = inner_empty_padded.len() + rx.suite.tag_len();
+    let aad2 = [
+        ContentType::ApplicationData as u8,
+        0x03,
+        0x03,
+        (enc_len2 >> 8) as u8,
+        (enc_len2 & 0xff) as u8,
+    ];
+    let nonce2 = make_nonce(&rx.iv, rx.sequence_number);
+    let ct2 = rx
+        .suite
+        .seal(&rx.key, &nonce2, &aad2, &inner_empty_padded)
+        .unwrap();
+
+    let mut record2 = Vec::new();
+    record2.extend_from_slice(&aad2);
+    record2.extend_from_slice(&ct2);
+
+    let res2 = rx.open_record(&record2);
+    assert_eq!(res2, Err(ShieldError::Fatal(AlertDescription::DecodeError)));
+    assert!(!rx.is_poisoned);
+
+    // 3. 非空の Handshake 断片は正常に復号できること
+    let mut tx = RecordProtection::new(
+        RecordDirection::Transmit,
+        suite,
+        vec![0x77u8; suite.hash_len()],
+        &ks,
+    );
+    let valid_sealed = tx
+        .seal_record(ContentType::Handshake, &[0x04, 0x00, 0x00, 0x00], 16)
+        .unwrap();
+    let (ct, fragment, _) = rx.open_record(&valid_sealed).unwrap();
+    assert_eq!(ct, ContentType::Handshake);
+    assert_eq!(fragment, vec![0x04, 0x00, 0x00, 0x00]);
+
+    // 4. 空の ApplicationData 断片は正常に復号できること
+    let empty_app_sealed = tx
+        .seal_record(ContentType::ApplicationData, &[], 32)
+        .unwrap();
+    let (ct_app, fragment_app, _) = rx.open_record(&empty_app_sealed).unwrap();
+    assert_eq!(ct_app, ContentType::ApplicationData);
+    assert!(fragment_app.is_empty());
+}
+
+#[test]
 fn test_key_update_record_and_sequence_number_reset() {
     let suite = CipherSuite::TlsAes256GcmSha384;
     let ks = KeySchedule::new(suite);

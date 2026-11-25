@@ -6,6 +6,7 @@
 //! - レコード復号と検査:
 //!   - 内部平文 2^14 + 1 (16,385) バイト以下、平文断片 2^14 (16,384) バイト以下、暗号文 2^14 + 256 (16,640) バイト以下
 //!   - 内部平文が全ゼロなら unexpected_message
+//!   - ハンドシェイクの平文断片長 0 なら decode_error (RFC 8446 §5.1)
 //!   - AEAD 認証失敗時は bad_record_mac で即座に終了し読み続けない (poisoning)
 
 use crate::alert::{AlertDescription, ShieldError};
@@ -78,6 +79,11 @@ impl RecordProtection {
 
         // 平文断片長検査 (2^14 バイト以下)
         if plaintext.len() > MAX_PLAIN_RECORD_PAYLOAD {
+            return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+        }
+
+        // 長さ 0 のハンドシェイク断片は拒否する (RFC 8446 §5.1)
+        if content_type == ContentType::Handshake && plaintext.is_empty() {
             return Err(ShieldError::Fatal(AlertDescription::DecodeError));
         }
 
@@ -198,6 +204,11 @@ impl RecordProtection {
             .ok_or(ShieldError::Fatal(AlertDescription::UnexpectedMessage))?;
 
         let plain_fragment = &inner_plaintext[..type_idx];
+
+        // 長さ 0 のハンドシェイク断片は拒否する (RFC 8446 §5.1)
+        if inner_content_type == ContentType::Handshake && plain_fragment.is_empty() {
+            return Err(ShieldError::Fatal(AlertDescription::DecodeError));
+        }
 
         // 平文断片長検査 (2^14 バイト以下)
         if plain_fragment.len() > MAX_PLAIN_RECORD_PAYLOAD {
