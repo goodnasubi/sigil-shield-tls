@@ -40,6 +40,7 @@ use shield_limits.max_plain_record_payload;
 use shield_record.ContentType;
 use shield_record.parse_record_header;
 use shield_record.record_header_content_type;
+use shield_record.record_header_length;
 use shield_record_crypto.RecordDirection;
 use shield_record_crypto.RecordProtection;
 use shield_record_crypto.new_record_protection;
@@ -718,6 +719,15 @@ pub fn handshake_client_app_sec(session: &HandshakeSession) -> Bytes
   return session.client_app_sec.clone();
 }
 
+pub fn handshake_client_hs_protection(session: &HandshakeSession) -> Option<RecordProtection>
+  intent "クライアントハンドシェイク保護コンテキストを取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return session.client_hs_protection.clone();
+}
+
 // サーバー応答フライトの戻り値
 pub struct ServerFlight {
   records: List<Bytes>,
@@ -1138,28 +1148,61 @@ pub fn handle_client_record(session: &mut HandshakeSession, raw_record: &Bytes) 
   ensures none
   effects none
 {
+  match session.phase {
+    HandshakePhase.Failed(alert) => {
+      return Err(ShieldError.Fatal(alert.clone()));
+    }
+    _ => {}
+  }
+
   let is_enc = match session.client_hs_protection {
     Some(_) => true,
     None => false,
   };
-  let header = parse_record_header(&raw_record, is_enc)?;
-  let ct = record_header_content_type(&header);
+  match parse_record_header(&raw_record, is_enc) {
+    Ok(header) => {
+      let ct = record_header_content_type(&header);
 
-  match ct {
-    ContentType.ChangeCipherSpec => {
-      // ChangeCipherSpec は ClientHello 後から Finished 前までに 1 回だけ受理して破棄
-      if session.ccs_received {
-        session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
-        return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
-      }
-      match session.phase {
-        HandshakePhase.WaitingClientHello2 => {
-          session.ccs_received = true;
-          return Ok(None);
+      match ct {
+        ContentType.ChangeCipherSpec => {
+          // 互換 ChangeCipherSpec として有効なのは 1 バイト 0x01 のペイロードのみ (RFC 8446 §5, App D.4)
+          if record_header_length(&header) != 1 || raw_record.byte_len() != 6 || raw_record.get(5).unwrap_or(0) != 1 {
+            session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+            return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+          }
+
+          // ChangeCipherSpec は ClientHello 後から Finished 前までに 1 回だけ受理して破棄
+          if session.ccs_received {
+            session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+            return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+          }
+          match session.phase {
+            HandshakePhase.WaitingClientHello2 => {
+              session.ccs_received = true;
+              return Ok(None);
+            }
+            HandshakePhase.WaitingFinished => {
+              session.ccs_received = true;
+              return Ok(None);
+            }
+            _ => {
+              session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+              return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+            }
+          }
         }
-        HandshakePhase.WaitingFinished => {
-          session.ccs_received = true;
-          return Ok(None);
+        ContentType.ApplicationData => {
+          // WaitingFinished 時の Client Finished 保護レコード
+          match session.phase {
+            HandshakePhase.WaitingFinished => {
+              return process_client_finished_record(&mut session, &raw_record);
+            }
+            _ => {
+              // 0-RTT や想定外フェーズでの ApplicationData は拒否（決定 1.2）
+              session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+              return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+            }
+          }
         }
         _ => {
           session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
@@ -1167,22 +1210,22 @@ pub fn handle_client_record(session: &mut HandshakeSession, raw_record: &Bytes) 
         }
       }
     }
-    ContentType.ApplicationData => {
-      // WaitingFinished 時の Client Finished 保護レコード
-      match session.phase {
-        HandshakePhase.WaitingFinished => {
-          return process_client_finished_record(&mut session, &raw_record);
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(alert) => {
+          session.phase = HandshakePhase.Failed(alert.clone());
+          return Err(ShieldError.Fatal(alert));
         }
-        _ => {
-          // 0-RTT や想定外フェーズでの ApplicationData は拒否（決定 1.2）
-          session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
-          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+        ShieldError.Incomplete(n) => {
+          return Err(ShieldError.Incomplete(n));
+        }
+        ShieldError.TimeoutOrNoProgress => {
+          return Err(ShieldError.TimeoutOrNoProgress);
+        }
+        ShieldError.ConnectionClosed => {
+          return Err(ShieldError.ConnectionClosed);
         }
       }
-    }
-    _ => {
-      session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
-      return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
     }
   }
 }
@@ -1196,97 +1239,118 @@ fn process_client_finished_record(session: &mut HandshakeSession, raw_record: &B
   match session.client_hs_protection {
     Some(p) => {
       let mut c_prot = p.clone();
-      let outcome = open_record(&mut c_prot, &raw_record)?;
-      let inner_ct = open_outcome_content_type(&outcome);
-      match inner_ct {
-        ContentType.Handshake => {}
-        _ => {
-          session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
-          return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
-        }
-      }
+      match open_record(&mut c_prot, &raw_record) {
+        Ok(outcome) => {
+          session.client_hs_protection = Some(c_prot);
 
-      // レコード開封に成功したら受信シーケンス番号を進めた状態を保持
-      session.client_hs_protection = Some(c_prot);
-
-      let plaintext = open_outcome_plaintext(&outcome);
-      session.client_finished_buffer.extend(&plaintext);
-
-      // バッファ過大（平文レコード上限超え）に対する安全策
-      if session.client_finished_buffer.byte_len() > max_plain_record_payload() {
-        session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
-        return Err(ShieldError.Fatal(AlertDescription.DecodeError));
-      }
-
-      match session.selected_suite {
-        Some(suite) => {
-          let hash_len = cipher_suite_hash_len(&suite);
-
-          // まだヘッダ (4 バイト) が揃っていなければ後続レコードを待機
-          if session.client_finished_buffer.byte_len() < 4 {
-            return Ok(None);
+          let inner_ct = open_outcome_content_type(&outcome);
+          match inner_ct {
+            ContentType.Handshake => {}
+            _ => {
+              session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+              return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+            }
           }
 
-          // msg_type == 20 (Finished)
-          if session.client_finished_buffer.get(0).unwrap_or(0) != 20 {
-            session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
-            return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
-          }
+          let plaintext = open_outcome_plaintext(&outcome);
+          session.client_finished_buffer.extend(&plaintext);
 
-          let l0 = session.client_finished_buffer.get(1).unwrap_or(0);
-          let l1 = session.client_finished_buffer.get(2).unwrap_or(0);
-          let l2 = session.client_finished_buffer.get(3).unwrap_or(0);
-          let body_len = l0 * 65536 + l1 * 256 + l2;
-          if body_len != hash_len {
+          // バッファ過大（平文レコード上限超え）に対する安全策
+          if session.client_finished_buffer.byte_len() > max_plain_record_payload() {
             session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
             return Err(ShieldError.Fatal(AlertDescription.DecodeError));
           }
 
-          let expected_total_len = 4 + hash_len;
-          if session.client_finished_buffer.byte_len() < expected_total_len {
-            // Finished メッセージ本体がまだ揃っていないので後続レコードを待機
-            return Ok(None);
+          match session.selected_suite {
+            Some(suite) => {
+              let hash_len = cipher_suite_hash_len(&suite);
+
+              // まだヘッダ (4 バイト) が揃っていなければ後続レコードを待機
+              if session.client_finished_buffer.byte_len() < 4 {
+                return Ok(None);
+              }
+
+              // msg_type == 20 (Finished)
+              if session.client_finished_buffer.get(0).unwrap_or(0) != 20 {
+                session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+                return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+              }
+
+              let l0 = session.client_finished_buffer.get(1).unwrap_or(0);
+              let l1 = session.client_finished_buffer.get(2).unwrap_or(0);
+              let l2 = session.client_finished_buffer.get(3).unwrap_or(0);
+              let body_len = l0 * 65536 + l1 * 256 + l2;
+              if body_len != hash_len {
+                session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
+                return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+              }
+
+              let expected_total_len = 4 + hash_len;
+              if session.client_finished_buffer.byte_len() < expected_total_len {
+                // Finished メッセージ本体がまだ揃っていないので後続レコードを待機
+                return Ok(None);
+              }
+              if session.client_finished_buffer.byte_len() > expected_total_len {
+                session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
+                return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+              }
+
+              let client_verify_data = session.client_finished_buffer.slice(4, expected_total_len).unwrap_or(Bytes.new());
+
+              // Server Finished までのトランスクリプトハッシュに対して検証
+              let th_sf = transcript_hash_for_suite(&suite, &session.transcript);
+              let ok = verify_finished_data(&suite, &session.client_hs_sec, &th_sf, &client_verify_data);
+              if !ok {
+                session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
+                return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+              }
+
+              // トランスクリプト更新 (Client Finished 追加)
+              let mut transcript = session.transcript.clone();
+              transcript.extend(&session.client_finished_buffer);
+
+              // アプリケーショントラフィック鍵導出: Server Finished 時点のトランスクリプトハッシュ (th_sf) を使用 (RFC 8446 §7.1)
+              let ms_sec = master_secret(&suite, &session.handshake_sec);
+              let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+              let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+
+              let s_app_prot = new_record_protection(RecordDirection.Transmit, suite.clone(), s_ap_sec.clone());
+              let c_app_prot = new_record_protection(RecordDirection.Receive, suite.clone(), c_ap_sec.clone());
+
+              session.phase = HandshakePhase.Connected;
+              session.transcript = transcript;
+              session.master_sec = ms_sec;
+              session.server_app_sec = s_ap_sec;
+              session.client_app_sec = c_ap_sec;
+              session.server_app_protection = Some(s_app_prot);
+              session.client_app_protection = Some(c_app_prot);
+
+              return Ok(None);
+            }
+            None => {
+              session.phase = HandshakePhase.Failed(AlertDescription.InternalError);
+              return Err(ShieldError.Fatal(AlertDescription.InternalError));
+            }
           }
-          if session.client_finished_buffer.byte_len() > expected_total_len {
-            session.phase = HandshakePhase.Failed(AlertDescription.DecodeError);
-            return Err(ShieldError.Fatal(AlertDescription.DecodeError));
-          }
-
-          let client_verify_data = session.client_finished_buffer.slice(4, expected_total_len).unwrap_or(Bytes.new());
-
-          // Server Finished までのトランスクリプトハッシュに対して検証
-          let th_sf = transcript_hash_for_suite(&suite, &session.transcript);
-          let ok = verify_finished_data(&suite, &session.client_hs_sec, &th_sf, &client_verify_data);
-          if !ok {
-            session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
-            return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
-          }
-
-          // トランスクリプト更新 (Client Finished 追加)
-          let mut transcript = session.transcript.clone();
-          transcript.extend(&session.client_finished_buffer);
-
-          // アプリケーショントラフィック鍵導出: Server Finished 時点のトランスクリプトハッシュ (th_sf) を使用 (RFC 8446 §7.1)
-          let ms_sec = master_secret(&suite, &session.handshake_sec);
-          let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
-          let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
-
-          let s_app_prot = new_record_protection(RecordDirection.Transmit, suite.clone(), s_ap_sec.clone());
-          let c_app_prot = new_record_protection(RecordDirection.Receive, suite.clone(), c_ap_sec.clone());
-
-          session.phase = HandshakePhase.Connected;
-          session.transcript = transcript;
-          session.master_sec = ms_sec;
-          session.server_app_sec = s_ap_sec;
-          session.client_app_sec = c_ap_sec;
-          session.server_app_protection = Some(s_app_prot);
-          session.client_app_protection = Some(c_app_prot);
-
-          return Ok(None);
         }
-        None => {
-          session.phase = HandshakePhase.Failed(AlertDescription.InternalError);
-          return Err(ShieldError.Fatal(AlertDescription.InternalError));
+        Err(e) => {
+          match e {
+            ShieldError.Fatal(alert) => {
+              // 認証失敗等で c_prot は poison されているため、破棄せずセッションに保持して Failed へ遷移
+              session.client_hs_protection = Some(c_prot);
+              session.phase = HandshakePhase.Failed(alert.clone());
+              return Err(ShieldError.Fatal(alert));
+            }
+            ShieldError.Incomplete(n) => {
+              return Err(ShieldError.Incomplete(n));
+            }
+            ShieldError.TimeoutOrNoProgress => {
+              return Err(ShieldError.TimeoutOrNoProgress);
+            }
+            ShieldError.ConnectionClosed => {
+              return Err(ShieldError.ConnectionClosed);
+            }
+          }
         }
       }
     }

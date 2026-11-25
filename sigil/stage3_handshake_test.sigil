@@ -23,6 +23,7 @@ use shield_handshake.handle_client_hello_explicit;
 use shield_handshake.handle_client_record;
 use shield_handshake.handshake_client_app_protection;
 use shield_handshake.handshake_client_app_sec;
+use shield_handshake.handshake_client_hs_protection;
 use shield_handshake.handshake_phase;
 use shield_handshake.handshake_server_app_protection;
 use shield_handshake.handshake_server_app_sec;
@@ -44,6 +45,7 @@ use shield_record_crypto.RecordProtection;
 use shield_record_crypto.new_record_protection;
 use shield_record_crypto.open_outcome_plaintext;
 use shield_record_crypto.open_record;
+use shield_record_crypto.record_protection_is_poisoned;
 use shield_record_crypto.seal_record;
 use test_support.bytes_eq;
 use test_support.hex_decode;
@@ -998,6 +1000,65 @@ fn test_handshake_rule_negatives() -> Int
             }
           }
 
+          // 8.1 不正な CCS ペイロード長 (0 バイト) -> UnexpectedMessage
+          let mut s8_inv1 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s8_inv1, &ch8, &server_rand, &server_priv);
+          let inv_ccs_len0 = wrap_in_record(20, 771, &Bytes.new());
+          let res8_inv1 = handle_client_record(&mut s8_inv1, &inv_ccs_len0);
+          match res8_inv1 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 530;
+            }
+          }
+          match handshake_phase(&s8_inv1) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 531;
+            }
+          }
+
+          // 8.2 不正な CCS ペイロード長 (2 バイト 0x01, 0x01) -> UnexpectedMessage
+          let mut s8_inv2 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s8_inv2, &ch8, &server_rand, &server_priv);
+          let mut two_bytes = Bytes.new();
+          two_bytes.push(1);
+          two_bytes.push(1);
+          let inv_ccs_len2 = wrap_in_record(20, 771, &two_bytes);
+          let res8_inv2 = handle_client_record(&mut s8_inv2, &inv_ccs_len2);
+          match res8_inv2 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 532;
+            }
+          }
+          match handshake_phase(&s8_inv2) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 533;
+            }
+          }
+
+          // 8.3 不正な CCS ペイロード値 (1 バイト 0x02) -> UnexpectedMessage
+          let mut s8_inv3 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s8_inv3, &ch8, &server_rand, &server_priv);
+          let mut wrong_val = Bytes.new();
+          wrong_val.push(2);
+          let inv_ccs_val = wrap_in_record(20, 771, &wrong_val);
+          let res8_inv3 = handle_client_record(&mut s8_inv3, &inv_ccs_val);
+          match res8_inv3 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 534;
+            }
+          }
+          match handshake_phase(&s8_inv3) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 535;
+            }
+          }
+
           // 9. 不正フェーズでのレコード (WaitingClientHello での ApplicationData) -> UnexpectedMessage
           let mut s9 = new_test_session(&ecdsa_priv);
           let early_data_record = wrap_in_record(23, 771, &"0-RTT early data".as_bytes());
@@ -1284,6 +1345,131 @@ fn test_client_finished_reassembly_across_records() -> Int
   }
 }
 
+fn test_client_finished_auth_failure_poison_and_failed() -> Int
+  intent "Client Finished レコードの認証失敗時に保護コンテキストが汚染保持されセッションが Failed に遷移する試験 (P2 指摘対応)"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(server_priv) => {
+          match test_client_x25519_priv() {
+            Ok(client_priv) => {
+              let mut session = new_test_session(&ecdsa_priv);
+              let client_pub = x25519_public_key(&client_priv);
+              let client_pub_bytes = client_pub.as_bytes();
+              let server_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);
+              let mut sigs = List.new();
+              sigs.push(1027);
+              let mut groups = List.new();
+              groups.push(29);
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+              let ch_msg = build_client_hello_custom(true, ciphers, sigs, groups, Some(client_pub_bytes.clone()), alpn, None);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  let sh_rec = get_record(&records, 0);
+                  let sh_msg_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let s_pub_from_sh = slice_bytes(&sh_msg_raw, sh_msg_raw.byte_len() - 32, sh_msg_raw.byte_len());
+                  let shared_secret = derive_shared_secret(&client_priv, &s_pub_from_sh);
+
+                  let suite = CipherSuite.TlsAes128GcmSha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_msg_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                  let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                  let sealed_rec = get_record(&records, 2);
+                  let pt = open_record_pt(&mut client_rx_hs, &sealed_rec);
+                  client_transcript.extend(&pt);
+
+                  let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                  let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+                  let c_fin_rec = seal_record_bytes(&mut client_tx_hs, &ContentType.Handshake, &c_fin_msg, 0);
+
+                  // 暗号文レコードの末尾バイト（認証タグ）を改ざん
+                  let mut tampered_rec = c_fin_rec.clone();
+                  let last_idx = tampered_rec.byte_len() - 1;
+                  let cur_b = tampered_rec.get(last_idx).unwrap_or(0);
+                  let _ = tampered_rec.set(last_idx, cur_b ^ 1);
+
+                  // 改ざんレコードの受信 -> BadRecordMac で拒絶
+                  let res = handle_client_record(&mut session, &tampered_rec);
+                  match res {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 801;
+                    }
+                  }
+
+                  // セッション状態が Failed(BadRecordMac) に遷移していること
+                  match handshake_phase(&session) {
+                    HandshakePhase.Failed(AlertDescription.BadRecordMac) => {}
+                    _ => {
+                      return 802;
+                    }
+                  }
+
+                  // 失敗したクライアント保護状態が破棄されず、poison された状態で保持されていること
+                  match handshake_client_hs_protection(&session) {
+                    Some(c_prot) => {
+                      if !record_protection_is_poisoned(&c_prot) {
+                        return 803;
+                      }
+                    }
+                    None => {
+                      return 804;
+                    }
+                  }
+
+                  // 失敗済みセッションへの後続レコード投入が即座に Failed で拒絶されること
+                  let res2 = handle_client_record(&mut session, &c_fin_rec);
+                  match res2 {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 805;
+                    }
+                  }
+
+                  return 0;
+                }
+                Err(_) => {
+                  return 800;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
 pub fn main() -> Int
   intent "Stage 3 ハンドシェイク状態機械の全テストを実行する"
   requires none
@@ -1323,6 +1509,11 @@ pub fn main() -> Int
   let r7 = test_client_finished_reassembly_across_records();
   if r7 != 0 {
     return r7;
+  }
+
+  let r8 = test_client_finished_auth_failure_poison_and_failed();
+  if r8 != 0 {
+    return r8;
   }
 
   return 0;
