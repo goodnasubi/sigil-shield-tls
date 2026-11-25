@@ -1,0 +1,179 @@
+module shield_key_update
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_limits.max_key_update_count;
+
+// TLS 1.3 鍵更新（ADR 0063 決定 1.3, RFC 8446 §4.6.3, §5.5）
+//
+// - KeyUpdate ハンドシェイクメッセージ (type 24, length 1, request_update = 0 または 1)
+// - 送信レコード数が 2^23 に達する前の更新トリガー、更新できず 2^23 超過時の終了
+// - 受信 KeyUpdate の受理、update_requested 時の送信鍵更新と応答、接続あたり 16 回制限（超過時 unexpected_message）
+
+pub fn key_update_tx_limit() -> Int
+  intent "送信レコード数の上限 (2^23 = 8,388,608 レコード)"
+  requires none
+  ensures none
+  effects none
+{
+  return 8388608;
+}
+
+pub enum KeyUpdateRequest {
+  UpdateNotRequested,
+  UpdateRequested,
+}
+
+pub fn key_update_request_to_u8(req: &KeyUpdateRequest) -> Int
+  intent "KeyUpdateRequest をバイト値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  return match req {
+    KeyUpdateRequest.UpdateNotRequested => 0,
+    KeyUpdateRequest.UpdateRequested => 1,
+  };
+}
+
+pub fn encode_key_update(request: &KeyUpdateRequest) -> Bytes
+  intent "KeyUpdate メッセージをエンコードする (5 バイト)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(5);
+  out.push(24);
+  out.push(0);
+  out.push(0);
+  out.push(1);
+  out.push(key_update_request_to_u8(&request));
+  return out;
+}
+
+pub fn decode_key_update(buf: &Bytes) -> Result<KeyUpdateRequest, ShieldError>
+  intent "KeyUpdate メッセージをデコードする"
+  requires none
+  ensures none
+  effects none
+{
+  if buf.byte_len() < 5 {
+    return Err(ShieldError.Incomplete(5 - buf.byte_len()));
+  }
+
+  if buf.get(0).unwrap_or(0) != 24 {
+    return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+  }
+
+  let length = buf.get(1).unwrap_or(0) * 65536 + buf.get(2).unwrap_or(0) * 256 + buf.get(3).unwrap_or(0);
+  if length != 1 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  if buf.byte_len() > 5 {
+    return Err(ShieldError.Fatal(AlertDescription.DecodeError));
+  }
+
+  let req_val = buf.get(4).unwrap_or(255);
+  if req_val == 0 {
+    return Ok(KeyUpdateRequest.UpdateNotRequested);
+  }
+  if req_val == 1 {
+    return Ok(KeyUpdateRequest.UpdateRequested);
+  }
+
+  return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+}
+
+pub struct KeyUpdateTracker {
+  records_sent: Int,
+  received_key_update_count: Int,
+}
+
+pub fn new_key_update_tracker() -> KeyUpdateTracker
+  intent "新しい KeyUpdateTracker を作成する"
+  requires none
+  ensures none
+  effects none
+{
+  return KeyUpdateTracker { records_sent: 0, received_key_update_count: 0 };
+}
+
+pub fn set_tracker_records_sent(tracker: &mut KeyUpdateTracker, count: Int)
+  intent "送信レコード数を設定する（テスト用）"
+  requires none
+  ensures none
+  effects none
+{
+  tracker.records_sent = count;
+}
+
+pub fn tracker_records_sent(tracker: &KeyUpdateTracker) -> Int
+  intent "送信レコード数を取得する"
+  requires none
+  ensures none
+  effects none
+{
+  return tracker.records_sent;
+}
+
+pub fn can_send_record(tracker: &KeyUpdateTracker) -> Result<Bool, ShieldError>
+  intent "レコード送信が可能か検査（2^23 に達して更新されないまま超過した場合は internal_error）"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.records_sent >= key_update_tx_limit() {
+    return Err(ShieldError.Fatal(AlertDescription.InternalError));
+  }
+  return Ok(true);
+}
+
+pub fn should_trigger_tx_update(tracker: &KeyUpdateTracker) -> Bool
+  intent "送信レコード数が 2^23 に達する前の更新トリガーか判定 (2^23 - 1 に到達)"
+  requires none
+  ensures none
+  effects none
+{
+  return tracker.records_sent >= key_update_tx_limit() - 1;
+}
+
+pub fn record_sent(tracker: &mut KeyUpdateTracker) -> Result<Bool, ShieldError>
+  intent "レコード送信を記録し、鍵更新トリガーが必要かを返す"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.records_sent >= key_update_tx_limit() {
+    return Err(ShieldError.Fatal(AlertDescription.InternalError));
+  }
+  tracker.records_sent = tracker.records_sent + 1;
+  return Ok(should_trigger_tx_update(&tracker));
+}
+
+pub fn on_tx_key_updated(tracker: &mut KeyUpdateTracker)
+  intent "送信鍵の更新完了時に呼び出し、レコード数を 0 にリセットする"
+  requires none
+  ensures none
+  effects none
+{
+  tracker.records_sent = 0;
+}
+
+pub fn handle_received_key_update(tracker: &mut KeyUpdateTracker, request: &KeyUpdateRequest) -> Result<Bool, ShieldError>
+  intent "受信した KeyUpdate を処理する（16 回超過時 unexpected_message。update_requested なら true を返す）"
+  requires none
+  ensures none
+  effects none
+{
+  tracker.received_key_update_count = tracker.received_key_update_count + 1;
+  if tracker.received_key_update_count > max_key_update_count() {
+    return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+  }
+  return Ok(match request {
+    KeyUpdateRequest.UpdateRequested => true,
+    KeyUpdateRequest.UpdateNotRequested => false,
+  });
+}

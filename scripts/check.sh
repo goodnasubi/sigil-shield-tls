@@ -64,4 +64,9 @@ run_entry stage1_client_hello_test "Stage 1 ClientHello parsing and validation"
 run_entry stage1_progress_test "Stage 1 progress and timeout invariants"
 run_entry stage1_fuzz_test "Stage 1 fuzzing harnesses"
 
-printf 'All Stage 1 evaluator and native tests passed.\n'
+run_entry stage2_cipher_suite_test "Stage 2 cipher suite definitions and selection"
+run_entry stage2_key_schedule_test "Stage 2 key schedule derivation and RFC 8448 vectors"
+run_entry stage2_record_crypto_test "Stage 2 record protection and RFC 8448 records"
+run_entry stage2_key_update_test "Stage 2 key update and limits"
+
+printf 'All Stage 1 and Stage 2 evaluator and native tests passed.\n'

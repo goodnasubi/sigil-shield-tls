@@ -1,0 +1,244 @@
+module stage2_key_schedule_test
+  targets server
+  trust none
+
+use shield_cipher_suite.CipherSuite;
+use shield_cipher_suite.cipher_suite_hash_len;
+use shield_cipher_suite.cipher_suite_iv_len;
+use shield_cipher_suite.cipher_suite_key_len;
+use shield_key_schedule.client_application_traffic_secret_0;
+use shield_key_schedule.client_handshake_traffic_secret;
+use shield_key_schedule.derive_traffic_iv;
+use shield_key_schedule.derive_traffic_key;
+use shield_key_schedule.early_secret;
+use shield_key_schedule.empty_transcript_hash;
+use shield_key_schedule.handshake_secret;
+use shield_key_schedule.master_secret;
+use shield_key_schedule.next_traffic_secret;
+use shield_key_schedule.server_application_traffic_secret_0;
+use shield_key_schedule.server_handshake_traffic_secret;
+use test_support.hex_decode;
+
+// RFC 8448 公式ベクタ照合と全暗号スイート鍵スケジュール導出試験（ADR 0063 決定 1）
+
+fn test_rfc8448_section3_key_schedule() -> Int
+  intent "RFC 8448 Section 3 (Simple 1-RTT Handshake) 公式ベクタとの厳密照合"
+  requires none
+  ensures none
+  effects none
+{
+  let suite = CipherSuite.TlsAes128GcmSha256;
+
+  // 1. Early Secret
+  let early_sec = early_secret(&suite);
+  let exp_early = hex_decode("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a");
+  if early_sec != exp_early {
+    return 11;
+  }
+
+  // 2. Handshake Secret
+  let shared_secret = hex_decode("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
+  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+  let exp_hs = hex_decode("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac");
+  if hs_sec != exp_hs {
+    return 12;
+  }
+
+  // 3. Server Handshake Traffic Secret & Key & IV
+  let th_sh = hex_decode("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+  let exp_s_hs_sec = hex_decode("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38");
+  if s_hs_sec != exp_s_hs_sec {
+    return 13;
+  }
+
+  let s_hs_key = derive_traffic_key(&suite, &s_hs_sec);
+  let exp_s_hs_key = hex_decode("3fce516009c21727d0f2e4e86ee403bc");
+  if s_hs_key != exp_s_hs_key {
+    return 14;
+  }
+
+  let s_hs_iv = derive_traffic_iv(&suite, &s_hs_sec);
+  let exp_s_hs_iv = hex_decode("5d313eb2671276ee13000b30");
+  if s_hs_iv != exp_s_hs_iv {
+    return 15;
+  }
+
+  // 4. Client Handshake Traffic Secret & Key & IV
+  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+  let exp_c_hs_sec = hex_decode("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21");
+  if c_hs_sec != exp_c_hs_sec {
+    return 16;
+  }
+
+  let c_hs_key = derive_traffic_key(&suite, &c_hs_sec);
+  let exp_c_hs_key = hex_decode("dbfaa693d1762c5b666af5d950258d01");
+  if c_hs_key != exp_c_hs_key {
+    return 17;
+  }
+
+  let c_hs_iv = derive_traffic_iv(&suite, &c_hs_sec);
+  let exp_c_hs_iv = hex_decode("5bd3c71b836e0b76bb73265f");
+  if c_hs_iv != exp_c_hs_iv {
+    return 18;
+  }
+
+  // 5. Master Secret
+  let ms_sec = master_secret(&suite, &hs_sec);
+  let exp_ms = hex_decode("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919");
+  if ms_sec != exp_ms {
+    return 19;
+  }
+
+  // 6. Application Traffic Secrets & Keys & IVs (Server Finished までのハッシュで導出)
+  let th_sf = hex_decode("9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13");
+  let c_app_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+  let exp_c_app_sec = hex_decode("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+  if c_app_sec != exp_c_app_sec {
+    return 20;
+  }
+
+  let c_app_key = derive_traffic_key(&suite, &c_app_sec);
+  let exp_c_app_key = hex_decode("17422dda596ed5d9acd890e3c63f5051");
+  if c_app_key != exp_c_app_key {
+    return 21;
+  }
+
+  let c_app_iv = derive_traffic_iv(&suite, &c_app_sec);
+  let exp_c_app_iv = hex_decode("5b78923dee08579033e523d9");
+  if c_app_iv != exp_c_app_iv {
+    return 22;
+  }
+
+  let s_app_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+  let exp_s_app_sec = hex_decode("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643");
+  if s_app_sec != exp_s_app_sec {
+    return 23;
+  }
+
+  let s_app_key = derive_traffic_key(&suite, &s_app_sec);
+  let exp_s_app_key = hex_decode("9f02283b6c9c07efc26bb9f2ac92e356");
+  if s_app_key != exp_s_app_key {
+    return 24;
+  }
+
+  let s_app_iv = derive_traffic_iv(&suite, &s_app_sec);
+  let exp_s_app_iv = hex_decode("cf782b88dd83549aadf1e984");
+  if s_app_iv != exp_s_app_iv {
+    return 25;
+  }
+
+  return 0;
+}
+
+fn test_suite_key_schedule(suite: CipherSuite) -> Bool
+  intent "単一暗号スイートでの鍵スケジュール導出完全性試験"
+  requires none
+  ensures none
+  effects none
+{
+  let hlen = cipher_suite_hash_len(&suite);
+  let klen = cipher_suite_key_len(&suite);
+  let ivlen = cipher_suite_iv_len(&suite);
+
+  let early_sec = early_secret(&suite);
+  if early_sec.byte_len() != hlen {
+    return false;
+  }
+
+  let mut shared_secret = Bytes.with_capacity(32);
+  let mut i = 0;
+  while i < 32 {
+    shared_secret.push(66);
+    i = i + 1;
+  }
+
+  let hs_sec = handshake_secret(&suite, &early_sec, &shared_secret);
+  if hs_sec.byte_len() != hlen {
+    return false;
+  }
+
+  let empty_th = empty_transcript_hash(&suite);
+  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &empty_th);
+  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &empty_th);
+  if c_hs_sec.byte_len() != hlen || s_hs_sec.byte_len() != hlen {
+    return false;
+  }
+  if c_hs_sec == s_hs_sec {
+    return false;
+  }
+
+  let ms_sec = master_secret(&suite, &hs_sec);
+  if ms_sec.byte_len() != hlen {
+    return false;
+  }
+
+  let c_app_sec = client_application_traffic_secret_0(&suite, &ms_sec, &empty_th);
+  let s_app_sec = server_application_traffic_secret_0(&suite, &ms_sec, &empty_th);
+  if c_app_sec.byte_len() != hlen || s_app_sec.byte_len() != hlen {
+    return false;
+  }
+  if c_app_sec == s_app_sec {
+    return false;
+  }
+
+  let c_key = derive_traffic_key(&suite, &c_app_sec);
+  let c_iv = derive_traffic_iv(&suite, &c_app_sec);
+  let s_key = derive_traffic_key(&suite, &s_app_sec);
+  let s_iv = derive_traffic_iv(&suite, &s_app_sec);
+
+  if c_key.byte_len() != klen || s_key.byte_len() != klen {
+    return false;
+  }
+  if c_iv.byte_len() != ivlen || s_iv.byte_len() != ivlen {
+    return false;
+  }
+  if c_key == s_key || c_iv == s_iv {
+    return false;
+  }
+
+  // 鍵更新時の次世代トラフィック秘密
+  let next_c = next_traffic_secret(&suite, &c_app_sec);
+  if next_c.byte_len() != hlen {
+    return false;
+  }
+  if next_c == c_app_sec {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_all_suites_key_schedule() -> Bool
+  intent "全 3 スイートでの鍵スケジュール導出試験"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_suite_key_schedule(CipherSuite.TlsChacha20Poly1305Sha256) {
+    return false;
+  }
+  if !test_suite_key_schedule(CipherSuite.TlsAes128GcmSha256) {
+    return false;
+  }
+  if !test_suite_key_schedule(CipherSuite.TlsAes256GcmSha384) {
+    return false;
+  }
+  return true;
+}
+
+pub fn main() -> Int
+  intent "鍵スケジュールテストのエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  let rfc_res = test_rfc8448_section3_key_schedule();
+  if rfc_res != 0 {
+    return rfc_res;
+  }
+  if !test_all_suites_key_schedule() {
+    return 2;
+  }
+  return 0;
+}

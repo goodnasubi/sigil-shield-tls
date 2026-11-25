@@ -1,0 +1,437 @@
+module stage2_key_update_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_key_update.KeyUpdateRequest;
+use shield_key_update.can_send_record;
+use shield_key_update.decode_key_update;
+use shield_key_update.encode_key_update;
+use shield_key_update.handle_received_key_update;
+use shield_key_update.key_update_tx_limit;
+use shield_key_update.new_key_update_tracker;
+use shield_key_update.on_tx_key_updated;
+use shield_key_update.record_sent;
+use shield_key_update.set_tracker_records_sent;
+use shield_key_update.should_trigger_tx_update;
+use shield_key_update.tracker_records_sent;
+use shield_record.ContentType;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_record_crypto.record_protection_key;
+use shield_record_crypto.record_protection_sequence_number;
+use shield_record_crypto.seal_record;
+use shield_record_crypto.update_record_protection_key;
+use test_support.bytes_eq;
+
+// 1. KeyUpdate メッセージのエンコード・デコード検証 (RFC 8446 §4.6.3)
+fn test_key_update_message_encoding_decoding() -> Bool
+  intent "KeyUpdate メッセージの正常系エンコード・デコードおよび異常系を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // UpdateNotRequested: [24, 0, 0, 1, 0]
+  let enc0 = encode_key_update(&KeyUpdateRequest.UpdateNotRequested);
+  let mut exp0 = Bytes.with_capacity(5);
+  exp0.push(24);
+  exp0.push(0);
+  exp0.push(0);
+  exp0.push(1);
+  exp0.push(0);
+  if !bytes_eq(&enc0, &exp0) {
+    return false;
+  }
+
+  match decode_key_update(&enc0) {
+    Ok(req) => {
+      match req {
+        KeyUpdateRequest.UpdateNotRequested => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // UpdateRequested: [24, 0, 0, 1, 1]
+  let enc1 = encode_key_update(&KeyUpdateRequest.UpdateRequested);
+  let mut exp1 = Bytes.with_capacity(5);
+  exp1.push(24);
+  exp1.push(0);
+  exp1.push(0);
+  exp1.push(1);
+  exp1.push(1);
+  if !bytes_eq(&enc1, &exp1) {
+    return false;
+  }
+
+  match decode_key_update(&enc1) {
+    Ok(req) => {
+      match req {
+        KeyUpdateRequest.UpdateRequested => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 不正な request_update 値 (例: 2) -> IllegalParameter
+  let mut invalid_req = Bytes.with_capacity(5);
+  invalid_req.push(24);
+  invalid_req.push(0);
+  invalid_req.push(0);
+  invalid_req.push(1);
+  invalid_req.push(2);
+  match decode_key_update(&invalid_req) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.IllegalParameter) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 長さ不正 (例: 長さ 2) -> DecodeError
+  let mut invalid_len = Bytes.with_capacity(6);
+  invalid_len.push(24);
+  invalid_len.push(0);
+  invalid_len.push(0);
+  invalid_len.push(2);
+  invalid_len.push(0);
+  invalid_len.push(0);
+  match decode_key_update(&invalid_len) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 余計なバイト -> DecodeError
+  let mut extra_bytes = Bytes.with_capacity(6);
+  extra_bytes.push(24);
+  extra_bytes.push(0);
+  extra_bytes.push(0);
+  extra_bytes.push(1);
+  extra_bytes.push(0);
+  extra_bytes.push(99);
+  match decode_key_update(&extra_bytes) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+// 2. KeyUpdateTracker 境界テスト (送信 2^23 および受信 16 回制限)
+fn test_key_update_boundaries() -> Bool
+  intent "送信 2^23 の直前・到達・超過、および受信 16 回制限の境界を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut tracker = new_key_update_tracker();
+  let limit = key_update_tx_limit();  // 8388608
+
+  // 1. 2^23 - 2 の状態
+  set_tracker_records_sent(&mut tracker, limit - 2);
+  if should_trigger_tx_update(&tracker) {
+    return false;
+  }
+  match can_send_record(&tracker) {
+    Ok(can) => {
+      if !can {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 1 レコード送信して 2^23 - 1 に到達（直前: 更新トリガー発生）
+  match record_sent(&mut tracker) {
+    Ok(need_update) => {
+      if !need_update {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if !should_trigger_tx_update(&tracker) {
+    return false;
+  }
+  if tracker_records_sent(&tracker) != limit - 1 {
+    return false;
+  }
+  match can_send_record(&tracker) {
+    Ok(can) => {
+      if !can {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 1 レコード送信して 2^23 に到達（一致）
+  match record_sent(&mut tracker) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+  if tracker_records_sent(&tracker) != limit {
+    return false;
+  }
+
+  // 2^23 超過: 更新できずさらに送信しようとするとエラー終了 (InternalError)
+  match can_send_record(&tracker) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.InternalError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  match record_sent(&mut tracker) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.InternalError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 鍵更新が行われたら 0 にリセットされて再び送信可能
+  on_tx_key_updated(&mut tracker);
+  if tracker_records_sent(&tracker) != 0 {
+    return false;
+  }
+  match can_send_record(&tracker) {
+    Ok(can) => {
+      if !can {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 受信 KeyUpdate 回数 (16 回制限) の境界テスト
+  let mut rx_tracker = new_key_update_tracker();
+
+  // 15 回目（直前）
+  let mut r = 0;
+  while r < 15 {
+    match handle_received_key_update(&mut rx_tracker, &KeyUpdateRequest.UpdateNotRequested) {
+      Ok(resp) => {
+        if resp {
+          return false;
+        }
+      }
+      Err(_) => {
+        return false;
+      }
+    }
+    r = r + 1;
+  }
+
+  // 16 回目（一致: 上限ちょうどまで受理可能、UpdateRequested は true を返す）
+  match handle_received_key_update(&mut rx_tracker, &KeyUpdateRequest.UpdateRequested) {
+    Ok(resp) => {
+      if !resp {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 17 回目（超過: 16 回を超えたら UnexpectedMessage）
+  match handle_received_key_update(&mut rx_tracker, &KeyUpdateRequest.UpdateNotRequested) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.UnexpectedMessage) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+// 3. 鍵更新適用とシーケンス番号リセット・通信継続検証
+fn test_key_update_record_and_seq_reset() -> Bool
+  intent "鍵更新後にシーケンス番号が 0 にリセットされ、新世代鍵で正しく通信できることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut secret = Bytes.with_capacity(32);
+  let mut i = 0;
+  while i < 32 {
+    secret.push(85);
+    i = i + 1;
+  }
+
+  let mut tx = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsAes128GcmSha256, secret.clone());
+  let mut rx = new_record_protection(RecordDirection.Receive, CipherSuite.TlsAes128GcmSha256, secret.clone());
+
+  let key_before = record_protection_key(&tx);
+
+  // 1 回目送受信 (seq 0)
+  let mut msg1 = Bytes.with_capacity(4);
+  msg1.push(109);
+  msg1.push(115);
+  msg1.push(103);
+  msg1.push(49);
+
+  match seal_record(&mut tx, &ContentType.ApplicationData, &msg1, 0) {
+    Ok(r1) => {
+      if record_protection_sequence_number(&tx) != 1 {
+        return false;
+      }
+      match open_record(&mut rx, &r1) {
+        Ok(outcome1) => {
+          if record_protection_sequence_number(&rx) != 1 {
+            return false;
+          }
+          let d1 = open_outcome_plaintext(&outcome1);
+          if !bytes_eq(&d1, &msg1) {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 鍵更新の適用
+  update_record_protection_key(&mut tx);
+  update_record_protection_key(&mut rx);
+
+  // シーケンス番号が 0 にリセットされていること
+  if record_protection_sequence_number(&tx) != 0 {
+    return false;
+  }
+  if record_protection_sequence_number(&rx) != 0 {
+    return false;
+  }
+
+  // 鍵が新世代に更新されていること
+  let key_after = record_protection_key(&tx);
+  if bytes_eq(&key_before, &key_after) {
+    return false;
+  }
+
+  // 更新後の新しい鍵で送受信 (seq 0) が成立すること
+  let mut msg2 = Bytes.with_capacity(4);
+  msg2.push(109);
+  msg2.push(115);
+  msg2.push(103);
+  msg2.push(50);
+
+  match seal_record(&mut tx, &ContentType.ApplicationData, &msg2, 0) {
+    Ok(r2) => {
+      if record_protection_sequence_number(&tx) != 1 {
+        return false;
+      }
+      match open_record(&mut rx, &r2) {
+        Ok(outcome2) => {
+          if record_protection_sequence_number(&rx) != 1 {
+            return false;
+          }
+          let d2 = open_outcome_plaintext(&outcome2);
+          if !bytes_eq(&d2, &msg2) {
+            return false;
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+pub fn main() -> Int
+  intent "段 2 鍵更新の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_key_update_message_encoding_decoding() {
+    return 1;
+  }
+  if !test_key_update_boundaries() {
+    return 2;
+  }
+  if !test_key_update_record_and_seq_reset() {
+    return 3;
+  }
+  return 0;
+}

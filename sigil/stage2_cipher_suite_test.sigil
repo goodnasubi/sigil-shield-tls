@@ -1,0 +1,240 @@
+module stage2_cipher_suite_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_cipher_suite.aead_open;
+use shield_cipher_suite.aead_seal;
+use shield_cipher_suite.cipher_suite_hash_len;
+use shield_cipher_suite.cipher_suite_iv_len;
+use shield_cipher_suite.cipher_suite_key_len;
+use shield_cipher_suite.cipher_suite_tag_len;
+use shield_cipher_suite.cipher_suite_to_u16;
+use shield_cipher_suite.select_cipher_suite;
+
+// 暗号スイート定義と選択・AEAD 正常系・異常系試験（ADR 0063 決定 1）
+
+fn test_cipher_suite_selection() -> Bool
+  intent "サーバー優先順（ChaCha20 > AES-128 > AES-256）と未対応スイート拒否の検証"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 全スイート提示時は ChaCha20-Poly1305 が選ばれること
+  let mut all_suites = List.new();
+  all_suites.push(4866);  // AES-256-GCM
+  all_suites.push(4865);  // AES-128-GCM
+  all_suites.push(4867);  // ChaCha20-Poly1305
+  match select_cipher_suite(&all_suites) {
+    Ok(s) => {
+      if cipher_suite_to_u16(&s) != 4867 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 2. AES-256 と AES-128 提示時は AES-128 が選ばれること
+  let mut aes_suites = List.new();
+  aes_suites.push(4866);
+  aes_suites.push(4865);
+  match select_cipher_suite(&aes_suites) {
+    Ok(s) => {
+      if cipher_suite_to_u16(&s) != 4865 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 3. AES-256 のみ提示時は AES-256 が選ばれること
+  let mut single_aes256 = List.new();
+  single_aes256.push(4866);
+  match select_cipher_suite(&single_aes256) {
+    Ok(s) => {
+      if cipher_suite_to_u16(&s) != 4866 {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 4. 未対応スイートのみ提示時は handshake_failure で拒否されること
+  let mut unsupported = List.new();
+  unsupported.push(47);  // TLS_RSA_WITH_AES_128_CBC_SHA
+  unsupported.push(49171);  // TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA
+  match select_cipher_suite(&unsupported) {
+    Ok(_) => {
+      return false;
+    }
+    Err(err) => {
+      match err {
+        ShieldError.Fatal(desc) => {
+          match desc {
+            AlertDescription.HandshakeFailure => {}
+            _ => {
+              return false;
+            }
+          }
+        }
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+fn test_cipher_suite_properties() -> Bool
+  intent "鍵長・IV 長・タグ長・ハッシュ長の検証"
+  requires none
+  ensures none
+  effects none
+{
+  let chacha = CipherSuite.TlsChacha20Poly1305Sha256;
+  let aes128 = CipherSuite.TlsAes128GcmSha256;
+  let aes256 = CipherSuite.TlsAes256GcmSha384;
+
+  if cipher_suite_key_len(&chacha) != 32 || cipher_suite_key_len(&aes128) != 16 || cipher_suite_key_len(&aes256) != 32 {
+    return false;
+  }
+
+  if cipher_suite_iv_len(&chacha) != 12 || cipher_suite_iv_len(&aes128) != 12 || cipher_suite_iv_len(&aes256) != 12 {
+    return false;
+  }
+
+  if cipher_suite_tag_len(&chacha) != 16 || cipher_suite_tag_len(&aes128) != 16 || cipher_suite_tag_len(&aes256) != 16 {
+    return false;
+  }
+
+  if cipher_suite_hash_len(&chacha) != 32 || cipher_suite_hash_len(&aes128) != 32 || cipher_suite_hash_len(&aes256) != 48 {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_aead_for_suite(suite: CipherSuite) -> Bool
+  intent "単一暗号スイートでの AEAD 暗号化・復号・改ざん検知試験"
+  requires none
+  ensures none
+  effects none
+{
+  let klen = cipher_suite_key_len(&suite);
+  let mut key = Bytes.with_capacity(klen);
+  let mut i = 0;
+  while i < klen {
+    key.push(i + 1);
+    i = i + 1;
+  }
+
+  let mut nonce = Bytes.with_capacity(12);
+  let mut n = 0;
+  while n < 12 {
+    nonce.push(n + 10);
+    n = n + 1;
+  }
+
+  let aad = "test authenticated data".as_bytes();
+  let pt = "hello world! TLS 1.3 protected record payload.".as_bytes();
+
+  // 1. 正常系暗号化と復号
+  let mut sealed = Bytes.new();
+  match aead_seal(&suite, &key, &nonce, &aad, &pt) {
+    Ok(ct) => {
+      sealed = ct;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if sealed.byte_len() != pt.byte_len() + 16 {
+    return false;
+  }
+
+  let mut recovered = Bytes.new();
+  match aead_open(&suite, &key, &nonce, &aad, &sealed) {
+    Ok(p) => {
+      recovered = p;
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+  if recovered != pt {
+    return false;
+  }
+
+  // 2. 暗号文改ざんの検知（bad_record_mac）
+  let mut tampered_ct = sealed.clone();
+  let cur_byte = tampered_ct.get(0).unwrap_or(0);
+  let _ = tampered_ct.set(0, cur_byte ^ 1);
+  let open_tampered = aead_open(&suite, &key, &nonce, &aad, &tampered_ct);
+  if open_tampered.is_ok() {
+    return false;
+  }
+
+  // 3. AAD 改ざんの検知（bad_record_mac）
+  let wrong_aad = "wrong authenticated data".as_bytes();
+  let open_wrong_aad = aead_open(&suite, &key, &nonce, &wrong_aad, &sealed);
+  if open_wrong_aad.is_ok() {
+    return false;
+  }
+
+  // 4. 不正な Nonce での検証失敗（bad_record_mac）
+  let mut wrong_nonce = nonce.clone();
+  let n_cur = wrong_nonce.get(0).unwrap_or(0);
+  let _ = wrong_nonce.set(0, n_cur ^ 1);
+  let open_wrong_nonce = aead_open(&suite, &key, &wrong_nonce, &aad, &sealed);
+  if open_wrong_nonce.is_ok() {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_aead_roundtrip_all() -> Bool
+  intent "3 スイートすべてでの AEAD 正常・改ざん試験"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_aead_for_suite(CipherSuite.TlsChacha20Poly1305Sha256) {
+    return false;
+  }
+  if !test_aead_for_suite(CipherSuite.TlsAes128GcmSha256) {
+    return false;
+  }
+  if !test_aead_for_suite(CipherSuite.TlsAes256GcmSha384) {
+    return false;
+  }
+  return true;
+}
+
+pub fn main() -> Int
+  intent "暗号スイートテストのエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_cipher_suite_selection() {
+    return 1;
+  }
+  if !test_cipher_suite_properties() {
+    return 2;
+  }
+  if !test_aead_roundtrip_all() {
+    return 3;
+  }
+  return 0;
+}

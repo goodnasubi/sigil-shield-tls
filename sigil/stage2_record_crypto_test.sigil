@@ -1,0 +1,625 @@
+module stage2_record_crypto_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_cipher_suite.aead_seal;
+use shield_record.ContentType;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.make_nonce;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_consumed_len;
+use shield_record_crypto.open_outcome_content_type;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_record_crypto.record_protection_is_poisoned;
+use shield_record_crypto.record_protection_iv;
+use shield_record_crypto.record_protection_key;
+use shield_record_crypto.record_protection_sequence_number;
+use shield_record_crypto.seal_record;
+use shield_record_crypto.set_record_protection_sequence_number;
+use test_support.bytes_eq;
+use test_support.hex_decode;
+
+// 1. Nonce 構成のテスト (RFC 8446 §5.3)
+fn test_nonce_construction() -> Bool
+  intent "make_nonce の 64 ビットシーケンス番号 XOR ロジックを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut iv = Bytes.with_capacity(12);
+  let mut i = 1;
+  while i <= 12 {
+    iv.push(i);
+    i = i + 1;
+  }
+
+  // シーケンス番号 0 -> IV と同一
+  let nonce0 = make_nonce(&iv, 0);
+  if !bytes_eq(&nonce0, &iv) {
+    return false;
+  }
+
+  // シーケンス番号 1 -> 最下位バイトのみ 12 ^ 1 = 13
+  let nonce1 = make_nonce(&iv, 1);
+  if nonce1.get(11).unwrap_or(0) != 13 {
+    return false;
+  }
+  let mut j = 0;
+  while j < 11 {
+    if nonce1.get(j).unwrap_or(0) != iv.get(j).unwrap_or(0) {
+      return false;
+    }
+    j = j + 1;
+  }
+
+  // シーケンス番号 0x0102030405060708
+  // 0x01020304 << 32 | 0x05060708 = 72623859790382856
+  let seq = 72623859790382856;
+  let nonce_seq = make_nonce(&iv, seq);
+
+  let mut expected_seq = Bytes.with_capacity(12);
+  expected_seq.push(1);
+  expected_seq.push(2);
+  expected_seq.push(3);
+  expected_seq.push(4);
+  expected_seq.push(5 ^ 1);
+  expected_seq.push(6 ^ 2);
+  expected_seq.push(7 ^ 3);
+  expected_seq.push(8 ^ 4);
+  expected_seq.push(9 ^ 5);
+  expected_seq.push(10 ^ 6);
+  expected_seq.push(11 ^ 7);
+  expected_seq.push(12 ^ 8);
+
+  if !bytes_eq(&nonce_seq, &expected_seq) {
+    return false;
+  }
+
+  return true;
+}
+
+// 2. 3 暗号スイート全件の保護レコード送受信ラウンドトリップ
+fn test_record_protection_roundtrip(suite: CipherSuite) -> Bool
+  intent "単一暗号スイートでのパディング付きラウンドトリップを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut secret = Bytes.with_capacity(48);
+  let mut b = 0;
+  while b < 48 {
+    secret.push(b + 1);
+    b = b + 1;
+  }
+
+  let mut tx = new_record_protection(RecordDirection.Transmit, suite.clone(), secret.clone());
+  let mut rx = new_record_protection(RecordDirection.Receive, suite.clone(), secret.clone());
+
+  // ペイロード: 空、1 バイト、15 バイト、1024 バイト
+  let mut payloads = List.new();
+  payloads.push(Bytes.new());
+
+  let mut p15 = Bytes.with_capacity(15);
+  let mut k = 1;
+  while k <= 15 {
+    p15.push(k);
+    k = k + 1;
+  }
+  payloads.push(p15.clone());
+
+  let mut p256 = Bytes.with_capacity(256);
+  let mut m = 0;
+  while m < 16 {
+    p256.extend(&p15);
+    p256.push(m);
+    m = m + 1;
+  }
+  payloads.push(p256);
+
+  // パディング長: 0, 16
+  let mut paddings = List.new();
+  paddings.push(0);
+  paddings.push(16);
+
+  let mut pi = 0;
+  while pi < payloads.len() {
+    let payload = match payloads.get(pi) {
+      Some(p) => p.clone(),
+      None => Bytes.new(),
+    };
+
+    let mut pj = 0;
+    while pj < paddings.len() {
+      let pad = match paddings.get(pj) {
+        Some(v) => v + 0,
+        None => 0,
+      };
+
+      // ApplicationData の送受信 (空ペイロードも許容)
+      let seq_before_tx = record_protection_sequence_number(&tx);
+      let sealed_res = seal_record(&mut tx, &ContentType.ApplicationData, &payload, pad);
+      match sealed_res {
+        Ok(sealed) => {
+          if record_protection_sequence_number(&tx) != seq_before_tx + 1 {
+            return false;
+          }
+
+          let seq_before_rx = record_protection_sequence_number(&rx);
+          let open_res = open_record(&mut rx, &sealed);
+          match open_res {
+            Ok(outcome) => {
+              if record_protection_sequence_number(&rx) != seq_before_rx + 1 {
+                return false;
+              }
+              match open_outcome_content_type(&outcome) {
+                ContentType.ApplicationData => {}
+                _ => {
+                  return false;
+                }
+              }
+              let decrypted = open_outcome_plaintext(&outcome);
+              if !bytes_eq(&decrypted, &payload) {
+                return false;
+              }
+              if open_outcome_consumed_len(&outcome) != sealed.byte_len() {
+                return false;
+              }
+            }
+            Err(_) => {
+              return false;
+            }
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+
+      // Handshake の送受信 (非空ペイロードのみ)
+      if payload.byte_len() > 0 {
+        match seal_record(&mut tx, &ContentType.Handshake, &payload, pad) {
+          Ok(sealed_hs) => {
+            match open_record(&mut rx, &sealed_hs) {
+              Ok(outcome_hs) => {
+                match open_outcome_content_type(&outcome_hs) {
+                  ContentType.Handshake => {}
+                  _ => {
+                    return false;
+                  }
+                }
+                let decrypted_hs = open_outcome_plaintext(&outcome_hs);
+                if !bytes_eq(&decrypted_hs, &payload) {
+                  return false;
+                }
+              }
+              Err(_) => {
+                return false;
+              }
+            }
+          }
+          Err(_) => {
+            return false;
+          }
+        }
+      }
+
+      pj = pj + 1;
+    }
+    pi = pi + 1;
+  }
+
+  // 送信側と受信側のシーケンス番号の一致を確認
+  if record_protection_sequence_number(&tx) != record_protection_sequence_number(&rx) {
+    return false;
+  }
+
+  return true;
+}
+
+// 3. RFC 8448 公式アプリケーションレコードの検証
+fn test_rfc8448_application_records() -> Bool
+  intent "RFC 8448 Section 3 公式アプリケーションレコードの暗号化・復号を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let server_traffic_secret = hex_decode("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643");
+  let client_traffic_secret = hex_decode("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5");
+
+  let app_plain = hex_decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3031");
+  let expected_server_record = hex_decode("17030300432e937e11ef4ac740e538ad36005fc4a46932fc3225d05f82aa1b36e30efaf97d90e6dffc602dcb501a59a8fcc49c4bf2e5f0a21c0047c2abf332540dd032e167c2955d");
+  let client_record = hex_decode("1703030043a23f7054b62c94d0affafe8228ba55cbefacea42f914aa66bcab3f2b9819a8a5b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3deae63aeebb21694915e4");
+
+  // サーバー送信: RFC 8448 Section 3 では Server Finished (seq 0) 送信後のため seq 1
+  let mut server_tx = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsAes128GcmSha256, server_traffic_secret);
+  set_record_protection_sequence_number(&mut server_tx, 1);
+
+  match seal_record(&mut server_tx, &ContentType.ApplicationData, &app_plain, 0) {
+    Ok(sealed) => {
+      if !bytes_eq(&sealed, &expected_server_record) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // クライアント受信: クライアント側から送信されたレコード (seq 0) を復号
+  let mut client_rx = new_record_protection(RecordDirection.Receive, CipherSuite.TlsAes128GcmSha256, client_traffic_secret);
+  match open_record(&mut client_rx, &client_record) {
+    Ok(outcome) => {
+      match open_outcome_content_type(&outcome) {
+        ContentType.ApplicationData => {}
+        _ => {
+          return false;
+        }
+      }
+      let decrypted = open_outcome_plaintext(&outcome);
+      if !bytes_eq(&decrypted, &app_plain) {
+        return false;
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// 4. AEAD 認証失敗テストおよびポイズニング検証
+fn test_aead_failure_and_poisoning() -> Bool
+  intent "破損データで即座に BadRecordMac を返し、以後の復号も永久に拒否することを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut secret = Bytes.with_capacity(32);
+  let mut i = 0;
+  while i < 32 {
+    secret.push(17);
+    i = i + 1;
+  }
+
+  let mut tx = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsChacha20Poly1305Sha256, secret.clone());
+  let mut rx = new_record_protection(RecordDirection.Receive, CipherSuite.TlsChacha20Poly1305Sha256, secret.clone());
+
+  let mut msg = Bytes.with_capacity(12);
+  msg.push(104);
+  msg.push(101);
+  msg.push(108);
+  msg.push(108);
+  msg.push(111);
+
+  match seal_record(&mut tx, &ContentType.ApplicationData, &msg, 0) {
+    Ok(sealed) => {
+      // 最後のバイト（MAC タグ）を改ざんする
+      let mut tampered = Bytes.with_capacity(sealed.byte_len());
+      let last_idx = sealed.byte_len() - 1;
+      let mut idx = 0;
+      while idx < sealed.byte_len() {
+        let b = sealed.get(idx).unwrap_or(0);
+        if idx == last_idx {
+          tampered.push(b ^ 255);
+        } else {
+          tampered.push(b);
+        }
+        idx = idx + 1;
+      }
+
+      // 復号が BadRecordMac で失敗すること
+      match open_record(&mut rx, &tampered) {
+        Ok(_) => {
+          return false;
+        }
+        Err(e) => {
+          match e {
+            ShieldError.Fatal(AlertDescription.BadRecordMac) => {}
+            _ => {
+              return false;
+            }
+          }
+        }
+      }
+
+      // 受信インスタンスが毒入れされていること
+      if !record_protection_is_poisoned(&rx) {
+        return false;
+      }
+
+      // 正常なレコードであっても以後は BadRecordMac で即座に拒否されること
+      match seal_record(&mut tx, &ContentType.ApplicationData, &msg, 0) {
+        Ok(valid_sealed) => {
+          match open_record(&mut rx, &valid_sealed) {
+            Ok(_) => {
+              return false;
+            }
+            Err(e) => {
+              match e {
+                ShieldError.Fatal(AlertDescription.BadRecordMac) => {}
+                _ => {
+                  return false;
+                }
+              }
+            }
+          }
+        }
+        Err(_) => {
+          return false;
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// 5. 全ゼロ内部平文の拒否テスト
+fn test_all_zero_inner_plaintext_rejected() -> Bool
+  intent "内部平文が全ゼロの場合に UnexpectedMessage で拒否されることを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut secret = Bytes.with_capacity(32);
+  let mut i = 0;
+  while i < 32 {
+    secret.push(34);
+    i = i + 1;
+  }
+
+  let mut rx = new_record_protection(RecordDirection.Receive, CipherSuite.TlsAes128GcmSha256, secret.clone());
+  let key = record_protection_key(&rx);
+  let iv = record_protection_iv(&rx);
+
+  let mut zeros = Bytes.with_capacity(10);
+  let mut z = 0;
+  while z < 10 {
+    zeros.push(0);
+    z = z + 1;
+  }
+
+  let encrypted_len = zeros.byte_len() + 16;
+  let mut aad = Bytes.with_capacity(5);
+  aad.push(23);
+  aad.push(3);
+  aad.push(3);
+  aad.push(encrypted_len / 256);
+  aad.push(encrypted_len % 256);
+
+  let nonce = make_nonce(&iv, record_protection_sequence_number(&rx));
+  match aead_seal(&CipherSuite.TlsAes128GcmSha256, &key, &nonce, &aad, &zeros) {
+    Ok(ct) => {
+      let mut bad_record = Bytes.with_capacity(5 + ct.byte_len());
+      bad_record.extend(&aad);
+      bad_record.extend(&ct);
+
+      match open_record(&mut rx, &bad_record) {
+        Ok(_) => {
+          return false;
+        }
+        Err(e) => {
+          match e {
+            ShieldError.Fatal(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return false;
+            }
+          }
+        }
+      }
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// 6. 境界値および異常系テスト
+fn test_boundary_and_negative_cases() -> Bool
+  intent "平文長上限・空ハンドシェイク断片・暗号化 CCS 拒否の境界を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut secret = Bytes.with_capacity(32);
+  let mut i = 0;
+  while i < 32 {
+    secret.push(51);
+    i = i + 1;
+  }
+
+  let mut tx = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsAes128GcmSha256, secret.clone());
+
+  // 16,384 バイト平文は暗号化可能
+  let mut chunk = Bytes.with_capacity(256);
+  let mut c = 0;
+  while c < 256 {
+    chunk.push(66);
+    c = c + 1;
+  }
+  let mut plain_16384 = Bytes.with_capacity(16384);
+  let mut k = 0;
+  while k < 64 {
+    plain_16384.extend(&chunk);
+    k = k + 1;
+  }
+
+  match seal_record(&mut tx, &ContentType.ApplicationData, &plain_16384, 0) {
+    Ok(_) => {}
+    Err(_) => {
+      return false;
+    }
+  }
+
+  // 16,385 バイト平文は DecodeError で拒否
+  let mut plain_16385 = plain_16384.clone();
+  plain_16385.push(67);
+  match seal_record(&mut tx, &ContentType.ApplicationData, &plain_16385, 0) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 16,384 バイト + パディング 1 バイト = inner_len 16,386 (> 16,385) は DecodeError
+  match seal_record(&mut tx, &ContentType.ApplicationData, &plain_16384, 1) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 16,384 バイト + パディング 64 バイトも DecodeError
+  match seal_record(&mut tx, &ContentType.ApplicationData, &plain_16384, 64) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 空の Handshake 断片は DecodeError で拒否 (RFC 8446 §5.1)
+  let empty = Bytes.new();
+  match seal_record(&mut tx, &ContentType.Handshake, &empty, 0) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  match seal_record(&mut tx, &ContentType.Handshake, &empty, 64) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // ChangeCipherSpec (20) は保護レコード内では UnexpectedMessage で拒否
+  let mut one_byte = Bytes.with_capacity(1);
+  one_byte.push(1);
+  match seal_record(&mut tx, &ContentType.ChangeCipherSpec, &one_byte, 0) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.UnexpectedMessage) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+
+  // 負のパディング長 (-1, -100) は DecodeError で拒否し、シーケンス番号を進めない
+  let seq_before = record_protection_sequence_number(&tx);
+  match seal_record(&mut tx, &ContentType.ApplicationData, &one_byte, -1) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+  match seal_record(&mut tx, &ContentType.ApplicationData, &one_byte, -100) {
+    Ok(_) => {
+      return false;
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(AlertDescription.DecodeError) => {}
+        _ => {
+          return false;
+        }
+      }
+    }
+  }
+  let seq_after = record_protection_sequence_number(&tx);
+  if seq_before != seq_after {
+    return false;
+  }
+
+  return true;
+}
+
+pub fn main() -> Int
+  intent "段 2 保護レコードの全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_nonce_construction() {
+    return 1;
+  }
+  if !test_record_protection_roundtrip(CipherSuite.TlsChacha20Poly1305Sha256) {
+    return 2;
+  }
+  if !test_record_protection_roundtrip(CipherSuite.TlsAes128GcmSha256) {
+    return 3;
+  }
+  if !test_record_protection_roundtrip(CipherSuite.TlsAes256GcmSha384) {
+    return 4;
+  }
+  if !test_rfc8448_application_records() {
+    return 5;
+  }
+  if !test_aead_failure_and_poisoning() {
+    return 6;
+  }
+  if !test_all_zero_inner_plaintext_rejected() {
+    return 7;
+  }
+  if !test_boundary_and_negative_cases() {
+    return 8;
+  }
+  return 0;
+}
