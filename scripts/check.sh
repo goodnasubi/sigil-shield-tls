@@ -63,5 +63,6 @@ run_entry stage1_record_test "Stage 1 record layer and reassembly"
 run_entry stage1_client_hello_test "Stage 1 ClientHello parsing and validation"
 run_entry stage1_progress_test "Stage 1 progress and timeout invariants"
 run_entry stage1_fuzz_test "Stage 1 fuzzing harnesses"
+run_entry stage2_key_schedule_test "Stage 2 key schedule and cipher suites"
 
-printf 'All Stage 1 evaluator and native tests passed.\n'
+printf 'All Stage 1 and Stage 2 evaluator and native tests passed.\n'

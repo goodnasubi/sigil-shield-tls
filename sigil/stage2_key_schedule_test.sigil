@@ -1,0 +1,340 @@
+module stage2_key_schedule_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_alert.alert_description_to_u8;
+use shield_cipher_suite.CipherSuite;
+use shield_cipher_suite.cipher_suite_as_u16;
+use shield_cipher_suite.cipher_suite_code_aes_128_gcm_sha256;
+use shield_cipher_suite.cipher_suite_code_aes_256_gcm_sha384;
+use shield_cipher_suite.cipher_suite_code_chacha20_poly1305_sha256;
+use shield_cipher_suite.cipher_suite_hash_len;
+use shield_cipher_suite.cipher_suite_iv_len;
+use shield_cipher_suite.cipher_suite_key_len;
+use shield_cipher_suite.cipher_suite_open;
+use shield_cipher_suite.cipher_suite_seal;
+use shield_cipher_suite.select_cipher_suite;
+use shield_key_schedule.client_application_traffic_secret_0;
+use shield_key_schedule.client_handshake_traffic_secret;
+use shield_key_schedule.derive_traffic_iv;
+use shield_key_schedule.derive_traffic_key;
+use shield_key_schedule.early_secret;
+use shield_key_schedule.empty_hash;
+use shield_key_schedule.handshake_secret;
+use shield_key_schedule.master_secret;
+use shield_key_schedule.next_traffic_secret;
+use shield_key_schedule.server_application_traffic_secret_0;
+use shield_key_schedule.server_handshake_traffic_secret;
+
+// ADR 0063 段 2: 鍵スケジュールと暗号スイートのテスト（Sigil 実装）
+
+fn bytes_equal(a: &Bytes, b: &Bytes) -> Bool
+  intent "2 つのバイト列が等しいか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    let va = a.get(i).unwrap_or(0);
+    let vb = b.get(i).unwrap_or(0);
+    if va != vb {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn test_cipher_suite_selection() -> Bool
+  intent "暗号スイートの選択規則とサーバー優先順を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 全スイート提示時は ChaCha20-Poly1305 が選ばれる (0x1303 = 4867)
+  let mut all_suites = List.new();
+  all_suites.push(cipher_suite_code_aes_256_gcm_sha384());
+  all_suites.push(cipher_suite_code_aes_128_gcm_sha256());
+  all_suites.push(cipher_suite_code_chacha20_poly1305_sha256());
+
+  let sel1 = select_cipher_suite(&all_suites);
+  let mut code1 = 0;
+  match sel1 {
+    Ok(s) => {
+      code1 = cipher_suite_as_u16(&s);
+    }
+    Err(e) => {
+      return false;
+    }
+  }
+  if code1 != cipher_suite_code_chacha20_poly1305_sha256() {
+    return false;
+  }
+
+  // 2. AES のみ提示時は AES-128-GCM が選ばれる (0x1301 = 4865)
+  let mut aes_suites = List.new();
+  aes_suites.push(cipher_suite_code_aes_256_gcm_sha384());
+  aes_suites.push(cipher_suite_code_aes_128_gcm_sha256());
+
+  let sel2 = select_cipher_suite(&aes_suites);
+  let mut code2 = 0;
+  match sel2 {
+    Ok(s) => {
+      code2 = cipher_suite_as_u16(&s);
+    }
+    Err(e) => {
+      return false;
+    }
+  }
+  if code2 != cipher_suite_code_aes_128_gcm_sha256() {
+    return false;
+  }
+
+  // 3. AES-256 のみ提示時は AES-256-GCM が選ばれる (0x1302 = 4866)
+  let mut single_aes256 = List.new();
+  single_aes256.push(cipher_suite_code_aes_256_gcm_sha384());
+
+  let sel3 = select_cipher_suite(&single_aes256);
+  let mut code3 = 0;
+  match sel3 {
+    Ok(s) => {
+      code3 = cipher_suite_as_u16(&s);
+    }
+    Err(e) => {
+      return false;
+    }
+  }
+  if code3 != cipher_suite_code_aes_256_gcm_sha384() {
+    return false;
+  }
+
+  // 4. 未知スイートのみ提示時はエラー (HandshakeFailure)
+  let mut unsupported = List.new();
+  unsupported.push(47);
+  unsupported.push(53);
+
+  let sel4 = select_cipher_suite(&unsupported);
+  let is_handshake_failure = match sel4 {
+    Err(e) => match e {
+      ShieldError.Fatal(desc) => alert_description_to_u8(&desc) == alert_description_to_u8(&AlertDescription.HandshakeFailure),
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+  if !is_handshake_failure {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_suite_key_schedule_flow(suite: CipherSuite) -> Bool
+  intent "単一暗号スイートでの鍵スケジュール導出フローを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let hlen = cipher_suite_hash_len(&suite);
+  let klen = cipher_suite_key_len(&suite);
+  let ivlen = cipher_suite_iv_len(&suite);
+
+  // Early Secret
+  let early = early_secret(&suite);
+  if early.byte_len() != hlen {
+    return false;
+  }
+
+  // Handshake Secret
+  let mut shared = Bytes.with_capacity(32);
+  let mut i = 0;
+  while i < 32 {
+    shared.push(66);
+    i = i + 1;
+  }
+  let hs = handshake_secret(&suite, &early, &shared);
+  if hs.byte_len() != hlen {
+    return false;
+  }
+
+  // Client/Server Handshake Traffic Secret
+  let thash = empty_hash(&suite);
+  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs, &thash);
+  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs, &thash);
+  if c_hs_sec.byte_len() != hlen || s_hs_sec.byte_len() != hlen {
+    return false;
+  }
+  let c_hs_b = c_hs_sec.expose();
+  let s_hs_b = s_hs_sec.expose();
+  if bytes_equal(&c_hs_b, &s_hs_b) {
+    return false;
+  }
+
+  // Master Secret
+  let ms = master_secret(&suite, &hs);
+  if ms.byte_len() != hlen {
+    return false;
+  }
+
+  // Client/Server Application Traffic Secret
+  let c_ap_sec = client_application_traffic_secret_0(&suite, &ms, &thash);
+  let s_ap_sec = server_application_traffic_secret_0(&suite, &ms, &thash);
+  if c_ap_sec.byte_len() != hlen || s_ap_sec.byte_len() != hlen {
+    return false;
+  }
+  let c_ap_b = c_ap_sec.expose();
+  let s_ap_b = s_ap_sec.expose();
+  if bytes_equal(&c_ap_b, &s_ap_b) {
+    return false;
+  }
+
+  // Key and IV
+  let c_key = derive_traffic_key(&suite, &c_ap_sec);
+  let s_key = derive_traffic_key(&suite, &s_ap_sec);
+  let c_iv = derive_traffic_iv(&suite, &c_ap_sec);
+  let s_iv = derive_traffic_iv(&suite, &s_ap_sec);
+
+  if c_key.byte_len() != klen || s_key.byte_len() != klen {
+    return false;
+  }
+  if c_iv.byte_len() != ivlen || s_iv.byte_len() != ivlen {
+    return false;
+  }
+  let c_kb = c_key.expose();
+  let s_kb = s_key.expose();
+  if bytes_equal(&c_kb, &s_kb) {
+    return false;
+  }
+  if bytes_equal(&c_iv, &s_iv) {
+    return false;
+  }
+
+  // Key Update
+  let next_sec = next_traffic_secret(&suite, &c_ap_sec);
+  if next_sec.byte_len() != hlen {
+    return false;
+  }
+  let next_b = next_sec.expose();
+  if bytes_equal(&c_ap_b, &next_b) {
+    return false;
+  }
+
+  return true;
+}
+
+fn test_aead_roundtrip_and_failure(suite: CipherSuite) -> Bool
+  intent "暗号スイートでの AEAD seal/open ラウンドトリップおよび改変検知を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let klen = cipher_suite_key_len(&suite);
+  let mut key_bytes = Bytes.with_capacity(klen);
+  let mut k = 0;
+  while k < klen {
+    key_bytes.push(k + 1);
+    k = k + 1;
+  }
+  let key_sec = Secret.from_bytes(key_bytes);
+
+  let mut iv = Bytes.with_capacity(12);
+  let mut v = 0;
+  while v < 12 {
+    iv.push(v + 10);
+    v = v + 1;
+  }
+
+  let mut aad = Bytes.with_capacity(5);
+  aad.push(23);
+  aad.push(3);
+  aad.push(3);
+  aad.push(0);
+  aad.push(16);
+
+  let plain_str = "hello shield tls";
+  let plain_bytes = plain_str.as_bytes();
+  let plain_sec = Secret.from_bytes(plain_bytes.clone());
+
+  let seal_res = cipher_suite_seal(&suite, &key_sec, &iv, &aad, &plain_sec);
+  let mut ciphertext = Bytes.new();
+  match seal_res {
+    Ok(ct) => {
+      ciphertext = ct;
+    }
+    Err(e) => {
+      return false;
+    }
+  }
+
+  // 正常復号
+  let open_res = cipher_suite_open(&suite, &key_sec, &iv, &aad, &ciphertext);
+  let mut decrypted_b = Bytes.new();
+  match open_res {
+    Ok(pt) => {
+      decrypted_b = pt.expose();
+    }
+    Err(e) => {
+      return false;
+    }
+  }
+  if !bytes_equal(&plain_bytes, &decrypted_b) {
+    return false;
+  }
+
+  // 改変検知（末尾タグの 1 バイト反転）
+  let last_idx = ciphertext.byte_len() - 1;
+  let last_val = ciphertext.get(last_idx).unwrap_or(0);
+  let _ = ciphertext.set(last_idx, last_val ^ 255);
+
+  let bad_open_res = cipher_suite_open(&suite, &key_sec, &iv, &aad, &ciphertext);
+  let is_bad_record_mac = match bad_open_res {
+    Err(e) => match e {
+      ShieldError.Fatal(desc) => alert_description_to_u8(&desc) == alert_description_to_u8(&AlertDescription.BadRecordMac),
+      _ => false,
+    },
+    Ok(_) => false,
+  };
+  if !is_bad_record_mac {
+    return false;
+  }
+
+  return true;
+}
+
+pub fn main() -> Int
+  intent "段 2 鍵スケジュールと暗号スイートの全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  if !test_cipher_suite_selection() {
+    return 1;
+  }
+
+  if !test_suite_key_schedule_flow(CipherSuite.TlsChacha20Poly1305Sha256) {
+    return 2;
+  }
+  if !test_suite_key_schedule_flow(CipherSuite.TlsAes128GcmSha256) {
+    return 3;
+  }
+  if !test_suite_key_schedule_flow(CipherSuite.TlsAes256GcmSha384) {
+    return 4;
+  }
+
+  if !test_aead_roundtrip_and_failure(CipherSuite.TlsChacha20Poly1305Sha256) {
+    return 5;
+  }
+  if !test_aead_roundtrip_and_failure(CipherSuite.TlsAes128GcmSha256) {
+    return 6;
+  }
+  if !test_aead_roundtrip_and_failure(CipherSuite.TlsAes256GcmSha384) {
+    return 7;
+  }
+
+  return 0;
+}
