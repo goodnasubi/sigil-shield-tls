@@ -1,0 +1,10 @@
+[package]
+name = "sigil-shield-tls"
+version = "0.1.0"
+edition = "2021"
+description = "TLS termination component for Sigil services"
+authors = ["Sigil Contributors"]
+
+[dependencies]
+
+[dev-dependencies]
