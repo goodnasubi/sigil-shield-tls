@@ -883,6 +883,48 @@ pub fn handle_client_hello_explicit(session: &mut HandshakeSession, ch_bytes: &B
   ensures none
   effects none
 {
+  match session.phase {
+    HandshakePhase.Failed(alert) => {
+      return Err(ShieldError.Fatal(alert.clone()));
+    }
+    HandshakePhase.Initial => {}
+    _ => {
+      session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);
+      return Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage));
+    }
+  }
+
+  let flight_res = process_initial_client_hello(&mut session, &ch_bytes, &server_random, &server_x25519_priv);
+  match flight_res {
+    Ok(flight) => {
+      return Ok(flight);
+    }
+    Err(e) => {
+      match e {
+        ShieldError.Fatal(alert) => {
+          session.phase = HandshakePhase.Failed(alert.clone());
+          return Err(ShieldError.Fatal(alert));
+        }
+        ShieldError.Incomplete(n) => {
+          return Err(ShieldError.Incomplete(n));
+        }
+        ShieldError.TimeoutOrNoProgress => {
+          return Err(ShieldError.TimeoutOrNoProgress);
+        }
+        ShieldError.ConnectionClosed => {
+          return Err(ShieldError.ConnectionClosed);
+        }
+      }
+    }
+  }
+}
+
+fn process_initial_client_hello(session: &mut HandshakeSession, ch_bytes: &Bytes, server_random: &Bytes, server_x25519_priv: &X25519PrivateKey) -> Result<ServerFlight, ShieldError>
+  intent "Initial フェーズでの ClientHello を解析・検証しフライトを生成する"
+  requires none
+  ensures none
+  effects none
+{
   let ch = parse_client_hello(&ch_bytes)?;
 
   // 1. supported_versions 検査
@@ -1088,6 +1130,9 @@ pub fn handle_client_hello2_explicit(session: &mut HandshakeSession, ch2_bytes: 
   effects none
 {
   match session.phase {
+    HandshakePhase.Failed(alert) => {
+      return Err(ShieldError.Fatal(alert.clone()));
+    }
     HandshakePhase.WaitingClientHello2 => {}
     _ => {
       session.phase = HandshakePhase.Failed(AlertDescription.UnexpectedMessage);

@@ -1070,6 +1070,50 @@ fn test_handshake_rule_negatives() -> Int
             }
           }
 
+          // 10.1 WaitingFinished フェーズでの初期 ClientHello -> UnexpectedMessage (P2 指摘対応)
+          let mut s10_1 = new_test_session(&ecdsa_priv);
+          let _ = handle_client_hello_explicit(&mut s10_1, &ch8, &server_rand, &server_priv);
+          let res10_1 = handle_client_hello_explicit(&mut s10_1, &ch8, &server_rand, &server_priv);
+          match res10_1 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 540;
+            }
+          }
+          match handshake_phase(&s10_1) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 541;
+            }
+          }
+
+          // 10.2 WaitingClientHello2 フェーズでの初期 ClientHello -> UnexpectedMessage (P2 指摘対応)
+          let mut s10_2 = new_test_session(&ecdsa_priv);
+          let mut ciphers10 = List.new();
+          ciphers10.push(4865);
+          let mut sigs10 = List.new();
+          sigs10.push(1027);
+          let mut groups10 = List.new();
+          groups10.push(29);
+          let mut alpn10 = List.new();
+          alpn10.push("http/1.1");
+          let ch10_no_share = build_client_hello_custom(true, ciphers10, sigs10, groups10, None, alpn10, None);
+          let _ = handle_client_hello_explicit(&mut s10_2, &ch10_no_share, &server_rand, &server_priv);
+          // HRR 送信済み (WaitingClientHello2)
+          let res10_2 = handle_client_hello_explicit(&mut s10_2, &ch8, &server_rand, &server_priv);
+          match res10_2 {
+            Err(ShieldError.Fatal(AlertDescription.UnexpectedMessage)) => {}
+            _ => {
+              return 542;
+            }
+          }
+          match handshake_phase(&s10_2) {
+            HandshakePhase.Failed(AlertDescription.UnexpectedMessage) => {}
+            _ => {
+              return 543;
+            }
+          }
+
           return 0;
         }
         Err(_) => {
@@ -1444,6 +1488,46 @@ fn test_client_finished_auth_failure_poison_and_failed() -> Int
                     Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
                     _ => {
                       return 805;
+                    }
+                  }
+
+                  // 致命的失敗後に有効な ClientHello を投入しても拒絶され、汚染保護コンテキストや Failed 状態が維持されること (P2 指摘対応)
+                  let res3 = handle_client_hello_explicit(&mut session, &ch_msg, &server_rand, &server_priv);
+                  match res3 {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 806;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.Failed(AlertDescription.BadRecordMac) => {}
+                    _ => {
+                      return 807;
+                    }
+                  }
+                  match handshake_client_hs_protection(&session) {
+                    Some(c_prot) => {
+                      if !record_protection_is_poisoned(&c_prot) {
+                        return 808;
+                      }
+                    }
+                    None => {
+                      return 809;
+                    }
+                  }
+
+                  // 失敗済みセッションへの handle_client_hello2_explicit も BadRecordMac で拒絶されること
+                  let res4 = handle_client_hello2_explicit(&mut session, &ch_msg, &server_rand, &server_priv);
+                  match res4 {
+                    Err(ShieldError.Fatal(AlertDescription.BadRecordMac)) => {}
+                    _ => {
+                      return 810;
+                    }
+                  }
+                  match handshake_phase(&session) {
+                    HandshakePhase.Failed(AlertDescription.BadRecordMac) => {}
+                    _ => {
+                      return 811;
                     }
                   }
 
