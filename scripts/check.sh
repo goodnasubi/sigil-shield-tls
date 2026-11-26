@@ -73,5 +73,7 @@ run_entry stage3_handshake_test "Stage 3 handshake state machine and RFC 8448 tr
 
 run_entry stage4_certificate_test "Stage 4 certificate loading and management"
 
-printf 'All Stage 1, Stage 2, Stage 3, and Stage 4 evaluator and native tests passed.\n'
+run_entry stage5_relay_test "Stage 5 relay, proxy protocol v2, limits, and safe logging"
+
+printf 'All Stage 1, Stage 2, Stage 3, Stage 4, and Stage 5 evaluator and native tests passed.\n'
 
