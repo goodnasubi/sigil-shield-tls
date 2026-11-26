@@ -718,7 +718,7 @@ pub fn parse_client_hello(msg: &Bytes) -> Result<ClientHello, ShieldError>
           if key_len != 65 || key_exchange.get(0).unwrap_or(0) != 4 {
             return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
           }
-          let pk_res = EcdsaP256PublicKey.from_bytes(&key_exchange);
+          let pk_res = EcdhP256PublicKey.from_bytes(&key_exchange);
           if pk_res.is_err() {
             return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
           }

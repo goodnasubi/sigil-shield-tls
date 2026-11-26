@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-sigil_sha=4cc94928b0d97d031e08ace5002f3a1a2d35ff8e
+sigil_sha=7a256dedd61fa0888486f98a95e17006e2948813
 rust_version=1.100.0
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 scratch=$(mktemp -d)
@@ -75,5 +75,7 @@ run_entry stage4_certificate_test "Stage 4 certificate loading and management"
 
 run_entry stage5_relay_test "Stage 5 relay, proxy protocol v2, limits, and safe logging"
 
-printf 'All Stage 1, Stage 2, Stage 3, Stage 4, and Stage 5 evaluator and native tests passed.\n'
+run_entry stage6_p256_test "Stage 6 P-256 key exchange, key_share validation, and HelloRetryRequest"
+
+printf 'All Stage 1, Stage 2, Stage 3, Stage 4, Stage 5, and Stage 6 evaluator and native tests passed.\n'
 
