@@ -1,0 +1,385 @@
+module stage7_interop_server
+  targets server
+  trust none
+
+use shield_certificate.CertificateStore;
+use shield_certificate.create_session_for_bundle;
+use shield_certificate.load_bundle_from_pem_text;
+use shield_certificate.new_certificate_store;
+use shield_certificate.select_certificate_for_sni;
+use shield_client_hello.ServerName;
+use shield_client_hello.client_hello_server_name;
+use shield_client_hello.parse_client_hello;
+use shield_handshake.HandshakePhase;
+use shield_handshake.flight_records;
+use shield_handshake.handle_client_hello_explicit;
+use shield_handshake.handle_client_record;
+use shield_handshake.handshake_client_app_protection;
+use shield_handshake.handshake_phase;
+use shield_handshake.handshake_server_app_protection;
+use shield_handshake.handshake_set_p256_key;
+use shield_record.ContentType;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_record_crypto.seal_record;
+use shield_relay.build_close_notify_record;
+use shield_relay.build_plaintext_fatal_alert_record;
+use test_support.hex_decode;
+
+// ADR 0063 段 7: 外部 TLS クライアント（curl, openssl s_client）相互運用試験用サーバー
+
+fn get_test_pkcs8_pem() -> String
+  intent "テスト用 P-256 PKCS#8 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEYGnSiBgXwP7WZEK\nnW83yc235VtOZqeK/Q82a2KsKzChRANCAAQsjimmI6QJfZtzEjO7tDVwEdD3FDaG\nFNceg/i8+Od5h4vee9/+QglHMgchn7hqguuMfQgPiyd39KnTRghFUJse\n-----END PRIVATE KEY-----\n";
+}
+
+fn get_test_fullchain_pem() -> String
+  intent "テスト用 リーフと CA を連結した証明書チェーン PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBVjCB/qADAgECAgECMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABCyOKaYjpAl9m3MSM7u0NXAR0PcUNoYU1x6D+Lz453mHi9573/5C\nCUcyByGfuGqC64x9CA+LJ3f0qdNGCEVQmx6jKTAnMCUGA1UdEQQeMByCC2V4YW1w\nbGUuY29tgg0qLmV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0cAMEQCIBwPwgIYt/HT\nFjg38v/ztFwZSNUvesJx5EYF1lnL773lAiAS4oI8uwonf2OgwhcSeaeRPd4WkBgS\nQuVXzxohuYlvNw==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBVTCB/KADAgECAgEBMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAqMRAwDgYDVQQDDAdUZXN0IENBMRYwFAYDVQQKDA1TaGllbGQgVExT\nIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExPyFTXe4R43oDNkBL8Vo2FYv\nWdlb5xCH8GvRf2gbu8MMmPzvupBajfVjZA8Cry9W2mZJ4K/Hp0Wp0V0uFCtNBaMT\nMBEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3+ozQ5fDf3mCs\nMYu/I0Cdd6iIOzGQd9OYKmZupKnV5wIhAMSh6uvvLlZgqYLTsGftiqaR7yCFBgyE\nIa6AnmlqfbLJ\n-----END CERTIFICATE-----\n";
+}
+
+fn test_server_x25519_priv() -> Option<X25519PrivateKey>
+  intent "テスト用 X25519 サーバー秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Some(k),
+    Err(_) => None,
+  };
+}
+
+fn test_p256_ecdh_key() -> Option<EcdhP256PrivateKey>
+  intent "テスト用 P-256 ECDH 秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match EcdhP256PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Some(k),
+    Err(_) => None,
+  };
+}
+
+fn read_tls_record(st: &TcpStream, prev_buf: Bytes) -> Result<(Bytes, Bytes), Int>
+  intent "ソケットから 1 レコード分を読み取って (レコード, 残余) を返す"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  let mut buf = prev_buf;
+  // ヘッダ 5 バイトを受信するまで読み取り
+  while buf.byte_len() < 5 {
+    match st.read(4096) {
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return Err(11);
+        }
+        buf.extend(&chunk);
+      }
+      Err(_) => {
+        return Err(12);
+      }
+    }
+  }
+
+  let l_hi = match buf.get(3) {
+    Some(v) => v,
+    None => 0,
+  };
+  let l_lo = match buf.get(4) {
+    Some(v) => v,
+    None => 0,
+  };
+  let rec_len = l_hi * 256 + l_lo;
+  let total_len = 5 + rec_len;
+
+  // レコード全体を受信するまで読み取り
+  while buf.byte_len() < total_len {
+    match st.read(4096) {
+      Ok(chunk) => {
+        if chunk.byte_len() == 0 {
+          return Err(13);
+        }
+        buf.extend(&chunk);
+      }
+      Err(_) => {
+        return Err(14);
+      }
+    }
+  }
+
+  let rec = match buf.slice(0, total_len) {
+    Ok(s) => s,
+    Err(_) => Bytes.new(),
+  };
+  if rec.byte_len() < total_len {
+    return Err(15);
+  }
+  let rest = match buf.slice(total_len, buf.byte_len()) {
+    Ok(s) => s,
+    Err(_) => Bytes.new(),
+  };
+  return Ok((rec, rest));
+}
+
+fn handle_single_connection(st: &TcpStream, store: &CertificateStore, test_mode: Int) -> Int
+  intent "1 つの着信接続に対して TLS 1.3 終端と中継処理を行う"
+  requires none
+  ensures none
+  effects net.server, task.suspend
+{
+  match read_tls_record(&st, Bytes.new()) {
+    Err(e) => {
+      return e;
+    }
+    Ok((ch_rec, rem1)) => {
+      if ch_rec.byte_len() < 5 {
+        return 21;
+      }
+      let ch_slice = ch_rec.slice(5, ch_rec.byte_len());
+      match ch_slice {
+        Err(_) => {
+          return 22;
+        }
+        Ok(ch_msg) => {
+          match parse_client_hello(&ch_msg) {
+            Err(_) => {
+              return 23;
+            }
+            Ok(ch_parsed) => {
+              let raw_sni = match client_hello_server_name(&ch_parsed) {
+                Some(ServerName.Valid(s)) => Some(s),
+                _ => None,
+              };
+
+              match select_certificate_for_sni(&store, &raw_sni) {
+                Err(alert) => {
+                  let alert_rec = build_plaintext_fatal_alert_record(&alert);
+                  let _ = st.write_all(&alert_rec);
+                  let _ = st.shutdown();
+                  return 0;  // 期待される未登録 SNI 拒絶の成功
+                }
+                Ok(bundle_idx) => {
+                  match store.bundles.get(bundle_idx) {
+                    None => {
+                      return 24;
+                    }
+                    Some(bundle) => {
+                      let mut session = create_session_for_bundle(&bundle);
+
+                      match test_p256_ecdh_key() {
+                        None => {
+                          return 25;
+                        }
+                        Some(p256_k) => {
+                          handshake_set_p256_key(&mut session, p256_k);
+                        }
+                      }
+
+                      match test_server_x25519_priv() {
+                        None => {
+                          return 26;
+                        }
+                        Some(s_xpriv) => {
+                          let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+                          match handle_client_hello_explicit(&mut session, &ch_msg, &s_rand, &s_xpriv) {
+                            Err(_) => {
+                              return 27;
+                            }
+                            Ok(flight) => {
+                              let recs = flight_records(&flight);
+                              let mut ri = 0;
+                              while ri < recs.len() {
+                                match recs.get(ri) {
+                                  Some(r) => {
+                                    match st.write_all(&r) {
+                                      Ok(_) => {}
+                                      Err(_) => {
+                                        return 28;
+                                      }
+                                    }
+                                  }
+                                  None => {}
+                                }
+                                ri = ri + 1;
+                              }
+
+                              let mut cur_buf = rem1;
+                              let mut fin_handled = false;
+                              while !fin_handled {
+                                match read_tls_record(&st, cur_buf) {
+                                  Err(e) => {
+                                    return e;
+                                  }
+                                  Ok((client_rec, rem2)) => {
+                                    cur_buf = rem2;
+                                    match handle_client_record(&mut session, &client_rec) {
+                                      Err(_) => {
+                                        return 29;
+                                      }
+                                      Ok(_) => {
+                                        match handshake_phase(&session) {
+                                          HandshakePhase.Connected => {
+                                            fin_handled = true;
+                                          }
+                                          _ => {}
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+
+                              match handshake_server_app_protection(&session) {
+                                None => {
+                                  return 34;
+                                }
+                                Some(tx_prot) => {
+                                  let mut s_tx_app = tx_prot;
+
+                                  if test_mode == 2 {
+                                    match handshake_client_app_protection(&session) {
+                                      None => {
+                                        return 30;
+                                      }
+                                      Some(rx_prot) => {
+                                        let mut s_rx_app = rx_prot;
+                                        match read_tls_record(&st, cur_buf) {
+                                          Err(e) => {
+                                            return e;
+                                          }
+                                          Ok((req_rec, _)) => {
+                                            match open_record(&mut s_rx_app, &req_rec) {
+                                              Err(_) => {
+                                                return 32;
+                                              }
+                                              Ok(out) => {
+                                                let _ = open_outcome_plaintext(&out);
+                                                let s_body = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHello Shield";
+                                                let resp_text = s_body.as_bytes();
+                                                match seal_record(&mut s_tx_app, &ContentType.ApplicationData, &resp_text, 0) {
+                                                  Err(_) => {
+                                                    return 31;
+                                                  }
+                                                  Ok(sealed_resp) => {
+                                                    let _ = st.write_all(&sealed_resp);
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  } else if test_mode == 3 {
+                                    let s_bad = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\n502 Bad Gateway";
+                                    let bad_gw = s_bad.as_bytes();
+                                    match seal_record(&mut s_tx_app, &ContentType.ApplicationData, &bad_gw, 0) {
+                                      Err(_) => {
+                                        return 33;
+                                      }
+                                      Ok(sealed_502) => {
+                                        let _ = st.write_all(&sealed_502);
+                                      }
+                                    }
+                                  }
+
+                                  match build_close_notify_record(&mut s_tx_app) {
+                                    Ok(cn_rec) => {
+                                      let _ = st.write_all(&cn_rec);
+                                    }
+                                    Err(_) => {}
+                                  }
+                                  let _ = st.shutdown();
+                                  return 0;
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+pub fn main() -> Int
+  intent "相互運用試験用 TLS サーバーを起動し、4 つの接続を順次処理する"
+  requires none
+  ensures none
+  effects console, net.server, task.suspend
+{
+  let priv_pem = get_test_pkcs8_pem();
+  let chain_pem = get_test_fullchain_pem();
+  let mut names = List.new();
+  names.push("example.com");
+  names.push("*.example.com");
+
+  match load_bundle_from_pem_text(&chain_pem, &priv_pem, &names, Some(1748736000)) {
+    Err(_) => {
+      return 1;
+    }
+    Ok(bundle) => {
+      let mut bundles = List.new();
+      bundles.push(bundle);
+      match new_certificate_store(bundles, None) {
+        Err(_) => {
+          return 2;
+        }
+        Ok(store) => {
+          let h = "127.0.0.1";
+          match net.listen(&h, 0, 16) {
+            Err(_) => {
+              return 3;
+            }
+            Ok(listener) => {
+              let port = listener.local_port();
+              console.log(&port);
+
+              let mut conn_idx = 1;
+              while conn_idx <= 4 {
+                let mut mode = 1;
+                if conn_idx == 3 {
+                  mode = 2;
+                }
+                match listener.accept() {
+                  Err(_) => {
+                    return 4;
+                  }
+                  Ok(st) => {
+                    let r = handle_single_connection(&st, &store, mode);
+                    if r != 0 {
+                      return 100 + r;
+                    }
+                  }
+                }
+                conn_idx = conn_idx + 1;
+              }
+
+              return 0;
+            }
+          }
+        }
+      }
+    }
+  }
+}

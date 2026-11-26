@@ -66,19 +66,16 @@ ADR 0020 決定 2・決定 4、および ADR 0063 決定 6 に基づき、各設
 ### 3.1 試験構成
 - **サーバー側**: `sigil-shield-tls`（ECDSA P-256 証明書、X25519 & secp256r1 鍵交換対応、ALPN `http/1.1`）
 - **クライアント側**:
-  1. `openssl s_client` (OpenSSL 3.0+): TLS 1.3 接続、暗号スイートネゴシエーション、SNI 送信、X25519 鍵交換、P-256 鍵交換
-  2. `curl`: HTTPS GET 要求、ALPN `http/1.1` 検証、後段 PROXY v2 経由の平文応答受信確認
+  1. `openssl s_client` (OpenSSL 3.0.13): TLS 1.3 接続、暗号スイートネゴシエーション、SNI 送信、X25519 鍵交換、P-256 鍵交換
+  2. `curl` (curl 8.5.0): HTTPS GET 要求、ALPN `http/1.1` 検証、平文 HTTP/1.1 応答受信確認
 
 ### 3.2 実施結果
-| クライアント | 検証項目 | 期待動作 | 結果 |
+| クライアント | 検証項目 / 実行コマンド | 期待動作・実測ログ | 結果 |
 |---|---|---|---|
-| `openssl s_client` | TLS 1.3 ハンドシェイク (X25519) | Handshake 完了、Cipher: TLS_AES_128_GCM_SHA256 | 合格 (Pass) |
-| `openssl s_client` | TLS 1.3 ハンドシェイク (P-256) | Handshake 完了、Group: secp256r1 | 合格 (Pass) |
-| `openssl s_client` | 暗号スイート ChaCha20-Poly1305 | Handshake 完了、Cipher: TLS_CHACHA20_POLY1305_SHA256 | 合格 (Pass) |
-| `openssl s_client` | 暗号スイート AES-256-GCM | Handshake 完了、Cipher: TLS_AES_256_GCM_SHA384 | 合格 (Pass) |
-| `openssl s_client` | 未登録 SNI での接続 | サーバーから致命的アラート `unrecognized_name` 受信で切断 | 合格 (Pass) |
-| `curl` | HTTPS リクエスト・レスポンス (ALPN http/1.1) | ALPN http/1.1 選択、HTTP 応答受信 | 合格 (Pass) |
-| `curl` | 上流サービス到達不能時 | 固定 502 Bad Gateway 応答を受信 | 合格 (Pass) |
+| `openssl s_client` | TLS 1.3 (X25519)<br>`openssl s_client -connect 127.0.0.1:<PORT> -servername example.com -tls1_3` | `New, TLSv1.3, Cipher is TLS_CHACHA20_POLY1305_SHA256`<br>`Server Temp Key: X25519, 253 bits`<br>`Peer signing digest: SHA256` | 合格 (Pass) |
+| `openssl s_client` | TLS 1.3 (P-256)<br>`openssl s_client -connect 127.0.0.1:<PORT> -servername example.com -tls1_3 -groups secp256r1` | `New, TLSv1.3, Cipher is TLS_CHACHA20_POLY1305_SHA256`<br>`Server Temp Key: ECDH, prime256v1, 256 bits`<br>`Peer signing digest: SHA256` | 合格 (Pass) |
+| `openssl s_client` | 未登録 SNI 拒絶<br>`openssl s_client -connect 127.0.0.1:<PORT> -servername unknown.invalid -tls1_3` | `SSL alert number 112`<br>`error:...tlsv1 unrecognized name` 受信による即座切断 | 合格 (Pass) |
+| `curl` | HTTPS GET リクエスト・レスポンス (ALPN http/1.1)<br>`curl --tlsv1.3 --http1.1 --resolve example.com:<PORT>:127.0.0.1 https://example.com:<PORT>/` | `SSL connection using TLSv1.3 / TLS_CHACHA20_POLY1305_SHA256`<br>`ALPN: server accepted http/1.1`<br>`HTTP/1.1 200 OK`<br>応答本文: `Hello Shield` | 合格 (Pass) |
 
 ---
 
@@ -87,22 +84,29 @@ ADR 0020 決定 2・決定 4、および ADR 0063 決定 6 に基づき、各設
 ハンドシェイク処理における CPU 費用と 1 コアあたりのスループットを実測した。
 
 ### 4.1 測定環境
-- **OS**: Linux x86_64
+- **OS**: Linux (Ubuntu 24.04.5 LTS, kernel 7.0.0-44-generic x86_64)
+- **CPU**: AMD EPYC 9D64 88-Core Processor
+- **クライアント**: OpenSSL 3.0.13, curl 8.5.0
 - **コンパイラ**: Sigil (commit `7a256dedd61fa0888486f98a95e17006e2948813`)
-- **暗号演算**: `std.crypto`（X25519 スカラー倍算、P-256 ECDH、ECDSA P-256 署名、定数時間 S-box AES / ChaCha20 / Poly1305）
+- **暗号演算**: `std.crypto`（X25519 スカラー倍算、P-256 ECDH、ECDSA P-256 署名、定数時間 ChaCha20-Poly1305 / AES-GCM）
 
 ### 4.2 実測結果
 | 測定対象 | 1 ハンドシェイク所要時間 | スループット (1 コア) | 備考 |
 |---|---:|---:|---|
-| **X25519 + ECDSA P-256** | 約 25〜45 ms | 約 22〜40 回/秒 | ネイティブ実行時 |
-| **secp256r1 (P-256) + ECDSA P-256** | 約 40〜70 ms | 約 14〜25 回/秒 | ネイティブ実行時 |
-| **評価器 (SIR インタープリタ)** | 約 1.0〜1.8 秒 | 約 0.5〜1.0 回/秒 | テスト・評価器環境 |
+| **X25519 + ECDSA P-256 (OpenSSL クライアント)** | 約 1,440 ms | 約 0.69 回/秒 | ネイティブ実行時 |
+| **secp256r1 (P-256) + ECDSA P-256 (OpenSSL クライアント)** | 約 1,914 ms | 約 0.52 回/秒 | ネイティブ実行時 |
+| **X25519 + ECDSA P-256 (curl HTTPS GET)** | 約 1,447 ms | 約 0.69 回/秒 | ネイティブ実行時（HTTP 応答含む） |
+| **未登録 SNI 拒絶** | 約 39 ms | 約 25.6 回/秒 | ネイティブ実行時（暗号計算なし・即時アラート） |
+| **内部検証テスト (`stage7_interop_load_test`)** | 約 1,667 ms (X25519)<br>約 2,633 ms (P-256) | 約 0.60 回/秒<br>約 0.38 回/秒 | ネイティブ（署名生成＋クライアント側署名検証含む） |
+| **評価器 (SIR インタープリタ)** | 約 11.6 秒 | 約 0.08 回/秒 | テスト・評価器環境 |
 
 ### 4.3 考察
-ADR 0063 決定 4.5 で見込まれていた「1 コアあたり毎秒 10 回前後」という見積もりに対し、ネイティブ実行では毎秒 20〜40 回程度を達成しており、見込み以上のスループットを確認した。
-同時に、ハンドシェイク 1 回につき数十ミリ秒の CPU 時間を確実に消費するため、DoS 攻撃（ハンドシェイク枯渇攻撃）への耐性として以下の制限が必須であることを確認した:
+Sigil の `std.crypto` によるソフトウェア暗号演算（定数時間大整数・有限体演算および RFC 6979 決定的 ECDSA P-256 署名）において、ハンドシェイク 1 回につき約 1.4〜1.9 秒（スループット毎秒 0.5〜0.7 回）を要することを確認した。
+ADR 0063 起草時の「毎秒 10 回前後（百ミリ秒台）」という見込みに対し、純 Sigil 実装の CPU 費用はより大きく、ハンドシェイク枯渇攻撃に対する耐性設計が決定的に重要であることが実測からも裏付けられた。
+以下の決定 4.5 に基づく資源制限が確実に機能することを確認している:
 - 同時計算数上限 `max_concurrent_crypto_tasks = 2`
 - 接続元ごとのハンドシェイク上限 `max_handshaking_connections_per_source = 4`
+- 暗号計算に入る前（SNI 照合段階）での未登録ドメイン即時拒絶（所要時間約 39 ms）による CPU 浪費の防止
 
 ---
 
@@ -116,7 +120,7 @@ ADR 0020 および ADR 0063 に従い、外部公開を判断する G3 関門に
 - **判断事項**: 公開 Web PKI で運用する場合、ECDSA P-256 証明書が必須となること、および準拠クライアントのうち RSA 証明書のみを要求する古い環境とは接続できない点についての了承。
 
 ### 2. ハンドシェイク CPU 費用と DoS 耐性（決定 4.5）
-- **内容**: 1 コアあたり毎秒 20〜40 ハンドシェイクの CPU 費用。
+- **内容**: 1 コアあたり毎秒 0.5〜0.7 ハンドシェイク（所要時間約 1.4〜1.9 秒/回）の CPU 費用。
 - **判断事項**: セッション再開機能を持たないため、クライアントが再接続するたびに完全ハンドシェイクが発生する。接続元ごとの上限（既定 4）、同時計算数上限（既定 2）のパラメータ設定値が、想定する運用規模とトラフィック特性に適しているかの確認。
 
 ### 3. 証明書の更新運用とシステム時計（決定 2.1〜2.5）

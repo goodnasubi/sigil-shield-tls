@@ -77,5 +77,9 @@ run_entry stage5_relay_test "Stage 5 relay, proxy protocol v2, limits, and safe 
 
 run_entry stage6_p256_test "Stage 6 P-256 key exchange, key_share validation, and HelloRetryRequest"
 
-printf 'All Stage 1, Stage 2, Stage 3, Stage 4, Stage 5, and Stage 6 evaluator and native tests passed.\n'
+run_entry stage7_interop_load_test "Stage 7 interop, benchmark, and load records"
+
+SIGIL_BIN="$sigil" "$repo_root/scripts/test_interop.sh"
+
+printf 'All Stage 1, Stage 2, Stage 3, Stage 4, Stage 5, Stage 6, and Stage 7 evaluator, native, and external interop tests passed.\n'
 
