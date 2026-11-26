@@ -23,8 +23,12 @@ use shield_proxy_v2.parsed_has_authority;
 use shield_proxy_v2.parsed_has_ssl_tlv;
 use shield_proxy_v2.parsed_src_port;
 use shield_proxy_v2.parsed_ssl_version;
+use shield_record.ContentType;
 use shield_record_crypto.RecordDirection;
 use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_content_type;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
 use shield_relay.RelayConfigError;
 use shield_relay.RelayOutcome;
 use shield_relay.RelayRejectReason;
@@ -32,6 +36,7 @@ use shield_relay.RelayResultClassification;
 use shield_relay.build_502_bad_gateway_response;
 use shield_relay.build_close_notify_record;
 use shield_relay.build_fatal_alert_record;
+use shield_relay.build_plaintext_fatal_alert_record;
 use shield_relay.extract_source_key;
 use shield_relay.format_relay_log;
 use shield_relay.is_ipv4_numeric;
@@ -778,18 +783,18 @@ fn test_termination_and_502_bad_gateway() -> Int
     return 103;
   }
 
-  // 2. 致命的アラート internal_error レコードの検証
-  let fatal_alert = build_fatal_alert_record(&AlertDescription.InternalError);
-  if fatal_alert.byte_len() != 7 {
+  // 2. 平文の致命的アラート internal_error レコードの検証（ハンドシェイク前の異常切断等）
+  let plain_fatal = build_plaintext_fatal_alert_record(&AlertDescription.InternalError);
+  if plain_fatal.byte_len() != 7 {
     return 104;
   }
-  if fatal_alert.get(0).unwrap_or(0) != 21 {  // ContentType.Alert
+  if plain_fatal.get(0).unwrap_or(0) != 21 {  // ContentType.Alert
     return 105;
   }
-  if fatal_alert.get(5).unwrap_or(0) != 2 {  // fatal (2)
+  if plain_fatal.get(5).unwrap_or(0) != 2 {  // fatal (2)
     return 106;
   }
-  if fatal_alert.get(6).unwrap_or(0) != 80 {  // internal_error (80)
+  if plain_fatal.get(6).unwrap_or(0) != 80 {  // internal_error (80)
     return 107;
   }
 
@@ -815,24 +820,91 @@ fn test_termination_and_502_bad_gateway() -> Int
     return 109;
   }
 
-  // 4. 暗号化 close_notify レコード生成の検証
-  let mut secret = Bytes.with_capacity(32);
+  // 4. ハンドシェイク完了後の暗号化 close_notify および暗号化 fatal internal_error レコード生成の検証
+  let mut tx_secret = Bytes.with_capacity(32);
+  let mut rx_secret = Bytes.with_capacity(32);
   let mut s_idx = 0;
   while s_idx < 32 {
-    secret.push(42);
+    tx_secret.push(42);
+    rx_secret.push(42);
     s_idx = s_idx + 1;
   }
-  let mut prot = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsAes128GcmSha256, secret);
-  let cn_res = build_close_notify_record(&mut prot);
+  let mut prot_tx = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsAes128GcmSha256, tx_secret);
+  let mut prot_rx = new_record_protection(RecordDirection.Receive, CipherSuite.TlsAes128GcmSha256, rx_secret);
+
+  // 4a. 暗号化 close_notify: 封印 -> 復号して inner alert (level 1, desc 0) を検証
+  let cn_res = build_close_notify_record(&mut prot_tx);
   match cn_res {
     Ok(cn_rec) => {
       // 5 bytes outer header + (2 bytes alert + 1 byte inner CT + 16 bytes AEAD tag) = 24 bytes
       if cn_rec.byte_len() != 24 {
         return 110;
       }
+      if cn_rec.get(0).unwrap_or(0) != 23 {  // ContentType.ApplicationData (outer)
+        return 1101;
+      }
+      let open_cn = open_record(&mut prot_rx, &cn_rec);
+      match open_cn {
+        Ok(cn_outcome) => {
+          match open_outcome_content_type(&cn_outcome) {
+            ContentType.Alert => {}
+            _ => {
+              return 1102;
+            }
+          }
+          let cn_pt = open_outcome_plaintext(&cn_outcome);
+          if cn_pt.byte_len() != 2 {
+            return 1103;
+          }
+          if cn_pt.get(0).unwrap_or(0) != 1 || cn_pt.get(1).unwrap_or(0) != 0 {  // warning (1), close_notify (0)
+            return 1104;
+          }
+        }
+        Err(_) => {
+          return 1105;
+        }
+      }
     }
     Err(_) => {
       return 110;
+    }
+  }
+
+  // 4b. 暗号化 fatal internal_error (決定 5.3): 封印 -> 復号して inner alert (level 2, desc 80) を検証
+  let fatal_res = build_fatal_alert_record(&mut prot_tx, &AlertDescription.InternalError);
+  match fatal_res {
+    Ok(fatal_rec) => {
+      // 5 bytes outer header + (2 bytes alert + 1 byte inner CT + 16 bytes AEAD tag) = 24 bytes
+      if fatal_rec.byte_len() != 24 {
+        return 1106;
+      }
+      if fatal_rec.get(0).unwrap_or(0) != 23 {  // ContentType.ApplicationData (outer)
+        return 1107;
+      }
+      let open_fatal = open_record(&mut prot_rx, &fatal_rec);
+      match open_fatal {
+        Ok(fatal_outcome) => {
+          match open_outcome_content_type(&fatal_outcome) {
+            ContentType.Alert => {}
+            _ => {
+              return 1108;
+            }
+          }
+          let fatal_pt = open_outcome_plaintext(&fatal_outcome);
+          if fatal_pt.byte_len() != 2 {
+            return 1109;
+          }
+          if fatal_pt.get(0).unwrap_or(0) != 2 || fatal_pt.get(1).unwrap_or(0) != 80 {  // fatal (2), internal_error (80)
+            return 1110;
+          }
+        }
+        Err(_) => {
+          return 1111;
+        }
+      }
+    }
+    Err(_) => {
+      return 1112;
     }
   }
 

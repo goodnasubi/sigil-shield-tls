@@ -1032,8 +1032,21 @@ pub fn build_close_notify_record(prot: &mut RecordProtection) -> Result<Bytes, S
   return seal_record(&mut prot, &ContentType.Alert, &alert_payload, 0);
 }
 
-pub fn build_fatal_alert_record(desc: &AlertDescription) -> Bytes
-  intent "平文の致命的アラートレコード（TLS レコードヘッダ含む）を構築する"
+pub fn build_fatal_alert_record(prot: &mut RecordProtection, desc: &AlertDescription) -> Result<Bytes, ShieldError>
+  intent "ハンドシェイク完了後の上流障害時等に送る暗号化致命的アラートレコードを構築する（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut alert_payload = Bytes.with_capacity(2);
+  alert_payload.push(2);  // fatal
+  let code = alert_description_to_u8(&desc);
+  alert_payload.push(code);
+  return seal_record(&mut prot, &ContentType.Alert, &alert_payload, 0);
+}
+
+pub fn build_plaintext_fatal_alert_record(desc: &AlertDescription) -> Bytes
+  intent "ハンドシェイク前の異常切断等に用いる平文の致命的アラートレコードを構築する"
   requires none
   ensures none
   effects none
