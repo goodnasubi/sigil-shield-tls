@@ -24,6 +24,7 @@ use shield_client_hello.client_hello_supported_versions;
 use shield_client_hello.ext_alpn;
 use shield_client_hello.ext_key_share;
 use shield_client_hello.ext_supported_versions;
+use shield_client_hello.group_secp256r1;
 use shield_client_hello.group_x25519;
 use shield_client_hello.key_share_exchange;
 use shield_client_hello.key_share_group;
@@ -52,7 +53,8 @@ use shield_record_crypto.seal_record;
 // TLS 1.3 ハンドシェイク状態機械（ADR 0063 決定 1.2, 決定 6 段 3）
 //
 // - ServerHello, HelloRetryRequest, EncryptedExtensions, Certificate, CertificateVerify, Finished の送受信
-// - 鍵交換: x25519 のみ対応（P-256 は段 6 で追加）
+// - 鍵交換: x25519（段 3）と secp256r1（P-256、段 6）。P-256 はセッションに ECDH の秘密鍵を設定したときだけ有効
+//   グループの選択: クライアントの supported_groups の提示順で、最初に対応するもの。その key_share がなければ HelloRetryRequest（1 回だけ）
 // - サーバー署名: ecdsa_secp256r1_sha256 のみ対応
 // - ALPN: 提示があれば "http/1.1" のみ選定、含まなければ no_application_protocol。提示なしなら "http/1.1" 扱い
 // - PSK / 0-RTT: 構造のみ検査して受理せず完全ハンドシェイクを実行。早期レコードは致命的アラートで終了
@@ -629,6 +631,8 @@ pub struct HandshakeSession {
   selected_suite: Option<CipherSuite>,
   alpn_selected: Bool,
   hrr_sent: Bool,
+  hrr_group: Int,
+  p256_priv: Option<EcdhP256PrivateKey>,
   ccs_received: Bool,
   transcript: Bytes,
   ch1_raw: Bytes,
@@ -653,7 +657,16 @@ pub fn new_handshake_session(cert_chain: List<Bytes>, private_key: EcdsaP256Priv
   ensures none
   effects none
 {
-  return HandshakeSession { phase: HandshakePhase.Initial, cert_chain: cert_chain, private_key: private_key, selected_suite: None, alpn_selected: false, hrr_sent: false, ccs_received: false, transcript: Bytes.new(), ch1_raw: Bytes.new(), ch1_parsed: None, early_sec: Bytes.new(), handshake_sec: Bytes.new(), server_hs_sec: Bytes.new(), client_hs_sec: Bytes.new(), server_hs_protection: None, client_hs_protection: None, master_sec: Bytes.new(), server_app_sec: Bytes.new(), client_app_sec: Bytes.new(), server_app_protection: None, client_app_protection: None, client_finished_buffer: Bytes.new() };
+  return HandshakeSession { phase: HandshakePhase.Initial, cert_chain: cert_chain, private_key: private_key, selected_suite: None, alpn_selected: false, hrr_sent: false, hrr_group: 0, p256_priv: None, ccs_received: false, transcript: Bytes.new(), ch1_raw: Bytes.new(), ch1_parsed: None, early_sec: Bytes.new(), handshake_sec: Bytes.new(), server_hs_sec: Bytes.new(), client_hs_sec: Bytes.new(), server_hs_protection: None, client_hs_protection: None, master_sec: Bytes.new(), server_app_sec: Bytes.new(), client_app_sec: Bytes.new(), server_app_protection: None, client_app_protection: None, client_finished_buffer: Bytes.new() };
+}
+
+pub fn handshake_set_p256_key(session: &mut HandshakeSession, key: EcdhP256PrivateKey)
+  intent "このセッションで secp256r1 の鍵交換に使うサーバーの一時 ECDH 秘密鍵を設定する（未設定なら P-256 は選ばない）"
+  requires none
+  ensures none
+  effects none
+{
+  session.p256_priv = Some(key);
 }
 
 pub fn handshake_phase(session: &HandshakeSession) -> HandshakePhase
@@ -798,20 +811,40 @@ fn check_signature_algorithms(ch: &ClientHello) -> Result<Bool, ShieldError>
   return Err(ShieldError.Fatal(AlertDescription.HandshakeFailure));
 }
 
-fn check_supported_groups(ch: &ClientHello) -> Result<Bool, ShieldError>
-  intent "supported_groups に x25519 が含まれるか検証する"
+fn group_supported(session: &HandshakeSession, group: Int) -> Bool
+  intent "サーバーがそのグループの鍵交換に対応しているか判定する（P-256 は鍵を設定したときだけ）"
+  requires none
+  ensures none
+  effects none
+{
+  if group == group_x25519() {
+    return true;
+  }
+  if group == group_secp256r1() {
+    return match session.p256_priv {
+      Some(_) => true,
+      None => false,
+    };
+  }
+  return false;
+}
+
+fn select_group(session: &HandshakeSession, ch: &ClientHello) -> Result<Int, ShieldError>
+  intent "supported_groups の提示順で、サーバーが対応する最初のグループを選ぶ（なければ handshake_failure）"
   requires none
   ensures none
   effects none
 {
   let groups = client_hello_supported_groups(&ch);
-  let target = group_x25519();
   let mut i = 0;
   while i < groups.len() {
     match groups.get(i) {
       Some(g) => {
-        if g == target {
-          return Ok(true);
+        let ok = group_supported(&session, g);
+        if ok {
+          // `Ok(g)` と書くと評価器だけ 0 を返す（ネイティブは正しい）ため、一度演算を通す
+          let chosen = g + 0;
+          return Ok(chosen);
         }
       }
       None => {}
@@ -851,21 +884,24 @@ fn check_alpn(ch: &ClientHello) -> Result<Bool, ShieldError>
   return Err(ShieldError.Fatal(AlertDescription.NoApplicationProtocol));
 }
 
-fn find_x25519_key_share(ch: &ClientHello) -> Option<Bytes>
-  intent "key_share 拡張から x25519 の公開鍵バイト列（32 バイト）を抽出する"
+fn find_key_share(ch: &ClientHello, group: Int) -> Option<Bytes>
+  intent "key_share 拡張から指定グループの公開鍵バイト列（x25519 は 32 バイト、secp256r1 は 65 バイト）を抽出する"
   requires none
   ensures none
   effects none
 {
+  let mut want_len = 32;
+  if group == group_secp256r1() {
+    want_len = 65;
+  }
   let shares = client_hello_key_shares(&ch);
-  let target_group = group_x25519();
   let mut i = 0;
   while i < shares.len() {
     match shares.get(i) {
       Some(ks) => {
-        if key_share_group(&ks) == target_group {
+        if key_share_group(&ks) == group {
           let exchange = key_share_exchange(&ks);
-          if exchange.byte_len() == 32 {
+          if exchange.byte_len() == want_len {
             return Some(exchange);
           }
         }
@@ -937,31 +973,74 @@ fn process_initial_client_hello(session: &mut HandshakeSession, ch_bytes: &Bytes
   // 3. 署名方式検査 (ecdsa_secp256r1_sha256 必須)
   check_signature_algorithms(&ch)?;
 
-  // 4. supported_groups 検査 (x25519 必須)
-  check_supported_groups(&ch)?;
+  // 4. 鍵交換グループの選択 (supported_groups の提示順で、サーバーが対応する最初のもの)
+  let group = select_group(&session, &ch)?;
 
   // 5. ALPN 検査
   let alpn_selected = check_alpn(&ch)?;
 
-  // 6. x25519 key_share の有無
-  let client_share_opt = find_x25519_key_share(&ch);
+  // 6. 選んだグループの key_share の有無
+  let client_share_opt = find_key_share(&ch, group);
   match client_share_opt {
     Some(client_pub_bytes) => {
       // 1-RTT フライト生成
-      return emit_1rtt_server_flight(&mut session, &ch_bytes, &ch, suite, alpn_selected, &server_random, &server_x25519_priv, &client_pub_bytes);
+      return emit_1rtt_server_flight(&mut session, &ch_bytes, &ch, suite, alpn_selected, &server_random, &server_x25519_priv, group, &client_pub_bytes);
     }
     None => {
-      // key_share に x25519 がない
+      // key_share に選んだグループがない
       if session.hrr_sent {
         session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
         return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
       }
-      return emit_hrr_server_flight(&mut session, &ch_bytes, ch, suite);
+      return emit_hrr_server_flight(&mut session, &ch_bytes, ch, suite, group);
     }
   }
 }
 
-fn emit_hrr_server_flight(session: &mut HandshakeSession, ch1_raw: &Bytes, ch1_parsed: ClientHello, suite: CipherSuite) -> Result<ServerFlight, ShieldError>
+pub struct KeyExchangeResult {
+  server_pub: Bytes,
+  shared: Bytes,
+}
+
+fn perform_key_exchange(session: &HandshakeSession, server_x25519_priv: &X25519PrivateKey, group: Int, client_pub_bytes: &Bytes) -> Result<KeyExchangeResult, ShieldError>
+  intent "選んだグループで鍵交換し、サーバーの公開鍵と共有秘密を返す。受け取る点が不正なら致命的アラート illegal_parameter（fail-open にしない）"
+  requires none
+  ensures none
+  effects none
+{
+  if group == group_secp256r1() {
+    // 曲線上の検査（65 バイト・先頭 0x04・座標 < p・曲線上）に通らない点は ECDH に渡さない
+    match EcdhP256PublicKey.from_bytes(&client_pub_bytes) {
+      Err(_) => {
+        return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
+      }
+      Ok(peer) => {
+        match session.p256_priv {
+          Some(priv) => {
+            let server_pub = ecdh_p256_public_key(&priv).to_bytes();
+            let shared = ecdh_p256_shared_secret(&priv, &peer).expose();
+            return Ok(KeyExchangeResult { server_pub: server_pub, shared: shared });
+          }
+          None => {
+            return Err(ShieldError.Fatal(AlertDescription.InternalError));
+          }
+        }
+      }
+    }
+  }
+
+  let server_pub = x25519_public_key(&server_x25519_priv);
+  let server_pub_bytes = server_pub.as_bytes();
+  return match X25519PublicKey.from_bytes(client_pub_bytes.clone()) {
+    Ok(client_pub) => match x25519_shared_secret(&server_x25519_priv, &client_pub) {
+      Ok(s) => Ok(KeyExchangeResult { server_pub: server_pub_bytes, shared: s.expose() }),
+      Err(_) => Err(ShieldError.Fatal(AlertDescription.IllegalParameter)),
+    },
+    Err(_) => Err(ShieldError.Fatal(AlertDescription.IllegalParameter)),
+  };
+}
+
+fn emit_hrr_server_flight(session: &mut HandshakeSession, ch1_raw: &Bytes, ch1_parsed: ClientHello, suite: CipherSuite, group: Int) -> Result<ServerFlight, ShieldError>
   intent "HelloRetryRequest フライトを生成し状態を WaitingClientHello2 に移行する"
   requires none
   ensures none
@@ -969,7 +1048,7 @@ fn emit_hrr_server_flight(session: &mut HandshakeSession, ch1_raw: &Bytes, ch1_p
 {
   let hrr_rand = magic_hrr_random();
   let sid = client_hello_legacy_session_id(&ch1_parsed);
-  let hrr_msg = build_server_hello(&hrr_rand, &sid, &suite, None, group_x25519());
+  let hrr_msg = build_server_hello(&hrr_rand, &sid, &suite, None, group);
   let hrr_rec = wrap_in_handshake_record(&hrr_msg);
   let ccs_rec = build_ccs_record();
 
@@ -990,6 +1069,7 @@ fn emit_hrr_server_flight(session: &mut HandshakeSession, ch1_raw: &Bytes, ch1_p
   session.phase = HandshakePhase.WaitingClientHello2;
   session.selected_suite = Some(suite);
   session.hrr_sent = true;
+  session.hrr_group = group;
   session.transcript = transcript;
   session.ch1_raw = ch1_raw.clone();
   session.ch1_parsed = Some(ch1_parsed);
@@ -1000,34 +1080,15 @@ fn emit_hrr_server_flight(session: &mut HandshakeSession, ch1_raw: &Bytes, ch1_p
   return Ok(ServerFlight { records: records });
 }
 
-fn emit_1rtt_server_flight(session: &mut HandshakeSession, ch_bytes: &Bytes, ch: &ClientHello, suite: CipherSuite, alpn_selected: Bool, server_random: &Bytes, server_x25519_priv: &X25519PrivateKey, client_pub_bytes: &Bytes) -> Result<ServerFlight, ShieldError>
+fn emit_1rtt_server_flight(session: &mut HandshakeSession, ch_bytes: &Bytes, ch: &ClientHello, suite: CipherSuite, alpn_selected: Bool, server_random: &Bytes, server_x25519_priv: &X25519PrivateKey, group: Int, client_pub_bytes: &Bytes) -> Result<ServerFlight, ShieldError>
   intent "1-RTT ServerHello から Finished までのフライトを生成する"
   requires none
   ensures none
   effects none
 {
-  let server_pub = x25519_public_key(&server_x25519_priv);
-  let server_pub_bytes = server_pub.as_bytes();
-
-  let mut shared_secret_opt = None;
-  match X25519PublicKey.from_bytes(client_pub_bytes.clone()) {
-    Ok(client_pub) => {
-      match x25519_shared_secret(&server_x25519_priv, &client_pub) {
-        Ok(s) => {
-          shared_secret_opt = Some(s.expose());
-        }
-        Err(_) => {
-          session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
-          return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
-        }
-      }
-    }
-    Err(_) => {
-      session.phase = HandshakePhase.Failed(AlertDescription.IllegalParameter);
-      return Err(ShieldError.Fatal(AlertDescription.IllegalParameter));
-    }
-  }
-  let shared_secret = shared_secret_opt.unwrap_or(Bytes.new());
+  let exchange = perform_key_exchange(&session, &server_x25519_priv, group, &client_pub_bytes)?;
+  let server_pub_bytes = exchange.server_pub.clone();
+  let shared_secret = exchange.shared.clone();
 
   // 鍵スケジュール
   let early_sec = early_secret(&suite);
@@ -1040,7 +1101,7 @@ fn emit_1rtt_server_flight(session: &mut HandshakeSession, ch_bytes: &Bytes, ch:
 
   // ServerHello メッセージ構築
   let sid = client_hello_legacy_session_id(&ch);
-  let sh_msg = build_server_hello(&server_random, &sid, &suite, Some(server_pub_bytes), group_x25519());
+  let sh_msg = build_server_hello(&server_random, &sid, &suite, Some(server_pub_bytes), group);
   let sh_rec = wrap_in_handshake_record(&sh_msg);
   let ccs_rec = build_ccs_record();
 
@@ -1187,8 +1248,8 @@ fn process_client_hello2(session: &mut HandshakeSession, ch2_bytes: &Bytes, serv
     }
   }
 
-  // x25519 key_share が存在しなければ illegal_parameter
-  let client_share_opt = find_x25519_key_share(&ch2);
+  // HelloRetryRequest で求めたグループの key_share が存在しなければ illegal_parameter
+  let client_share_opt = find_key_share(&ch2, session.hrr_group);
   let mut client_pub_bytes_opt = None;
   match client_share_opt {
     Some(s) => {
@@ -1215,7 +1276,8 @@ fn process_client_hello2(session: &mut HandshakeSession, ch2_bytes: &Bytes, serv
 
   let alpn_selected = check_alpn(&ch2)?;
 
-  return emit_1rtt_server_flight(&mut session, &ch2_bytes, &ch2, suite, alpn_selected, &server_random, &server_x25519_priv, &client_pub_bytes);
+  let hrr_group = session.hrr_group;
+  return emit_1rtt_server_flight(&mut session, &ch2_bytes, &ch2, suite, alpn_selected, &server_random, &server_x25519_priv, hrr_group, &client_pub_bytes);
 }
 
 pub fn handle_client_record(session: &mut HandshakeSession, raw_record: &Bytes) -> Result<Option<ServerFlight>, ShieldError>

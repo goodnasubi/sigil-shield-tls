@@ -1,0 +1,1120 @@
+module stage6_p256_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_cipher_suite.CipherSuite;
+use shield_client_hello.client_hello_key_shares;
+use shield_client_hello.ext_key_share;
+use shield_client_hello.ext_signature_algorithms;
+use shield_client_hello.ext_supported_groups;
+use shield_client_hello.ext_supported_versions;
+use shield_client_hello.group_secp256r1;
+use shield_client_hello.group_x25519;
+use shield_client_hello.key_share_exchange;
+use shield_client_hello.key_share_group;
+use shield_client_hello.parse_client_hello;
+use shield_handshake.HandshakePhase;
+use shield_handshake.HandshakeSession;
+use shield_handshake.ServerFlight;
+use shield_handshake.flight_records;
+use shield_handshake.handle_client_hello2_explicit;
+use shield_handshake.handle_client_hello_explicit;
+use shield_handshake.handshake_phase;
+use shield_handshake.handshake_set_p256_key;
+use shield_handshake.new_handshake_session;
+use shield_handshake.transcript_hash_for_suite;
+use shield_key_schedule.early_secret;
+use shield_key_schedule.handshake_secret;
+use shield_key_schedule.server_handshake_traffic_secret;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.RecordProtection;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use test_support.bytes_eq;
+use test_support.hex_decode;
+
+// ADR 0063 決定 6 段 6: P-256（secp256r1）の鍵交換の試験。
+//
+// 公開ベクタ: Botan の RFC 8448 再現トランスクリプト（Botan の src/tests/data/tls_13_rfc8448/transcripts.vec の
+// HelloRetryRequest_Handshake 節。クライアントが x25519 の key_share だけを提示し、サーバーが P-256 を要求する例）。
+// Botan のテストは両側の秘密鍵を固定の乱数列から作る。その乱数列（Server_RNG_Pool の 32〜63 バイト目、
+// Client_RNG_Pool の 64〜95 バイト目）をスカラーとして点を求めると、トランスクリプトの公開点と一致する
+// （独立に確認済み）。共有値は Python cryptography（OpenSSL）の ECDH でも同じ値になる。
+// Record_ServerHandshakeMessages を、この共有値から導いた鍵で復号できる（AES-GCM の認証が通る）ので、
+// 共有値・トランスクリプト・鍵スケジュールが一括で照合される。RFC 8448 の本文との直接照合は行っていない。
+
+fn ecdsa_priv() -> Result<EcdsaP256PrivateKey, Int>
+  intent "テスト用 ECDSA 秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let key_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match EcdsaP256PrivateKey.from_secret(Secret.from_bytes(key_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(90),
+  };
+}
+
+fn x25519_priv() -> Result<X25519PrivateKey, Int>
+  intent "テスト用 X25519 サーバー秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let key_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(key_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(91),
+  };
+}
+
+fn ecdh_priv(hex: String) -> Result<EcdhP256PrivateKey, Int>
+  intent "テスト用 P-256 ECDH 秘密鍵を 16 進から作る"
+  requires none
+  ensures none
+  effects none
+{
+  return match EcdhP256PrivateKey.from_secret(Secret.from_bytes(hex_decode(hex))) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(92),
+  };
+}
+
+// Botan の RFC 8448 再現トランスクリプトのサーバーとクライアントの P-256 秘密鍵（乱数列から取り出したスカラー）
+fn vec_server_d() -> String
+  intent "トランスクリプトのサーバー P-256 秘密鍵（16 進）"
+  requires none
+  ensures none
+  effects none
+{
+  return "8c510601f9765bfb8ed693449a48989859b5cfa879cb9f5443c41c5ff10634ed";
+}
+
+fn vec_client_d() -> String
+  intent "トランスクリプトのクライアント P-256 秘密鍵（16 進）"
+  requires none
+  ensures none
+  effects none
+{
+  return "ab5473467e19346ceb0a0414e41da21d4d2445bc3025afe97c4e8dc8d513da39";
+}
+
+fn vec_server_share() -> String
+  intent "トランスクリプトの ServerHello の P-256 key_share（16 進）"
+  requires none
+  ensures none
+  effects none
+{
+  return "04583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d";
+}
+
+fn vec_client_share() -> String
+  intent "トランスクリプトの ClientHello2 の P-256 key_share（16 進）"
+  requires none
+  ensures none
+  effects none
+{
+  return "04a6da7392ec591e17abfd535964b99894d13befb221b3def2ebe3830eac8f0151812677c4d6d2237e85cf01d6910cfb83954e76ba7352830534159897e8065780";
+}
+
+fn vec_shared() -> String
+  intent "トランスクリプトの P-256 共有値（16 進。OpenSSL の ECDH でも同じ）"
+  requires none
+  ensures none
+  effects none
+{
+  return "c142ce13ca11b5c2233652e63ad3d97844f1621fbfb9de69d547dc8fedeabeb4";
+}
+
+fn vec_ch1() -> Bytes
+  intent "トランスクリプトの ClientHello1（ハンドシェイクメッセージ）"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("010000b00303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010000810000000b0009000006736572766572ff01000100000a00080006001d00170018003300260024001d0020e8e8e3f3b93a25ed97a14a7dcacb8a272c6288e585c6484d05262fcad062ad1f002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001");
+}
+
+fn vec_hrr() -> Bytes
+  intent "トランスクリプトの HelloRetryRequest（ハンドシェイクメッセージ）"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("020000ac0303cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c001301000084003300020017002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002b00020304");
+}
+
+fn vec_ch2() -> Bytes
+  intent "トランスクリプトの ClientHello2（ハンドシェイクメッセージ）"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("010001fc0303b0b1c5a5aa37c5919f2ed1d5c6fff7fcb7849716945a2b8cee9258a346677b6f000006130113031302010001cd0000000b0009000006736572766572ff01000100000a00080006001d001700180033004700450017004104a6da7392ec591e17abfd535964b99894d13befb221b3def2ebe3830eac8f0151812677c4d6d2237e85cf01d6910cfb83954e76ba7352830534159897e8065780002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002c0074007271dcd04bb88bc3189119398a00000000eefafc76c146b823b096f8aacad365dd0030953f4edf625636e5f21bb2e23fcc654b1b5b40318d10d137abcbb87574e36e8a1f025f7dfa5d6e50781b5eda4aa15b0c8be778257d16aa3030e9e7841dd9e4c0342267e8ca0caf571fb2b7cff0f934b0002d00020101001c00024001001500af00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+}
+
+fn vec_sh() -> Bytes
+  intent "トランスクリプトの ServerHello（ハンドシェイクメッセージ）"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("020000770303bb341d847fd789c47c387172dc0c9bf147fccacb5043d86ca4c598d3ff571b9800130100004f003300450017004104583e054b7a66672ae020ad9d2686fcc85b5ad41a134a0f03ee72b893052bd85b4c8de6776f5b04ac07d83540eab3e3d9c547bc6528c4317d294686093a6cad7d002b00020304");
+}
+
+fn vec_server_hs_record() -> Bytes
+  intent "トランスクリプトのサーバーの保護レコード（EncryptedExtensions 以降）"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("170303029699bee20baf5b7fc727bfab6223928a381e6d0cf9c4da653f9d2a7b23f7de11cce842d5cf75631763450ffb8b0cc1d238e658af7a12adc86243114ab14a1da2fae42621ce483fb6242eabfaad52566b02b31d2eddedefeb80e66a9900d5f973b40c4fdf74719ecf1b68d7f9c3b6ceb903ca13dd1bb8f8187ae33417e1d152522c5822a1a03ad52c838c55953d610222874cce8e1790b229a2aa0b53c8d377ee720182951dc6181dc5d90bd1f0105ed1e84aa5f75957c6661897079e5ea5007449e3197bdc7c9beeedddeafdd844afa5c315ecfe65e576afe909812880620ec7048b42d7f5c78d76f299d6d82534bdd8f512febc0ed3814aca470cd8000d3e1cb9962b052fbb950df683a52c2ba77ed3713b122937a6e5170964e2ab7969dcd980b3db9b458da7603124d6dc005e4d6e04b4d0c4baf3275db827dbba0a6db09672171fc057b3851d7e026841e2978fbd2346bbefdd0376bb1108fe9acc92189f5650aa5e85d8e8c7b67ac510dba003d3d7e16350bb66d45013efd44c9b607c0d318c4c7d1a1f5cbc57e20611804e3787d7b4a4b5f08ed8fd70bdaeade02260b12ab842ef690b4a3ee7911e841b374ecd5ebbbc2a54d047b600336dd7d0c88b4bc10e58ee6cb656de7247fa20d8e91deb84628608cf80615b62e96c1491c7ac3755eb6901405d3474fe1ac79d106a0cee56c2577fc88480f96cb6b8c681b7b68b53c146093908f350888175bdfb0b1e31ad61e30ba0adfe6d223aa03c0783b5001a57587c328a9afcfcfb978d1cd4328f7d9d60530e630befd96c0c816ee20b0100768ae2a6df51fc68f172740a79af11398ee3be1252491fa9c693479e877f94ab7c5f8cad480203e6ab7b87dd71e8a0729113df17f5eee86ce108d1d72007ec1cd13c85a6c149621e77b7d78d805a30f0be030c315e54");
+}
+
+fn vec_encrypted_extensions() -> Bytes
+  intent "トランスクリプトの EncryptedExtensions メッセージ"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("080000180016000a0008000600170018001d001c0002400100000000");
+}
+
+fn slice_bytes(b: &Bytes, start: Int, end: Int) -> Bytes
+  intent "バイト列の一部を安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match b.slice(start, end) {
+    Ok(s) => s,
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn get_record(records: &List<Bytes>, idx: Int) -> Bytes
+  intent "フライトレコードを安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match records.get(idx) {
+    Some(r) => r.clone(),
+    None => Bytes.new(),
+  };
+}
+
+fn open_record_pt(rx: &mut RecordProtection, rec: &Bytes) -> Bytes
+  intent "レコードを開いて平文を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match open_record(&mut rx, &rec) {
+    Ok(outcome) => open_outcome_plaintext(&outcome),
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn new_session(ecdsa: &EcdsaP256PrivateKey, with_p256: Bool) -> Result<HandshakeSession, Int>
+  intent "テスト用の HandshakeSession を作る（with_p256 のとき P-256 のサーバー鍵を設定する）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cert_der = Bytes.new();
+  cert_der.push(48);
+  cert_der.push(10);
+  let mut i = 0;
+  while i < 10 {
+    cert_der.push(i + 1);
+    i = i + 1;
+  }
+  let mut cert_chain = List.new();
+  cert_chain.push(cert_der);
+  let mut session = new_handshake_session(cert_chain, ecdsa.clone());
+  if with_p256 {
+    match ecdh_priv(vec_server_d()) {
+      Ok(k) => {
+        handshake_set_p256_key(&mut session, k);
+      }
+      Err(e) => {
+        return Err(e);
+      }
+    }
+  }
+  return Ok(session);
+}
+
+// 1 つの key_share 項目
+pub struct Share {
+  group: Int,
+  data: Bytes,
+}
+
+fn build_client_hello(groups: List<Int>, shares: List<Share>) -> Bytes
+  intent "supported_groups と key_share を指定して ClientHello を構築する（TLS_AES_128_GCM_SHA256、ecdsa_secp256r1_sha256）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+  payload.push(3);
+  payload.push(3);
+  let mut i = 0;
+  while i < 32 {
+    payload.push(66);
+    i = i + 1;
+  }
+  payload.push(32);
+  i = 0;
+  while i < 32 {
+    payload.push(17);
+    i = i + 1;
+  }
+  payload.push(0);
+  payload.push(2);
+  payload.push(19);
+  payload.push(1);
+  payload.push(1);
+  payload.push(0);
+
+  let mut ext = Bytes.new();
+  ext.push(0);
+  ext.push(ext_supported_versions());
+  ext.push(0);
+  ext.push(3);
+  ext.push(2);
+  ext.push(3);
+  ext.push(4);
+
+  let glen = groups.len() * 2;
+  ext.push(0);
+  ext.push(ext_supported_groups());
+  ext.push((glen + 2) / 256);
+  ext.push((glen + 2) % 256);
+  ext.push(glen / 256);
+  ext.push(glen % 256);
+  let mut gi = 0;
+  while gi < groups.len() {
+    match groups.get(gi) {
+      Some(g) => {
+        ext.push(g / 256);
+        ext.push(g % 256);
+      }
+      None => {}
+    }
+    gi = gi + 1;
+  }
+
+  ext.push(0);
+  ext.push(ext_signature_algorithms());
+  ext.push(0);
+  ext.push(4);
+  ext.push(0);
+  ext.push(2);
+  ext.push(4);
+  ext.push(3);
+
+  if !shares.is_empty() {
+    let mut list = Bytes.new();
+    let mut si = 0;
+    while si < shares.len() {
+      match shares.get(si) {
+        Some(sh) => {
+          list.push(sh.group / 256);
+          list.push(sh.group % 256);
+          list.push(sh.data.byte_len() / 256);
+          list.push(sh.data.byte_len() % 256);
+          list.extend(&sh.data);
+        }
+        None => {}
+      }
+      si = si + 1;
+    }
+    ext.push(0);
+    ext.push(ext_key_share());
+    ext.push((list.byte_len() + 2) / 256);
+    ext.push((list.byte_len() + 2) % 256);
+    ext.push(list.byte_len() / 256);
+    ext.push(list.byte_len() % 256);
+    ext.extend(&list);
+  }
+
+  payload.push(ext.byte_len() / 256);
+  payload.push(ext.byte_len() % 256);
+  payload.extend(&ext);
+
+  let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+  msg.push(1);
+  let plen = payload.byte_len();
+  msg.push(plen / 65536);
+  msg.push(plen / 256 % 256);
+  msg.push(plen % 256);
+  msg.extend(&payload);
+  return msg;
+}
+
+fn groups2(a: Int, b: Int) -> List<Int>
+  intent "2 つのグループの一覧"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a);
+  l.push(b);
+  return l;
+}
+
+fn groups1(a: Int) -> List<Int>
+  intent "1 つのグループの一覧"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(a);
+  return l;
+}
+
+fn x25519_share() -> Share
+  intent "x25519 の key_share（クライアントの公開鍵）"
+  requires none
+  ensures none
+  effects none
+{
+  let key_raw = hex_decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(key_raw)) {
+    Ok(k) => Share { group: group_x25519(), data: x25519_public_key(&k).as_bytes() },
+    Err(_) => Share { group: group_x25519(), data: Bytes.new() },
+  };
+}
+
+fn p256_share(data: Bytes) -> Share
+  intent "secp256r1 の key_share"
+  requires none
+  ensures none
+  effects none
+{
+  return Share { group: group_secp256r1(), data: data };
+}
+
+fn one_share(s: Share) -> List<Share>
+  intent "key_share が 1 項目の一覧"
+  requires none
+  ensures none
+  effects none
+{
+  let mut l = List.new();
+  l.push(s);
+  return l;
+}
+
+fn server_random() -> Bytes
+  intent "テスト用のサーバー乱数"
+  requires none
+  ensures none
+  effects none
+{
+  return hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+}
+
+fn is_fatal(res: &Result<ServerFlight, ShieldError>, alert: AlertDescription) -> Bool
+  intent "結果が指定の致命的アラートか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match res {
+    Err(ShieldError.Fatal(a)) => a == alert,
+    _ => false,
+  };
+}
+
+// ServerHello の selected_group と key_share を取り出す。ServerHello レコードの本体は
+// [5..]: msg_type(1) len(3) version(2) random(32) sid_len(1) sid(32) suite(2) comp(1) ext_len(2) exts…
+// exts は supported_versions(6 バイト) の後に key_share: type(2) len(2) group(2) klen(2) key。
+fn server_hello_group(sh_rec: &Bytes) -> Int
+  intent "ServerHello レコードの key_share の group を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let off = 5 + 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2 + 6 + 4;
+  return sh_rec.get(off).unwrap_or(0) * 256 + sh_rec.get(off + 1).unwrap_or(0);
+}
+
+fn server_hello_key(sh_rec: &Bytes) -> Bytes
+  intent "ServerHello レコードの key_share の鍵を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let off = 5 + 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2 + 6 + 4 + 4;
+  return slice_bytes(&sh_rec, off, sh_rec.byte_len());
+}
+
+fn test_vector_public_keys_and_shared() -> Int
+  intent "トランスクリプトの P-256 公開点・共有値を標準部品の ECDH で再現する"
+  requires none
+  ensures none
+  effects none
+{
+  match ecdh_priv(vec_server_d()) {
+    Ok(srv) => {
+      match ecdh_priv(vec_client_d()) {
+        Ok(cli) => {
+          let srv_pub = ecdh_p256_public_key(&srv).to_bytes();
+          let cli_pub = ecdh_p256_public_key(&cli).to_bytes();
+          if !bytes_eq(&srv_pub, &hex_decode(vec_server_share())) {
+            return 601;
+          }
+          if !bytes_eq(&cli_pub, &hex_decode(vec_client_share())) {
+            return 602;
+          }
+          match EcdhP256PublicKey.from_bytes(&cli_pub) {
+            Ok(peer_c) => {
+              match EcdhP256PublicKey.from_bytes(&srv_pub) {
+                Ok(peer_s) => {
+                  let z1 = ecdh_p256_shared_secret(&srv, &peer_c).expose();
+                  let z2 = ecdh_p256_shared_secret(&cli, &peer_s).expose();
+                  if !bytes_eq(&z1, &hex_decode(vec_shared())) {
+                    return 603;
+                  }
+                  if !bytes_eq(&z2, &hex_decode(vec_shared())) {
+                    return 604;
+                  }
+                  return 0;
+                }
+                Err(_) => {
+                  return 605;
+                }
+              }
+            }
+            Err(_) => {
+              return 606;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_vector_key_schedule_decrypts_server_flight() -> Int
+  intent "P-256 の共有値から導いた鍵で、トランスクリプトのサーバーの保護レコードを復号できる"
+  requires none
+  ensures none
+  effects none
+{
+  let suite = CipherSuite.TlsAes128GcmSha256;
+  let ch1 = vec_ch1();
+  let ch1_hash = transcript_hash_for_suite(&suite, &ch1);
+  let mut transcript = Bytes.new();
+  transcript.push(254);
+  transcript.push(0);
+  transcript.push(0);
+  transcript.push(ch1_hash.byte_len());
+  transcript.extend(&ch1_hash);
+  transcript.extend(&vec_hrr());
+  transcript.extend(&vec_ch2());
+  transcript.extend(&vec_sh());
+  let th = transcript_hash_for_suite(&suite, &transcript);
+  if !bytes_eq(&th, &hex_decode("8aa8e828ec2f8a884fec95a3139de01c15a3daa7ff5bfc3f4bfcc21b438d7bf8")) {
+    return 611;
+  }
+  let early = early_secret(&suite);
+  let hs = handshake_secret(&suite, &early, &hex_decode(vec_shared()));
+  let s_hs = server_handshake_traffic_secret(&suite, &hs, &th);
+  let mut rx = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs.clone());
+  let pt = open_record_pt(&mut rx, &vec_server_hs_record());
+  if pt.byte_len() < 28 {
+    return 612;
+  }
+  let ee = vec_encrypted_extensions();
+  if !bytes_eq(&slice_bytes(&pt, 0, ee.byte_len()), &ee) {
+    return 613;
+  }
+  return 0;
+}
+
+fn test_vector_client_hello2_is_accepted() -> Int
+  intent "トランスクリプトの ClientHello2 から P-256 の key_share を取り出せる（曲線上の検査を通る）"
+  requires none
+  ensures none
+  effects none
+{
+  match parse_client_hello(&vec_ch2()) {
+    Ok(ch) => {
+      let shares = client_hello_key_shares(&ch);
+      if shares.len() != 1 {
+        return 621;
+      }
+      match shares.get(0) {
+        Some(ks) => {
+          if key_share_group(&ks) != group_secp256r1() {
+            return 622;
+          }
+          if !bytes_eq(&key_share_exchange(&ks), &hex_decode(vec_client_share())) {
+            return 623;
+          }
+          return 0;
+        }
+        None => {
+          return 624;
+        }
+      }
+    }
+    Err(_) => {
+      return 625;
+    }
+  }
+}
+
+fn test_p256_1rtt_handshake() -> Int
+  intent "クライアントが P-256 の key_share を提示すると、P-256 で 1-RTT ハンドシェイクが進む"
+  requires none
+  ensures none
+  effects none
+{
+  match ecdsa_priv() {
+    Ok(ecdsa) => {
+      match x25519_priv() {
+        Ok(xpriv) => {
+          match ecdh_priv(vec_client_d()) {
+            Ok(cli) => {
+              match new_session(&ecdsa, true) {
+                Ok(session0) => {
+                  let mut session = session0;
+                  let cli_pub = ecdh_p256_public_key(&cli).to_bytes();
+                  let ch = build_client_hello(groups1(group_secp256r1()), one_share(p256_share(cli_pub.clone())));
+                  match handle_client_hello_explicit(&mut session, &ch, &server_random(), &xpriv) {
+                    Ok(flight) => {
+                      let records = flight_records(&flight);
+                      if records.len() != 3 {
+                        return 631;
+                      }
+                      let sh_rec = get_record(&records, 0);
+                      if server_hello_group(&sh_rec) != group_secp256r1() {
+                        return 632;
+                      }
+                      let server_pub = server_hello_key(&sh_rec);
+                      if !bytes_eq(&server_pub, &hex_decode(vec_server_share())) {
+                        return 633;
+                      }
+                      // クライアント側: 同じ共有値から導いた鍵で、サーバーの保護レコードを開ける
+                      let suite = CipherSuite.TlsAes128GcmSha256;
+                      match EcdhP256PublicKey.from_bytes(&server_pub) {
+                        Ok(peer) => {
+                          let shared = ecdh_p256_shared_secret(&cli, &peer).expose();
+                          let early = early_secret(&suite);
+                          let hs = handshake_secret(&suite, &early, &shared);
+                          let sh_msg = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                          let mut tr = Bytes.new();
+                          tr.extend(&ch);
+                          tr.extend(&sh_msg);
+                          let th = transcript_hash_for_suite(&suite, &tr);
+                          let s_hs = server_handshake_traffic_secret(&suite, &hs, &th);
+                          let mut rx = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs.clone());
+                          let pt = open_record_pt(&mut rx, &get_record(&records, 2));
+                          if pt.byte_len() == 0 {
+                            return 634;
+                          }
+                          if pt.get(0).unwrap_or(0) != 8 {
+                            return 635;
+                          }
+                          return 0;
+                        }
+                        Err(_) => {
+                          return 636;
+                        }
+                      }
+                    }
+                    Err(_) => {
+                      return 637;
+                    }
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_group_selection_and_hrr() -> Int
+  intent "グループの選択（クライアントの提示順）と、P-256 を要求する HelloRetryRequest の経路"
+  requires none
+  ensures none
+  effects none
+{
+  match ecdsa_priv() {
+    Ok(ecdsa) => {
+      match x25519_priv() {
+        Ok(xpriv) => {
+          match ecdh_priv(vec_client_d()) {
+            Ok(cli) => {
+              let cli_pub = ecdh_p256_public_key(&cli).to_bytes();
+
+              // 1. 提示順が [x25519, secp256r1] で x25519 の key_share がある -> HRR なしで x25519（既存の挙動）
+              match new_session(&ecdsa, true) {
+                Ok(s1v) => {
+                  let mut s1 = s1v;
+                  let ch = build_client_hello(groups2(group_x25519(), group_secp256r1()), one_share(x25519_share()));
+                  match handle_client_hello_explicit(&mut s1, &ch, &server_random(), &xpriv) {
+                    Ok(f) => {
+                      if server_hello_group(&get_record(&flight_records(&f), 0)) != group_x25519() {
+                        return 641;
+                      }
+                    }
+                    Err(_) => {
+                      return 642;
+                    }
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+
+              // 2. 提示順が [secp256r1, x25519] で key_share は x25519 だけ -> P-256 を要求する HRR
+              //    その後の ClientHello2 に P-256 の key_share があれば P-256 で 1-RTT
+              match new_session(&ecdsa, true) {
+                Ok(s2v) => {
+                  let mut s2 = s2v;
+                  let ch1 = build_client_hello(groups2(group_secp256r1(), group_x25519()), one_share(x25519_share()));
+                  match handle_client_hello_explicit(&mut s2, &ch1, &server_random(), &xpriv) {
+                    Ok(f) => {
+                      let recs = flight_records(&f);
+                      if recs.len() != 2 {
+                        return 643;
+                      }
+                      if server_hello_group_hrr(&get_record(&recs, 0)) != group_secp256r1() {
+                        return 644;
+                      }
+                    }
+                    Err(_) => {
+                      return 645;
+                    }
+                  }
+                  match handshake_phase(&s2) {
+                    HandshakePhase.WaitingClientHello2 => {}
+                    _ => {
+                      return 646;
+                    }
+                  }
+                  let ch2 = build_client_hello(groups2(group_secp256r1(), group_x25519()), one_share(p256_share(cli_pub.clone())));
+                  match handle_client_hello2_explicit(&mut s2, &ch2, &server_random(), &xpriv) {
+                    Ok(f) => {
+                      let recs = flight_records(&f);
+                      if recs.len() != 3 {
+                        return 647;
+                      }
+                      let sh = get_record(&recs, 0);
+                      if server_hello_group(&sh) != group_secp256r1() {
+                        return 648;
+                      }
+                      if !bytes_eq(&server_hello_key(&sh), &hex_decode(vec_server_share())) {
+                        return 649;
+                      }
+                    }
+                    Err(_) => {
+                      return 650;
+                    }
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+
+              // 3. HRR の後の ClientHello2 に P-256 の key_share がない（x25519 のまま）-> illegal_parameter
+              match new_session(&ecdsa, true) {
+                Ok(s3v) => {
+                  let mut s3 = s3v;
+                  let ch1 = build_client_hello(groups2(group_secp256r1(), group_x25519()), one_share(x25519_share()));
+                  let _ = handle_client_hello_explicit(&mut s3, &ch1, &server_random(), &xpriv);
+                  let res = handle_client_hello2_explicit(&mut s3, &ch1, &server_random(), &xpriv);
+                  if !is_fatal(&res, AlertDescription.IllegalParameter) {
+                    return 651;
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+
+              // 4. 提示順が [x25519, secp256r1] で P-256 の key_share だけ -> x25519 を要求する HRR（P-256 の share は使わない）
+              match new_session(&ecdsa, true) {
+                Ok(s4v) => {
+                  let mut s4 = s4v;
+                  let ch1 = build_client_hello(groups2(group_x25519(), group_secp256r1()), one_share(p256_share(cli_pub.clone())));
+                  match handle_client_hello_explicit(&mut s4, &ch1, &server_random(), &xpriv) {
+                    Ok(f) => {
+                      let recs = flight_records(&f);
+                      if recs.len() != 2 {
+                        return 652;
+                      }
+                      if server_hello_group_hrr(&get_record(&recs, 0)) != group_x25519() {
+                        return 653;
+                      }
+                    }
+                    Err(_) => {
+                      return 654;
+                    }
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+
+              // 5. P-256 のサーバー鍵を設定していない -> P-256 は選ばない。提示が secp256r1 だけなら handshake_failure
+              match new_session(&ecdsa, false) {
+                Ok(s5v) => {
+                  let mut s5 = s5v;
+                  let ch = build_client_hello(groups1(group_secp256r1()), one_share(p256_share(cli_pub.clone())));
+                  let res = handle_client_hello_explicit(&mut s5, &ch, &server_random(), &xpriv);
+                  if !is_fatal(&res, AlertDescription.HandshakeFailure) {
+                    return 655;
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+
+              // 6. 鍵を設定していなくても、提示順が [secp256r1, x25519] なら x25519 を選ぶ（P-256 の share は無視する）
+              match new_session(&ecdsa, false) {
+                Ok(s6v) => {
+                  let mut s6 = s6v;
+                  let ch = build_client_hello(groups2(group_secp256r1(), group_x25519()), one_share(x25519_share()));
+                  match handle_client_hello_explicit(&mut s6, &ch, &server_random(), &xpriv) {
+                    Ok(f) => {
+                      if server_hello_group(&get_record(&flight_records(&f), 0)) != group_x25519() {
+                        return 656;
+                      }
+                    }
+                    Err(_) => {
+                      return 657;
+                    }
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+              return 0;
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+// HelloRetryRequest の key_share（selected_group のみ）を取り出す。
+// exts は supported_versions(6 バイト) の後に key_share: type(2) len(2) group(2)。
+fn server_hello_group_hrr(rec: &Bytes) -> Int
+  intent "HelloRetryRequest レコードの selected_group を返す（session id は 32 バイト）"
+  requires none
+  ensures none
+  effects none
+{
+  let off = 5 + 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2 + 6 + 4;
+  return rec.get(off).unwrap_or(0) * 256 + rec.get(off + 1).unwrap_or(0);
+}
+
+fn flip_last(b: &Bytes) -> Bytes
+  intent "最後のバイトの最下位ビットを反転した複製を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(b.byte_len());
+  let mut i = 0;
+  while i < b.byte_len() {
+    let v = b.get(i).unwrap_or(0);
+    if i + 1 == b.byte_len() {
+      out.push(v ^ 1);
+    } else {
+      out.push(v);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn repeat_byte(v: Int, n: Int) -> Bytes
+  intent "同じバイトを n 個並べる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.with_capacity(n);
+  let mut i = 0;
+  while i < n {
+    out.push(v);
+    i = i + 1;
+  }
+  return out;
+}
+
+fn point_of(prefix: Int, x: &Bytes, y: &Bytes) -> Bytes
+  intent "SEC 1 の点（先頭バイト || X || Y）を組み立てる"
+  requires none
+  ensures none
+  effects none
+{
+  let mut out = Bytes.new();
+  out.push(prefix);
+  out.extend(&x);
+  out.extend(&y);
+  return out;
+}
+
+// 不正な P-256 の key_share を渡して、致命的アラート illegal_parameter で終えることを確かめる。
+fn rejects_p256_share(point: Bytes, ecdsa: &EcdsaP256PrivateKey, xpriv: &X25519PrivateKey) -> Bool
+  intent "不正な P-256 の key_share を ClientHello が運ぶと illegal_parameter で終え、セッションが Failed になる"
+  requires none
+  ensures none
+  effects none
+{
+  match new_session(&ecdsa, true) {
+    Ok(s0) => {
+      let mut s = s0;
+      let ch = build_client_hello(groups1(group_secp256r1()), one_share(p256_share(point)));
+      let res = handle_client_hello_explicit(&mut s, &ch, &server_random(), &xpriv);
+      if !is_fatal(&res, AlertDescription.IllegalParameter) {
+        return false;
+      }
+      return match handshake_phase(&s) {
+        HandshakePhase.Failed(_) => true,
+        _ => false,
+      };
+    }
+    Err(_) => {
+      return false;
+    }
+  }
+}
+
+fn test_invalid_key_share_points_are_rejected() -> Int
+  intent "曲線上にない点・無限遠点（0, 0）・範囲外の座標・長さと先頭バイトの誤りを致命的アラートで拒否する（fail-open にしない）"
+  requires none
+  ensures none
+  effects none
+{
+  match ecdsa_priv() {
+    Ok(ecdsa) => {
+      match x25519_priv() {
+        Ok(xpriv) => {
+          let good = hex_decode(vec_client_share());
+          let x = slice_bytes(&good, 1, 33);
+          let y = slice_bytes(&good, 33, 65);
+          let p = hex_decode("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+          let all_ff = repeat_byte(255, 32);
+          let zero = repeat_byte(0, 32);
+
+          // 対照: 正しい点は拒否されない
+          match new_session(&ecdsa, true) {
+            Ok(sg) => {
+              let mut sgm = sg;
+              let chg = build_client_hello(groups1(group_secp256r1()), one_share(p256_share(good.clone())));
+              if handle_client_hello_explicit(&mut sgm, &chg, &server_random(), &xpriv).is_err() {
+                return 671;
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+
+          // 曲線上にない（Y の最下位ビットを反転）
+          if !rejects_p256_share(point_of(4, &x, &flip_last(&y)), &ecdsa, &xpriv) {
+            return 672;
+          }
+          // 曲線上にない（X の最下位ビットを反転）
+          if !rejects_p256_share(point_of(4, &flip_last(&x), &y), &ecdsa, &xpriv) {
+            return 673;
+          }
+          // 無限遠点を非圧縮で表した (0, 0)
+          if !rejects_p256_share(point_of(4, &zero, &zero), &ecdsa, &xpriv) {
+            return 674;
+          }
+          // X と Y の入れ替え
+          if !rejects_p256_share(point_of(4, &y, &x), &ecdsa, &xpriv) {
+            return 675;
+          }
+          // 座標が p と同じ・p 以上（X、Y それぞれ）
+          if !rejects_p256_share(point_of(4, &p, &y), &ecdsa, &xpriv) {
+            return 676;
+          }
+          if !rejects_p256_share(point_of(4, &x, &p), &ecdsa, &xpriv) {
+            return 677;
+          }
+          if !rejects_p256_share(point_of(4, &all_ff, &y), &ecdsa, &xpriv) {
+            return 678;
+          }
+          if !rejects_p256_share(point_of(4, &x, &all_ff), &ecdsa, &xpriv) {
+            return 679;
+          }
+          // 先頭バイトが 0x04 でない（圧縮点の 0x02・0x03、0x00、ハイブリッドの 0x06）
+          if !rejects_p256_share(point_of(2, &x, &y), &ecdsa, &xpriv) {
+            return 680;
+          }
+          if !rejects_p256_share(point_of(3, &x, &y), &ecdsa, &xpriv) {
+            return 681;
+          }
+          if !rejects_p256_share(point_of(0, &x, &y), &ecdsa, &xpriv) {
+            return 682;
+          }
+          if !rejects_p256_share(point_of(6, &x, &y), &ecdsa, &xpriv) {
+            return 683;
+          }
+          // 長さの誤り（64 バイト、66 バイト、33 バイトの圧縮形、空）
+          let mut short = point_of(4, &x, &y);
+          short = slice_bytes(&short, 0, 64);
+          if !rejects_p256_share(short, &ecdsa, &xpriv) {
+            return 684;
+          }
+          let mut long = point_of(4, &x, &y);
+          long.push(0);
+          if !rejects_p256_share(long, &ecdsa, &xpriv) {
+            return 685;
+          }
+          let mut compressed = Bytes.new();
+          compressed.push(2);
+          compressed.extend(&x);
+          if !rejects_p256_share(compressed, &ecdsa, &xpriv) {
+            return 686;
+          }
+          if !rejects_p256_share(Bytes.new(), &ecdsa, &xpriv) {
+            return 687;
+          }
+          return 0;
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_invalid_share_after_hrr_is_rejected() -> Int
+  intent "HelloRetryRequest の後の ClientHello2 の P-256 の key_share が曲線上にない場合も致命的アラートで終える"
+  requires none
+  ensures none
+  effects none
+{
+  match ecdsa_priv() {
+    Ok(ecdsa) => {
+      match x25519_priv() {
+        Ok(xpriv) => {
+          match new_session(&ecdsa, true) {
+            Ok(s0) => {
+              let mut s = s0;
+              let ch1 = build_client_hello(groups2(group_secp256r1(), group_x25519()), one_share(x25519_share()));
+              let _ = handle_client_hello_explicit(&mut s, &ch1, &server_random(), &xpriv);
+              let good = hex_decode(vec_client_share());
+              let bad = flip_last(&good);
+              let ch2 = build_client_hello(groups2(group_secp256r1(), group_x25519()), one_share(p256_share(bad)));
+              let res = handle_client_hello2_explicit(&mut s, &ch2, &server_random(), &xpriv);
+              if !is_fatal(&res, AlertDescription.IllegalParameter) {
+                return 691;
+              }
+              return match handshake_phase(&s) {
+                HandshakePhase.Failed(_) => 0,
+                _ => 692,
+              };
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+pub fn main() -> Int
+  intent "段 6（P-256 の鍵交換）の全試験を実行する"
+  requires none
+  ensures none
+  effects none
+{
+  let r1 = test_vector_public_keys_and_shared();
+  if r1 != 0 {
+    return r1;
+  }
+  let r2 = test_vector_key_schedule_decrypts_server_flight();
+  if r2 != 0 {
+    return r2;
+  }
+  let r3 = test_vector_client_hello2_is_accepted();
+  if r3 != 0 {
+    return r3;
+  }
+  let r4 = test_p256_1rtt_handshake();
+  if r4 != 0 {
+    return r4;
+  }
+  let r5 = test_group_selection_and_hrr();
+  if r5 != 0 {
+    return r5;
+  }
+  let r6 = test_invalid_key_share_points_are_rejected();
+  if r6 != 0 {
+    return r6;
+  }
+  let r7 = test_invalid_share_after_hrr_is_rejected();
+  if r7 != 0 {
+    return r7;
+  }
+  return 0;
+}
