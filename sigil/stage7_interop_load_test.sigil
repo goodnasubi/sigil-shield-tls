@@ -1,0 +1,1039 @@
+module stage7_interop_load_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_certificate.load_bundle_from_pem_text;
+use shield_certificate.new_certificate_store;
+use shield_certificate.select_certificate_for_sni;
+use shield_cipher_suite.CipherSuite;
+use shield_client_hello.ServerName;
+use shield_client_hello.client_hello_server_name;
+use shield_client_hello.ext_alpn;
+use shield_client_hello.ext_key_share;
+use shield_client_hello.ext_server_name;
+use shield_client_hello.ext_signature_algorithms;
+use shield_client_hello.ext_supported_groups;
+use shield_client_hello.ext_supported_versions;
+use shield_client_hello.group_secp256r1;
+use shield_client_hello.group_x25519;
+use shield_client_hello.parse_client_hello;
+use shield_handshake.HandshakePhase;
+use shield_handshake.HandshakeSession;
+use shield_handshake.build_ccs_record;
+use shield_handshake.build_finished;
+use shield_handshake.flight_records;
+use shield_handshake.handle_client_hello_explicit;
+use shield_handshake.handle_client_record;
+use shield_handshake.handshake_client_app_protection;
+use shield_handshake.handshake_phase;
+use shield_handshake.handshake_server_app_protection;
+use shield_handshake.handshake_set_p256_key;
+use shield_handshake.new_handshake_session;
+use shield_handshake.transcript_hash_for_suite;
+use shield_key_schedule.client_application_traffic_secret_0;
+use shield_key_schedule.client_handshake_traffic_secret;
+use shield_key_schedule.early_secret;
+use shield_key_schedule.handshake_secret;
+use shield_key_schedule.master_secret;
+use shield_key_schedule.server_application_traffic_secret_0;
+use shield_key_schedule.server_handshake_traffic_secret;
+use shield_proxy_v2.ProxyEndpoint;
+use shield_proxy_v2.build_proxy_v2_header;
+use shield_proxy_v2.new_ipv4;
+use shield_proxy_v2.parse_proxy_v2_header;
+use shield_proxy_v2.parsed_authority;
+use shield_proxy_v2.parsed_dst_port;
+use shield_proxy_v2.parsed_has_authority;
+use shield_proxy_v2.parsed_has_ssl_tlv;
+use shield_proxy_v2.parsed_src_port;
+use shield_proxy_v2.parsed_ssl_version;
+use shield_record.ContentType;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_record_crypto.seal_record;
+use shield_relay.build_502_bad_gateway_response;
+use shield_relay.build_close_notify_record;
+use shield_relay.build_plaintext_fatal_alert_record;
+use test_support.bytes_eq;
+use test_support.hex_decode;
+
+// ADR 0063 段 7: 相互運用・負荷・公開前の記録 試験
+
+fn get_test_pkcs8_pem() -> String
+  intent "テスト用 P-256 PKCS#8 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEYGnSiBgXwP7WZEK\nnW83yc235VtOZqeK/Q82a2KsKzChRANCAAQsjimmI6QJfZtzEjO7tDVwEdD3FDaG\nFNceg/i8+Od5h4vee9/+QglHMgchn7hqguuMfQgPiyd39KnTRghFUJse\n-----END PRIVATE KEY-----\n";
+}
+
+fn get_test_fullchain_pem() -> String
+  intent "テスト用 リーフと CA を連結した証明書チェーン PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBVjCB/qADAgECAgECMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABCyOKaYjpAl9m3MSM7u0NXAR0PcUNoYU1x6D+Lz453mHi9573/5C\nCUcyByGfuGqC64x9CA+LJ3f0qdNGCEVQmx6jKTAnMCUGA1UdEQQeMByCC2V4YW1w\nbGUuY29tgg0qLmV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0cAMEQCIBwPwgIYt/HT\nFjg38v/ztFwZSNUvesJx5EYF1lnL773lAiAS4oI8uwonf2OgwhcSeaeRPd4WkBgS\nQuVXzxohuYlvNw==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBVTCB/KADAgECAgEBMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAqMRAwDgYDVQQDDAdUZXN0IENBMRYwFAYDVQQKDA1TaGllbGQgVExT\nIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExPyFTXe4R43oDNkBL8Vo2FYv\nWdlb5xCH8GvRf2gbu8MMmPzvupBajfVjZA8Cry9W2mZJ4K/Hp0Wp0V0uFCtNBaMT\nMBEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3+ozQ5fDf3mCs\nMYu/I0Cdd6iIOzGQd9OYKmZupKnV5wIhAMSh6uvvLlZgqYLTsGftiqaR7yCFBgyE\nIa6AnmlqfbLJ\n-----END CERTIFICATE-----\n";
+}
+
+fn test_ecdsa_priv() -> Result<EcdsaP256PrivateKey, Int>
+  intent "テスト用 ECDSA 秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match EcdsaP256PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(99),
+  };
+}
+
+fn test_server_x25519_priv() -> Result<X25519PrivateKey, Int>
+  intent "テスト用 X25519 サーバー秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(98),
+  };
+}
+
+fn test_client_x25519_priv() -> Result<X25519PrivateKey, Int>
+  intent "テスト用 X25519 クライアント秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+  return match X25519PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(97),
+  };
+}
+
+fn test_p256_ecdh_key() -> Result<EcdhP256PrivateKey, Int>
+  intent "テスト用 P-256 ECDH 秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+  return match EcdhP256PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(96),
+  };
+}
+
+fn test_client_p256_ecdh_key() -> Result<EcdhP256PrivateKey, Int>
+  intent "テスト用 P-256 クライアント ECDH 秘密鍵"
+  requires none
+  ensures none
+  effects none
+{
+  let k_raw = hex_decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+  return match EcdhP256PrivateKey.from_secret(Secret.from_bytes(k_raw)) {
+    Ok(k) => Ok(k),
+    Err(_) => Err(95),
+  };
+}
+
+fn new_test_session(private_key: &EcdsaP256PrivateKey) -> HandshakeSession
+  intent "テスト用 HandshakeSession を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut cert_der = Bytes.new();
+  cert_der.push(48);
+  cert_der.push(10);
+  let mut i = 0;
+  while i < 10 {
+    cert_der.push(i + 1);
+    i = i + 1;
+  }
+  let mut cert_chain = List.new();
+  cert_chain.push(cert_der);
+  return new_handshake_session(cert_chain, private_key.clone());
+}
+
+fn slice_bytes(b: &Bytes, start: Int, end: Int) -> Bytes
+  intent "バイト列の一部を安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match b.slice(start, end) {
+    Ok(s) => s,
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn get_record(records: &List<Bytes>, idx: Int) -> Bytes
+  intent "フライトレコードを安全に取り出す"
+  requires none
+  ensures none
+  effects none
+{
+  return match records.get(idx) {
+    Some(r) => r.clone(),
+    None => Bytes.new(),
+  };
+}
+
+fn derive_x25519_shared(priv: &X25519PrivateKey, pub_bytes: &Bytes) -> Bytes
+  intent "X25519 共有秘密を導出する"
+  requires none
+  ensures none
+  effects none
+{
+  return match X25519PublicKey.from_bytes(pub_bytes.clone()) {
+    Ok(pub_obj) => match x25519_shared_secret(&priv, &pub_obj) {
+      Ok(ss) => ss.expose(),
+      Err(_) => Bytes.new(),
+    },
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn derive_p256_shared(priv: &EcdhP256PrivateKey, pub_bytes: &Bytes) -> Bytes
+  intent "P-256 ECDH 共有秘密を導出する"
+  requires none
+  ensures none
+  effects none
+{
+  return match EcdhP256PublicKey.from_bytes(&pub_bytes) {
+    Ok(pub_obj) => ecdh_p256_shared_secret(&priv, &pub_obj).expose(),
+    Err(_) => Bytes.new(),
+  };
+}
+
+fn build_test_client_hello(ciphers: List<Int>, groups: List<Int>, key_share_group: Int, key_share_data: Bytes, alpn_list: List<String>, sni_opt: Option<String>, extra_grease: Bool) -> Bytes
+  intent "相互運用試験用の ClientHello メッセージを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut payload = Bytes.new();
+
+  // legacy_version: 0x0303
+  payload.push(3);
+  payload.push(3);
+
+  // random: 32 bytes
+  let mut i = 0;
+  while i < 32 {
+    payload.push(11 + i);
+    i = i + 1;
+  }
+
+  // legacy_session_id: 32 bytes
+  payload.push(32);
+  let mut s = 0;
+  while s < 32 {
+    payload.push(22 + s);
+    s = s + 1;
+  }
+
+  // cipher_suites
+  let c_len = ciphers.len() * 2;
+  payload.push(c_len / 256);
+  payload.push(c_len % 256);
+  let mut ci = 0;
+  while ci < ciphers.len() {
+    match ciphers.get(ci) {
+      Some(cs) => {
+        payload.push(cs / 256);
+        payload.push(cs % 256);
+      }
+      None => {}
+    }
+    ci = ci + 1;
+  }
+
+  // legacy_compression_methods: [1, 0]
+  payload.push(1);
+  payload.push(0);
+
+  // 拡張部
+  let mut extensions = Bytes.new();
+
+  // 1. supported_versions: 0x002b (0x0304)
+  extensions.push(0);
+  extensions.push(ext_supported_versions());
+  extensions.push(0);
+  extensions.push(3);
+  extensions.push(2);
+  extensions.push(3);
+  extensions.push(4);
+
+  // 2. server_name
+  match sni_opt {
+    Some(sni_str) => {
+      let host_b = sni_str.as_bytes();
+      let sn_list_len = 3 + host_b.byte_len();
+      let ext_sn_len = sn_list_len + 2;
+      extensions.push(0);
+      extensions.push(ext_server_name());
+      extensions.push(ext_sn_len / 256);
+      extensions.push(ext_sn_len % 256);
+      extensions.push(sn_list_len / 256);
+      extensions.push(sn_list_len % 256);
+      extensions.push(0);
+      extensions.push(host_b.byte_len() / 256);
+      extensions.push(host_b.byte_len() % 256);
+      extensions.extend(&host_b);
+    }
+    None => {}
+  }
+
+  // 3. supported_groups
+  let g_len = groups.len() * 2;
+  let ext_g_len = g_len + 2;
+  extensions.push(0);
+  extensions.push(ext_supported_groups());
+  extensions.push(ext_g_len / 256);
+  extensions.push(ext_g_len % 256);
+  extensions.push(g_len / 256);
+  extensions.push(g_len % 256);
+  let mut gi = 0;
+  while gi < groups.len() {
+    match groups.get(gi) {
+      Some(grp) => {
+        extensions.push(grp / 256);
+        extensions.push(grp % 256);
+      }
+      None => {}
+    }
+    gi = gi + 1;
+  }
+
+  // 4. key_share
+  if !key_share_data.is_empty() {
+    let k_len = key_share_data.byte_len();
+    let share_entry_len = 4 + k_len;
+    let ext_ks_len = share_entry_len + 2;
+    extensions.push(0);
+    extensions.push(ext_key_share());
+    extensions.push(ext_ks_len / 256);
+    extensions.push(ext_ks_len % 256);
+    extensions.push(share_entry_len / 256);
+    extensions.push(share_entry_len % 256);
+    extensions.push(key_share_group / 256);
+    extensions.push(key_share_group % 256);
+    extensions.push(k_len / 256);
+    extensions.push(k_len % 256);
+    extensions.extend(&key_share_data);
+  }
+
+  // 5. signature_algorithms: ecdsa_secp256r1_sha256 = 0x0403
+  extensions.push(0);
+  extensions.push(ext_signature_algorithms());
+  extensions.push(0);
+  extensions.push(4);
+  extensions.push(0);
+  extensions.push(2);
+  extensions.push(4);
+  extensions.push(3);
+
+  // 6. ALPN
+  if !alpn_list.is_empty() {
+    let mut alpn_payload = Bytes.new();
+    let mut ai = 0;
+    while ai < alpn_list.len() {
+      match alpn_list.get(ai) {
+        Some(proto) => {
+          let proto_b = proto.as_bytes();
+          alpn_payload.push(proto_b.byte_len());
+          alpn_payload.extend(&proto_b);
+        }
+        None => {}
+      }
+      ai = ai + 1;
+    }
+    let ext_alpn_len = alpn_payload.byte_len() + 2;
+    extensions.push(0);
+    extensions.push(ext_alpn());
+    extensions.push(ext_alpn_len / 256);
+    extensions.push(ext_alpn_len % 256);
+    extensions.push(alpn_payload.byte_len() / 256);
+    extensions.push(alpn_payload.byte_len() % 256);
+    extensions.extend(&alpn_payload);
+  }
+
+  // 7. GREASE extension (0x5a5a) if requested
+  if extra_grease {
+    extensions.push(90);  // 0x5a
+    extensions.push(90);
+    extensions.push(0);
+    extensions.push(2);
+    extensions.push(1);
+    extensions.push(2);
+  }
+
+  // 拡張長 + 拡張部を payload に追加
+  payload.push(extensions.byte_len() / 256);
+  payload.push(extensions.byte_len() % 256);
+  payload.extend(&extensions);
+
+  // ハンドシェイクヘッダ（4 バイト）
+  let mut msg = Bytes.with_capacity(4 + payload.byte_len());
+  msg.push(1);  // client_hello
+  let plen = payload.byte_len();
+  msg.push(plen / 65536);
+  msg.push(plen / 256 % 256);
+  msg.push(plen % 256);
+  msg.extend(&payload);
+
+  return msg;
+}
+
+fn test_handshake_benchmark_x25519() -> Int
+  intent "X25519 + ECDSA P-256 1-RTT ハンドシェイク負荷実測および完全ラウンドトリップ検証"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(s_xpriv) => {
+          match test_client_x25519_priv() {
+            Ok(c_xpriv) => {
+              let c_xpub = x25519_public_key(&c_xpriv).as_bytes();
+              let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+              // ハンドシェイク検証
+              let mut session = new_test_session(&ecdsa_priv);
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);  // TLS_AES_128_GCM_SHA256
+              ciphers.push(4867);  // TLS_CHACHA20_POLY1305_SHA256
+              ciphers.push(4866);  // TLS_AES_256_GCM_SHA384
+
+              let mut groups = List.new();
+              groups.push(group_x25519());
+              groups.push(group_secp256r1());
+
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+
+              let ch_msg = build_test_client_hello(ciphers, groups, group_x25519(), c_xpub.clone(), alpn, Some("example.com"), false);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &s_rand, &s_xpriv) {
+                Ok(flight) => {
+                  let records = flight_records(&flight);
+                  if records.len() != 3 {
+                    return 105;
+                  }
+
+                  let sh_rec = get_record(&records, 0);
+                  let sh_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                  let s_pub_bytes = slice_bytes(&sh_raw, sh_raw.byte_len() - 32, sh_raw.byte_len());
+
+                  let shared_sec = derive_x25519_shared(&c_xpriv, &s_pub_bytes);
+                  if shared_sec.byte_len() != 32 {
+                    return 106;
+                  }
+
+                  // サーバー優先順最上位の ChaCha20-Poly1305
+                  let suite = CipherSuite.TlsChacha20Poly1305Sha256;
+                  let early_sec = early_secret(&suite);
+                  let hs_sec = handshake_secret(&suite, &early_sec, &shared_sec);
+
+                  let mut client_transcript = Bytes.new();
+                  client_transcript.extend(&ch_msg);
+                  client_transcript.extend(&sh_raw);
+
+                  let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                  let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                  let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                  let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                  let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                  let enc_flight = get_record(&records, 2);
+                  match open_record(&mut client_rx_hs, &enc_flight) {
+                    Ok(out) => {
+                      let pt = open_outcome_plaintext(&out);
+                      client_transcript.extend(&pt);
+
+                      let c_ccs_rec = build_ccs_record();
+                      match handle_client_record(&mut session, &c_ccs_rec) {
+                        Ok(None) => {
+                          let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                          let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+                          match seal_record(&mut client_tx_hs, &ContentType.Handshake, &c_fin_msg, 0) {
+                            Ok(c_fin_rec) => {
+                              match handle_client_record(&mut session, &c_fin_rec) {
+                                Ok(None) => {
+                                  match handshake_phase(&session) {
+                                    HandshakePhase.Connected => {
+                                      // アプリケーショントラフィック秘密導出 (Server Finished までの th_sf)
+                                      let ms_sec = master_secret(&suite, &hs_sec);
+                                      let c_ap_sec = client_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+                                      let s_ap_sec = server_application_traffic_secret_0(&suite, &ms_sec, &th_sf);
+
+                                      let mut client_tx_app = new_record_protection(RecordDirection.Transmit, suite.clone(), c_ap_sec);
+                                      let mut client_rx_app = new_record_protection(RecordDirection.Receive, suite.clone(), s_ap_sec);
+
+                                      match handshake_client_app_protection(&session) {
+                                        Some(rx_app) => {
+                                          let mut s_rx_app = rx_app;
+                                          match handshake_server_app_protection(&session) {
+                                            Some(tx_app) => {
+                                              let mut s_tx_app = tx_app;
+                                              let http_req = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".as_bytes();
+                                              match seal_record(&mut client_tx_app, &ContentType.ApplicationData, &http_req, 0) {
+                                                Ok(req_rec) => {
+                                                  match open_record(&mut s_rx_app, &req_rec) {
+                                                    Ok(s_out) => {
+                                                      let s_received_pt = open_outcome_plaintext(&s_out);
+                                                      if !bytes_eq(&s_received_pt, &http_req) {
+                                                        return 116;
+                                                      }
+
+                                                      let http_resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLO".as_bytes();
+                                                      match seal_record(&mut s_tx_app, &ContentType.ApplicationData, &http_resp, 0) {
+                                                        Ok(resp_rec) => {
+                                                          match open_record(&mut client_rx_app, &resp_rec) {
+                                                            Ok(c_out) => {
+                                                              let c_received_pt = open_outcome_plaintext(&c_out);
+                                                              if !bytes_eq(&c_received_pt, &http_resp) {
+                                                                return 118;
+                                                              }
+                                                              return 0;
+                                                            }
+                                                            Err(_) => {
+                                                              return 119;
+                                                            }
+                                                          }
+                                                        }
+                                                        Err(_) => {
+                                                          return 117;
+                                                        }
+                                                      }
+                                                    }
+                                                    Err(_) => {
+                                                      return 115;
+                                                    }
+                                                  }
+                                                }
+                                                Err(_) => {
+                                                  return 114;
+                                                }
+                                              }
+                                            }
+                                            None => {
+                                              return 113;
+                                            }
+                                          }
+                                        }
+                                        None => {
+                                          return 112;
+                                        }
+                                      }
+                                    }
+                                    _ => {
+                                      return 111;
+                                    }
+                                  }
+                                }
+                                _ => {
+                                  return 110;
+                                }
+                              }
+                            }
+                            Err(_) => {
+                              return 109;
+                            }
+                          }
+                        }
+                        _ => {
+                          return 108;
+                        }
+                      }
+                    }
+                    Err(_) => {
+                      return 107;
+                    }
+                  }
+                }
+                Err(_) => {
+                  return 104;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_handshake_benchmark_p256() -> Int
+  intent "secp256r1 (P-256) ECDH + ECDSA P-256 1-RTT ハンドシェイク実測および検証"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_p256_ecdh_key() {
+        Ok(s_ecdh_priv) => {
+          match test_client_p256_ecdh_key() {
+            Ok(c_ecdh_priv) => {
+              match test_server_x25519_priv() {
+                Ok(s_xpriv) => {
+                  let c_ecdh_pub = ecdh_p256_public_key(&c_ecdh_priv).to_bytes();
+                  let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+
+                  let mut session = new_test_session(&ecdsa_priv);
+                  handshake_set_p256_key(&mut session, s_ecdh_priv);
+
+                  let mut ciphers = List.new();
+                  ciphers.push(4865);  // TLS_AES_128_GCM_SHA256
+
+                  let mut groups = List.new();
+                  groups.push(group_secp256r1());
+
+                  let mut alpn = List.new();
+                  alpn.push("http/1.1");
+
+                  let ch_msg = build_test_client_hello(ciphers, groups, group_secp256r1(), c_ecdh_pub.clone(), alpn, Some("example.com"), false);
+
+                  match handle_client_hello_explicit(&mut session, &ch_msg, &s_rand, &s_xpriv) {
+                    Ok(flight) => {
+                      let records = flight_records(&flight);
+                      if records.len() != 3 {
+                        return 206;
+                      }
+
+                      let sh_rec = get_record(&records, 0);
+                      let sh_raw = slice_bytes(&sh_rec, 5, sh_rec.byte_len());
+                      let s_pub_bytes = slice_bytes(&sh_raw, sh_raw.byte_len() - 65, sh_raw.byte_len());
+
+                      let shared_sec = derive_p256_shared(&c_ecdh_priv, &s_pub_bytes);
+                      if shared_sec.byte_len() != 32 {
+                        return 207;
+                      }
+
+                      let suite = CipherSuite.TlsAes128GcmSha256;
+                      let early_sec = early_secret(&suite);
+                      let hs_sec = handshake_secret(&suite, &early_sec, &shared_sec);
+
+                      let mut client_transcript = Bytes.new();
+                      client_transcript.extend(&ch_msg);
+                      client_transcript.extend(&sh_raw);
+
+                      let th_sh = transcript_hash_for_suite(&suite, &client_transcript);
+                      let s_hs_sec = server_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+                      let c_hs_sec = client_handshake_traffic_secret(&suite, &hs_sec, &th_sh);
+
+                      let mut client_rx_hs = new_record_protection(RecordDirection.Receive, suite.clone(), s_hs_sec.clone());
+                      let mut client_tx_hs = new_record_protection(RecordDirection.Transmit, suite.clone(), c_hs_sec.clone());
+
+                      let enc_flight = get_record(&records, 2);
+                      match open_record(&mut client_rx_hs, &enc_flight) {
+                        Ok(out) => {
+                          let pt = open_outcome_plaintext(&out);
+                          client_transcript.extend(&pt);
+
+                          let c_ccs_rec = build_ccs_record();
+                          match handle_client_record(&mut session, &c_ccs_rec) {
+                            Ok(None) => {
+                              let th_sf = transcript_hash_for_suite(&suite, &client_transcript);
+                              let c_fin_msg = build_finished(&suite, &c_hs_sec, &th_sf);
+                              return match seal_record(&mut client_tx_hs, &ContentType.Handshake, &c_fin_msg, 0) {
+                                Ok(c_fin_rec) => match handle_client_record(&mut session, &c_fin_rec) {
+                                  Ok(None) => match handshake_phase(&session) {
+                                    HandshakePhase.Connected => 0,
+                                    _ => 212,
+                                  },
+                                  _ => 211,
+                                },
+                                Err(_) => 210,
+                              };
+                            }
+                            _ => {
+                              return 209;
+                            }
+                          }
+                        }
+                        Err(_) => {
+                          return 208;
+                        }
+                      }
+                    }
+                    Err(_) => {
+                      return 205;
+                    }
+                  }
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_interop_client_hello_openssl_variations() -> Int
+  intent "OpenSSL 3.x 形式の ClientHello（GREASE・複数スイート・OpenSSL 提示順）の相互運用試験"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(s_xpriv) => {
+          match test_client_x25519_priv() {
+            Ok(c_xpriv) => {
+              let c_xpub = x25519_public_key(&c_xpriv).as_bytes();
+              let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+              let mut session = new_test_session(&ecdsa_priv);
+
+              // OpenSSL 3.x で一般的な提示順
+              let mut ciphers = List.new();
+              ciphers.push(4866);  // TLS_AES_256_GCM_SHA384
+              ciphers.push(4867);  // TLS_CHACHA20_POLY1305_SHA256
+              ciphers.push(4865);  // TLS_AES_128_GCM_SHA256
+              ciphers.push(49196);  // レガシー暗号スイート（読み飛ばし対象）
+
+              let mut groups = List.new();
+              groups.push(group_x25519());
+              groups.push(group_secp256r1());
+              groups.push(24);  // secp384r1 (未知・読み飛ばし対象)
+
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+
+              // GREASE 拡張 0x5a5a を付与
+              let ch_msg = build_test_client_hello(ciphers, groups, group_x25519(), c_xpub, alpn, Some("example.com"), true);
+
+              match parse_client_hello(&ch_msg) {
+                Ok(ch_parsed) => {
+                  match client_hello_server_name(&ch_parsed) {
+                    Some(ServerName.Valid(sn)) => {
+                      if sn != "example.com" {
+                        return 305;
+                      }
+
+                      match handle_client_hello_explicit(&mut session, &ch_msg, &s_rand, &s_xpriv) {
+                        Ok(flight) => {
+                          let records = flight_records(&flight);
+                          if records.len() != 3 {
+                            return 308;
+                          }
+                          return 0;
+                        }
+                        Err(_) => {
+                          return 307;
+                        }
+                      }
+                    }
+                    _ => {
+                      return 306;
+                    }
+                  }
+                }
+                Err(_) => {
+                  return 304;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_interop_client_hello_curl_variations() -> Int
+  intent "curl 形式の ClientHello（ALPN http/1.1・SNI・AES 提示）の相互運用試験"
+  requires none
+  ensures none
+  effects none
+{
+  match test_ecdsa_priv() {
+    Ok(ecdsa_priv) => {
+      match test_server_x25519_priv() {
+        Ok(s_xpriv) => {
+          match test_client_x25519_priv() {
+            Ok(c_xpriv) => {
+              let c_xpub = x25519_public_key(&c_xpriv).as_bytes();
+              let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+              let mut session = new_test_session(&ecdsa_priv);
+
+              let mut ciphers = List.new();
+              ciphers.push(4865);  // TLS_AES_128_GCM_SHA256
+              ciphers.push(4866);  // TLS_AES_256_GCM_SHA384
+              ciphers.push(4867);  // TLS_CHACHA20_POLY1305_SHA256
+
+              let mut groups = List.new();
+              groups.push(group_x25519());
+
+              let mut alpn = List.new();
+              alpn.push("http/1.1");
+
+              let ch_msg = build_test_client_hello(ciphers, groups, group_x25519(), c_xpub, alpn, Some("example.com"), false);
+
+              match handle_client_hello_explicit(&mut session, &ch_msg, &s_rand, &s_xpriv) {
+                Ok(flight) => {
+                  if flight_records(&flight).len() != 3 {
+                    return 405;
+                  }
+                  return 0;
+                }
+                Err(_) => {
+                  return 404;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(e) => {
+      return e;
+    }
+  }
+}
+
+fn test_interop_sni_and_alpn_rejections() -> Int
+  intent "未登録 SNI および http/1.1 を含まない ALPN の拒絶（決定 1, 決定 2.4）試験"
+  requires none
+  ensures none
+  effects none
+{
+  let priv_pem = get_test_pkcs8_pem();
+  let chain_pem = get_test_fullchain_pem();
+  let mut names = List.new();
+  names.push("example.com");
+
+  match load_bundle_from_pem_text(&chain_pem, &priv_pem, &names, Some(1748736000)) {
+    Ok(bundle) => {
+      let mut bundles = List.new();
+      bundles.push(bundle);
+      match new_certificate_store(bundles, None) {
+        Ok(store) => {
+          // 1. 未登録 SNI ("unknown.org") -> unrecognized_name (112)
+          let unknown_sni = Some("unknown.org");
+          match select_certificate_for_sni(&store, &unknown_sni) {
+            Err(AlertDescription.UnrecognizedName) => {}
+            _ => {
+              return 502;
+            }
+          }
+        }
+        Err(_) => {
+          return 501;
+        }
+      }
+
+      // 2. 平文致命的アラートレコード構築の検証
+      let alert_rec = build_plaintext_fatal_alert_record(&AlertDescription.UnrecognizedName);
+      if alert_rec.byte_len() != 7 {
+        return 503;
+      }
+      if alert_rec.get(0).unwrap_or(0) != 21 || alert_rec.get(5).unwrap_or(0) != 2 || alert_rec.get(6).unwrap_or(0) != 112 {
+        return 504;
+      }
+
+      // 3. http/1.1 を含まない ALPN ("h2" のみ) -> no_application_protocol (120)
+      match test_ecdsa_priv() {
+        Ok(ecdsa_priv) => {
+          let mut s_bundle = new_test_session(&ecdsa_priv);
+          match test_client_x25519_priv() {
+            Ok(c_xpriv) => {
+              match test_server_x25519_priv() {
+                Ok(s_xpriv) => {
+                  let s_rand = hex_decode("707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f");
+                  let mut ciphers = List.new();
+                  ciphers.push(4865);
+                  let mut groups = List.new();
+                  groups.push(group_x25519());
+                  let mut alpn_h2 = List.new();
+                  alpn_h2.push("h2");
+
+                  let ch_h2 = build_test_client_hello(ciphers, groups, group_x25519(), x25519_public_key(&c_xpriv).as_bytes(), alpn_h2, Some("example.com"), false);
+
+                  return match handle_client_hello_explicit(&mut s_bundle, &ch_h2, &s_rand, &s_xpriv) {
+                    Err(ShieldError.Fatal(AlertDescription.NoApplicationProtocol)) => 0,
+                    _ => 507,
+                  };
+                }
+                Err(e) => {
+                  return e;
+                }
+              }
+            }
+            Err(e) => {
+              return e;
+            }
+          }
+        }
+        Err(e) => {
+          return e;
+        }
+      }
+    }
+    Err(_) => {
+      return 501;
+    }
+  }
+}
+
+fn test_interop_proxy_v2_and_502() -> Int
+  intent "PROXY protocol v2 ヘッダー付与・解析および 502 Bad Gateway 応答（決定 5.1, 5.3）試験"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. PROXY v2 ヘッダーの生成
+  let src_ip = new_ipv4(192, 168, 1, 50);
+  let dst_ip = new_ipv4(127, 0, 0, 1);
+  let ep = ProxyEndpoint.IPv4(src_ip, 54321, dst_ip, 8443);
+  let authority = Some("example.com");
+
+  match build_proxy_v2_header(&ep, &authority) {
+    Ok(proxy_hdr) => {
+      // ADR 0063 決定 5.1: ヘッダー全体は 1 KiB 以下
+      if proxy_hdr.byte_len() > 1024 {
+        return 602;
+      }
+
+      // PROXY v2 解析照合
+      match parse_proxy_v2_header(&proxy_hdr) {
+        Ok(parsed) => {
+          if !parsed_has_authority(&parsed) || parsed_authority(&parsed) != "example.com" {
+            return 604;
+          }
+          if !parsed_has_ssl_tlv(&parsed) || parsed_ssl_version(&parsed) != "TLSv1.3" {
+            return 605;
+          }
+          if parsed_src_port(&parsed) != 54321 || parsed_dst_port(&parsed) != 8443 {
+            return 606;
+          }
+
+          // 2. 固定 502 Bad Gateway 応答と close_notify
+          let bad_gw = build_502_bad_gateway_response();
+          if bad_gw.byte_len() == 0 {
+            return 607;
+          }
+
+          let suite = CipherSuite.TlsAes128GcmSha256;
+          let mut dummy_sec = Bytes.new();
+          let mut b = 0;
+          while b < 32 {
+            dummy_sec.push(b + 1);
+            b = b + 1;
+          }
+          let mut prot = new_record_protection(RecordDirection.Transmit, suite, dummy_sec);
+          match build_close_notify_record(&mut prot) {
+            Ok(cn_rec) => {
+              if cn_rec.byte_len() == 0 {
+                return 609;
+              }
+              return 0;
+            }
+            Err(_) => {
+              return 608;
+            }
+          }
+        }
+        Err(_) => {
+          return 603;
+        }
+      }
+    }
+    Err(_) => {
+      return 601;
+    }
+  }
+}
+
+pub fn main() -> Int
+  intent "Stage 7 相互運用・負荷実測・公開前記録の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  let r1 = test_handshake_benchmark_x25519();
+  if r1 != 0 {
+    return r1;
+  }
+
+  let r2 = test_handshake_benchmark_p256();
+  if r2 != 0 {
+    return r2;
+  }
+
+  let r3 = test_interop_client_hello_openssl_variations();
+  if r3 != 0 {
+    return r3;
+  }
+
+  let r4 = test_interop_client_hello_curl_variations();
+  if r4 != 0 {
+    return r4;
+  }
+
+  let r5 = test_interop_sni_and_alpn_rejections();
+  if r5 != 0 {
+    return r5;
+  }
+
+  let r6 = test_interop_proxy_v2_and_502();
+  if r6 != 0 {
+    return r6;
+  }
+
+  return 0;
+}
