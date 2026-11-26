@@ -1,0 +1,1149 @@
+module shield_x509
+  targets server
+  trust none
+
+use shield_asn1.Asn1Element;
+use shield_asn1.Asn1Error;
+use shield_asn1.read_children;
+use shield_asn1.read_element;
+use shield_asn1.tag_bit_string;
+use shield_asn1.tag_context_0;
+use shield_asn1.tag_context_3;
+use shield_asn1.tag_context_primitive_2;
+use shield_asn1.tag_generalized_time;
+use shield_asn1.tag_integer;
+use shield_asn1.tag_octet_string;
+use shield_asn1.tag_oid;
+use shield_asn1.tag_sequence;
+use shield_asn1.tag_utc_time;
+use shield_limits.max_cert_chain_count;
+use shield_limits.max_san_count;
+use shield_limits.max_single_cert_size;
+use shield_pem.PemBlock;
+
+// X.509 証明書および P-256 秘密鍵の検証・読み取り（ADR 0063 決定 2.2, 2.3）
+// - PKCS#8（BEGIN PRIVATE KEY）および SEC1（BEGIN EC PRIVATE KEY）の P-256 鍵のみ受理
+// - 暗号化鍵・RSA・Ed25519・他曲線の明示的拒否
+// - X.509 v3 の厳密な検証（DER 長・入れ子・SPKI と秘密鍵の一致・有効期間・SAN 充足・チェーン連接）
+// - サーバーはリーフ・チェーンの署名を検証しない（署名値は読み飛ばす）
+
+pub struct ParsedCertificate {
+  raw_der: Bytes,
+  version: Int,
+  serial_number: Bytes,
+  issuer_der: Bytes,
+  not_before: Int,
+  not_after: Int,
+  subject_der: Bytes,
+  spki_alg_oid: Bytes,
+  spki_curve_oid: Bytes,
+  spki_public_key: Bytes,
+  san_dns_names: List<String>,
+}
+
+pub enum CertError {
+  Asn1(Asn1Error),
+  CertTooLarge(Int, Int),
+  InvalidVersion(Int),
+  UnsupportedAlgorithm(String),
+  UnsupportedCurve(String),
+  EncryptedKeyForbidden,
+  InvalidPrivateKey,
+  InvalidPublicKey,
+  PublicKeyMismatch,
+  ClockUnavailable,
+  CertificateNotYetValid(Int, Int),
+  CertificateExpired(Int, Int),
+  ChainIssuerMismatch(Int),
+  ChainEmpty,
+  ChainTooLong(Int, Int),
+  SanCountExceeded(Int, Int),
+  ConfiguredNameNotCovered(String),
+  DuplicateConfiguredName(String),
+  InsecureFilePermissions(Int),
+  InvalidSubpath(String),
+  Io(String),
+}
+
+pub fn bytes_equal(a: &Bytes, b: &Bytes) -> Bool
+  intent "2 つの Bytes が等しいか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if a.byte_len() != b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.byte_len() {
+    if a.get(i).unwrap_or(0) != b.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+// OID 定義
+// id-ecPublicKey: 1.2.840.10045.2.1 -> [42, 134, 72, 206, 61, 2, 1]
+pub fn oid_id_ec_public_key() -> Bytes
+  intent "id-ecPublicKey OID バイト列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.with_capacity(7);
+  b.push(42);
+  b.push(134);
+  b.push(72);
+  b.push(206);
+  b.push(61);
+  b.push(2);
+  b.push(1);
+  return b;
+}
+
+// secp256r1 / prime256v1: 1.2.840.10045.3.1.7 -> [42, 134, 72, 206, 61, 3, 1, 7]
+pub fn oid_secp256r1() -> Bytes
+  intent "secp256r1 OID バイト列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.with_capacity(8);
+  b.push(42);
+  b.push(134);
+  b.push(72);
+  b.push(206);
+  b.push(61);
+  b.push(3);
+  b.push(1);
+  b.push(7);
+  return b;
+}
+
+// rsaEncryption: 1.2.840.113549.1.1.1 -> [42, 134, 72, 134, 247, 13, 1, 1, 1]
+pub fn oid_rsa() -> Bytes
+  intent "rsaEncryption OID バイト列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.with_capacity(9);
+  b.push(42);
+  b.push(134);
+  b.push(72);
+  b.push(134);
+  b.push(247);
+  b.push(13);
+  b.push(1);
+  b.push(1);
+  b.push(1);
+  return b;
+}
+
+// ed25519: 1.3.101.112 -> [43, 101, 112]
+pub fn oid_ed25519() -> Bytes
+  intent "ed25519 OID バイト列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.with_capacity(3);
+  b.push(43);
+  b.push(101);
+  b.push(112);
+  return b;
+}
+
+// secp384r1: 1.3.132.0.34 -> [43, 129, 4, 0, 34]
+pub fn oid_secp384r1() -> Bytes
+  intent "secp384r1 OID バイト列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.with_capacity(5);
+  b.push(43);
+  b.push(129);
+  b.push(4);
+  b.push(0);
+  b.push(34);
+  return b;
+}
+
+// subjectAltName: 2.5.29.17 -> [85, 29, 17]
+pub fn oid_subject_alt_name() -> Bytes
+  intent "subjectAltName OID バイト列"
+  requires none
+  ensures none
+  effects none
+{
+  let mut b = Bytes.with_capacity(3);
+  b.push(85);
+  b.push(29);
+  b.push(17);
+  return b;
+}
+
+fn read_elem_cert(data: &Bytes, offset: Int) -> Result<Asn1Element, CertError>
+  intent "DER 要素を読み取り、Asn1Error を CertError に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  return match read_element(&data, offset) {
+    Ok(e) => Ok(e),
+    Err(err) => Err(CertError.Asn1(err)),
+  };
+}
+
+fn read_children_cert(container: &Asn1Element) -> Result<List<Asn1Element>, CertError>
+  intent "子要素を読み取り、Asn1Error を CertError に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  return match read_children(&container) {
+    Ok(c) => Ok(c),
+    Err(err) => Err(CertError.Asn1(err)),
+  };
+}
+
+fn parse_digit(c: Int) -> Result<Int, CertError>
+  intent "ASCII 数字文字コードを数値 (0-9) に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return Ok(c - 48);
+  }
+  return Err(CertError.Asn1(Asn1Error.InvalidValue("Invalid digit in time")));
+}
+
+fn is_leap_year(year: Int) -> Bool
+  intent "閏年判定を行う"
+  requires none
+  ensures none
+  effects none
+{
+  return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+fn date_to_unix_seconds(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int) -> Result<Int, CertError>
+  intent "年月日時分秒を 1970-01-01 00:00:00 UTC 起点の Unix 秒に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60 {
+    return Err(CertError.Asn1(Asn1Error.InvalidValue("Date components out of range")));
+  }
+
+  let mut days = 0;
+  let mut y = 1970;
+  while y < year {
+    if is_leap_year(y) {
+      days = days + 366;
+    } else {
+      days = days + 365;
+    }
+    y = y + 1;
+  }
+
+  let leap = is_leap_year(year);
+  let mut m = 1;
+  while m < month {
+    if m == 2 {
+      if leap {
+        days = days + 29;
+      } else {
+        days = days + 28;
+      }
+    } else if m == 4 || m == 6 || m == 9 || m == 11 {
+      days = days + 30;
+    } else {
+      days = days + 31;
+    }
+    m = m + 1;
+  }
+
+  days = days + (day - 1);
+  let secs = days * 86400 + hour * 3600 + minute * 60 + second;
+  return Ok(secs);
+}
+
+pub fn parse_asn1_time(elem: &Asn1Element) -> Result<Int, CertError>
+  intent "UTCTime または GeneralizedTime 要素を Unix 秒に厳密に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  let blen = elem.content.byte_len();
+
+  if elem.tag == tag_utc_time() {
+    // UTCTime: YYMMDDHHMMSSZ (13 バイト)
+    if blen != 13 {
+      return Err(CertError.Asn1(Asn1Error.InvalidValue("Invalid UTCTime length")));
+    }
+    if elem.content.get(12).unwrap_or(0) != 90 {  // 'Z'
+      return Err(CertError.Asn1(Asn1Error.InvalidValue("UTCTime must end with Z")));
+    }
+
+    let y0 = parse_digit(elem.content.get(0).unwrap_or(0))?;
+    let y1 = parse_digit(elem.content.get(1).unwrap_or(0))?;
+    let mut year = y0 * 10 + y1;
+    if year >= 50 {
+      year = 1900 + year;
+    } else {
+      year = 2000 + year;
+    }
+
+    let m0 = parse_digit(elem.content.get(2).unwrap_or(0))?;
+    let m1 = parse_digit(elem.content.get(3).unwrap_or(0))?;
+    let month = m0 * 10 + m1;
+
+    let d0 = parse_digit(elem.content.get(4).unwrap_or(0))?;
+    let d1 = parse_digit(elem.content.get(5).unwrap_or(0))?;
+    let day = d0 * 10 + d1;
+
+    let h0 = parse_digit(elem.content.get(6).unwrap_or(0))?;
+    let h1 = parse_digit(elem.content.get(7).unwrap_or(0))?;
+    let hour = h0 * 10 + h1;
+
+    let min0 = parse_digit(elem.content.get(8).unwrap_or(0))?;
+    let min1 = parse_digit(elem.content.get(9).unwrap_or(0))?;
+    let minute = min0 * 10 + min1;
+
+    let s0 = parse_digit(elem.content.get(10).unwrap_or(0))?;
+    let s1 = parse_digit(elem.content.get(11).unwrap_or(0))?;
+    let second = s0 * 10 + s1;
+
+    return date_to_unix_seconds(year, month, day, hour, minute, second);
+  }
+
+  if elem.tag == tag_generalized_time() {
+    // GeneralizedTime: YYYYMMDDHHMMSSZ (15 バイト)
+    if blen != 15 {
+      return Err(CertError.Asn1(Asn1Error.InvalidValue("Invalid GeneralizedTime length")));
+    }
+    if elem.content.get(14).unwrap_or(0) != 90 {  // 'Z'
+      return Err(CertError.Asn1(Asn1Error.InvalidValue("GeneralizedTime must end with Z")));
+    }
+
+    let y0 = parse_digit(elem.content.get(0).unwrap_or(0))?;
+    let y1 = parse_digit(elem.content.get(1).unwrap_or(0))?;
+    let y2 = parse_digit(elem.content.get(2).unwrap_or(0))?;
+    let y3 = parse_digit(elem.content.get(3).unwrap_or(0))?;
+    let year = y0 * 1000 + y1 * 100 + y2 * 10 + y3;
+
+    let m0 = parse_digit(elem.content.get(4).unwrap_or(0))?;
+    let m1 = parse_digit(elem.content.get(5).unwrap_or(0))?;
+    let month = m0 * 10 + m1;
+
+    let d0 = parse_digit(elem.content.get(6).unwrap_or(0))?;
+    let d1 = parse_digit(elem.content.get(7).unwrap_or(0))?;
+    let day = d0 * 10 + d1;
+
+    let h0 = parse_digit(elem.content.get(8).unwrap_or(0))?;
+    let h1 = parse_digit(elem.content.get(9).unwrap_or(0))?;
+    let hour = h0 * 10 + h1;
+
+    let min0 = parse_digit(elem.content.get(10).unwrap_or(0))?;
+    let min1 = parse_digit(elem.content.get(11).unwrap_or(0))?;
+    let minute = min0 * 10 + min1;
+
+    let s0 = parse_digit(elem.content.get(12).unwrap_or(0))?;
+    let s1 = parse_digit(elem.content.get(13).unwrap_or(0))?;
+    let second = s0 * 10 + s1;
+
+    return date_to_unix_seconds(year, month, day, hour, minute, second);
+  }
+
+  return Err(CertError.Asn1(Asn1Error.InvalidTag(elem.tag)));
+}
+
+pub fn parse_private_key(block: &PemBlock) -> Result<EcdsaP256PrivateKey, CertError>
+  intent "PEM ブロックから P-256 秘密鍵を厳密に解析する（PKCS#8 または SEC1）"
+  requires none
+  ensures none
+  effects none
+{
+  if block.label == "RSA PRIVATE KEY" {
+    return Err(CertError.UnsupportedAlgorithm("RSA"));
+  }
+  if block.label == "ENCRYPTED PRIVATE KEY" {
+    return Err(CertError.EncryptedKeyForbidden);
+  }
+
+  let mut key_bytes = Bytes.new();
+
+  if block.label == "PRIVATE KEY" {
+    // PKCS#8 PrivateKeyInfo (RFC 5208)
+    // SEQUENCE { version INTEGER, privateKeyAlgorithm AlgorithmIdentifier, privateKey OCTET STRING }
+    let root = read_elem_cert(&block.data, 0)?;
+    if root.tag != tag_sequence() {
+      return Err(CertError.Asn1(Asn1Error.InvalidTag(root.tag)));
+    }
+    let children = read_children_cert(&root)?;
+    if children.len() < 3 {
+      return Err(CertError.InvalidPrivateKey);
+    }
+
+    // version
+    match children.get(0) {
+      Some(ver_elem) => {
+        if ver_elem.tag != tag_integer() {
+          return Err(CertError.InvalidPrivateKey);
+        }
+      }
+      None => {
+        return Err(CertError.InvalidPrivateKey);
+      }
+    }
+
+    // privateKeyAlgorithm
+    match children.get(1) {
+      Some(alg_elem) => {
+        let alg_children = read_children_cert(&alg_elem)?;
+        if alg_children.len() == 0 {
+          return Err(CertError.InvalidPrivateKey);
+        }
+        match alg_children.get(0) {
+          Some(alg_oid_elem) => {
+            if alg_oid_elem.tag != tag_oid() {
+              return Err(CertError.InvalidPrivateKey);
+            }
+            if bytes_equal(&alg_oid_elem.content, &oid_rsa()) {
+              return Err(CertError.UnsupportedAlgorithm("RSA"));
+            }
+            if bytes_equal(&alg_oid_elem.content, &oid_ed25519()) {
+              return Err(CertError.UnsupportedAlgorithm("Ed25519"));
+            }
+            if !bytes_equal(&alg_oid_elem.content, &oid_id_ec_public_key()) {
+              return Err(CertError.UnsupportedAlgorithm("Unknown"));
+            }
+          }
+          None => {
+            return Err(CertError.InvalidPrivateKey);
+          }
+        }
+        if alg_children.len() < 2 {
+          return Err(CertError.InvalidPrivateKey);
+        }
+        match alg_children.get(1) {
+          Some(curve_oid_elem) => {
+            if curve_oid_elem.tag != tag_oid() {
+              return Err(CertError.InvalidPrivateKey);
+            }
+            if bytes_equal(&curve_oid_elem.content, &oid_secp384r1()) {
+              return Err(CertError.UnsupportedCurve("secp384r1"));
+            }
+            if !bytes_equal(&curve_oid_elem.content, &oid_secp256r1()) {
+              return Err(CertError.UnsupportedCurve("Unknown"));
+            }
+          }
+          None => {
+            return Err(CertError.InvalidPrivateKey);
+          }
+        }
+      }
+      None => {
+        return Err(CertError.InvalidPrivateKey);
+      }
+    }
+
+    // privateKey (OCTET STRING containing SEC1 ECPrivateKey)
+    match children.get(2) {
+      Some(pk_elem) => {
+        if pk_elem.tag != tag_octet_string() {
+          return Err(CertError.InvalidPrivateKey);
+        }
+        if pk_elem.content.get(0).unwrap_or(0) == tag_sequence() {
+          let sec1_root = read_elem_cert(&pk_elem.content, 0)?;
+          let sec1_children = read_children_cert(&sec1_root)?;
+          if sec1_children.len() < 2 {
+            return Err(CertError.InvalidPrivateKey);
+          }
+          match sec1_children.get(1) {
+            Some(key_octets_elem) => {
+              if key_octets_elem.tag != tag_octet_string() {
+                return Err(CertError.InvalidPrivateKey);
+              }
+              key_bytes = key_octets_elem.content.clone();
+            }
+            None => {
+              return Err(CertError.InvalidPrivateKey);
+            }
+          }
+        } else {
+          key_bytes = pk_elem.content.clone();
+        }
+      }
+      None => {
+        return Err(CertError.InvalidPrivateKey);
+      }
+    }
+  } else if block.label == "EC PRIVATE KEY" {
+    // SEC1 ECPrivateKey (RFC 5915)
+    // SEQUENCE { version INTEGER, privateKey OCTET STRING, [0] parameters EXPLICIT OID OPTIONAL, [1] publicKey ... }
+    let root = read_elem_cert(&block.data, 0)?;
+    if root.tag != tag_sequence() {
+      return Err(CertError.Asn1(Asn1Error.InvalidTag(root.tag)));
+    }
+    let children = read_children_cert(&root)?;
+    if children.len() < 2 {
+      return Err(CertError.InvalidPrivateKey);
+    }
+
+    match children.get(0) {
+      Some(ver_elem) => {
+        if ver_elem.tag != tag_integer() {
+          return Err(CertError.InvalidPrivateKey);
+        }
+      }
+      None => {
+        return Err(CertError.InvalidPrivateKey);
+      }
+    }
+
+    match children.get(1) {
+      Some(key_elem) => {
+        if key_elem.tag != tag_octet_string() {
+          return Err(CertError.InvalidPrivateKey);
+        }
+        key_bytes = key_elem.content.clone();
+      }
+      None => {
+        return Err(CertError.InvalidPrivateKey);
+      }
+    }
+
+    // 曲線パラメータが指定されている場合は検証する
+    let mut ci = 2;
+    while ci < children.len() {
+      match children.get(ci) {
+        Some(opt_elem) => {
+          if opt_elem.tag == tag_context_0() {
+            let params = read_children_cert(&opt_elem)?;
+            match params.get(0) {
+              Some(param_oid) => {
+                if param_oid.tag == tag_oid() {
+                  if bytes_equal(&param_oid.content, &oid_secp384r1()) {
+                    return Err(CertError.UnsupportedCurve("secp384r1"));
+                  }
+                  if !bytes_equal(&param_oid.content, &oid_secp256r1()) {
+                    return Err(CertError.UnsupportedCurve("Unknown"));
+                  }
+                }
+              }
+              None => {}
+            }
+          }
+        }
+        None => {}
+      }
+      ci = ci + 1;
+    }
+  } else {
+    return Err(CertError.UnsupportedAlgorithm(block.label.clone()));
+  }
+
+  if key_bytes.byte_len() != 32 {
+    return Err(CertError.InvalidPrivateKey);
+  }
+
+  // 鍵を読み込み後すぐ Secret に入れる（決定 2.2）
+  let secret = Secret.from_bytes(key_bytes);
+  return match EcdsaP256PrivateKey.from_secret(secret) {
+    Ok(pk) => Ok(pk),
+    Err(_) => Err(CertError.InvalidPrivateKey),
+  };
+}
+
+pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
+  intent "X.509 v3 証明書の DER を厳密に解析する"
+  requires none
+  ensures none
+  effects none
+{
+  let dlen = der.byte_len();
+  if dlen > max_single_cert_size() {
+    return Err(CertError.CertTooLarge(dlen, max_single_cert_size()));
+  }
+
+  let root = read_elem_cert(&der, 0)?;
+  if root.tag != tag_sequence() {
+    return Err(CertError.Asn1(Asn1Error.InvalidTag(root.tag)));
+  }
+  if root.total_len != dlen {
+    return Err(CertError.Asn1(Asn1Error.TrailingBytesInContainer));
+  }
+
+  // Certificate SEQUENCE { tbsCertificate TBSCertificate, signatureAlgorithm AlgorithmIdentifier, signatureValue BIT STRING }
+  let cert_children = read_children_cert(&root)?;
+  if cert_children.len() != 3 {
+    return Err(CertError.Asn1(Asn1Error.InvalidValue("Certificate must have exactly 3 children")));
+  }
+
+  // 外側の署名アルゴリズム (signatureAlgorithm: AlgorithmIdentifier) の構造検証
+  let mut outer_sig_alg_raw = Bytes.new();
+  match cert_children.get(1) {
+    Some(outer_sig_alg) => {
+      if outer_sig_alg.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(outer_sig_alg.tag)));
+      }
+      let sig_alg_children = read_children_cert(&outer_sig_alg)?;
+      if sig_alg_children.len() < 1 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("signatureAlgorithm must have at least 1 field")));
+      }
+      match sig_alg_children.get(0) {
+        Some(oid_elem) => {
+          if oid_elem.tag != tag_oid() {
+            return Err(CertError.Asn1(Asn1Error.InvalidTag(oid_elem.tag)));
+          }
+          if oid_elem.content.byte_len() == 0 {
+            return Err(CertError.Asn1(Asn1Error.InvalidValue("signatureAlgorithm OID is empty")));
+          }
+        }
+        None => {
+          return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+        }
+      }
+      outer_sig_alg_raw = outer_sig_alg.raw.clone();
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 外側の署名値 (signatureValue: BIT STRING) の構造検証
+  match cert_children.get(2) {
+    Some(sig_val_elem) => {
+      if sig_val_elem.tag != tag_bit_string() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(sig_val_elem.tag)));
+      }
+      let sig_len = sig_val_elem.content.byte_len();
+      if sig_len < 2 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("signatureValue BIT STRING is too short")));
+      }
+      let unused_bits = sig_val_elem.content.get(0).unwrap_or(255);
+      if unused_bits > 7 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("Invalid unused bits in signatureValue")));
+      }
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  let mut tbs_children = List.new();
+  match cert_children.get(0) {
+    Some(tbs_elem) => {
+      if tbs_elem.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(tbs_elem.tag)));
+      }
+      tbs_children = read_children_cert(&tbs_elem)?;
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+  if tbs_children.len() < 7 {
+    return Err(CertError.Asn1(Asn1Error.InvalidValue("TBSCertificate has too few fields")));
+  }
+
+  // 1. Version: [0] EXPLICIT Version (Tag 160 / 0xA0)
+  // X.509 v3 では必須で値は 2（決定 2.3）
+  match tbs_children.get(0) {
+    Some(ver_outer) => {
+      if ver_outer.tag != tag_context_0() {
+        return Err(CertError.InvalidVersion(1));
+      }
+      let ver_children = read_children_cert(&ver_outer)?;
+      match ver_children.get(0) {
+        Some(ver_inner) => {
+          if ver_inner.tag != tag_integer() {
+            return Err(CertError.InvalidVersion(1));
+          }
+          let v_val = ver_inner.content.get(0).unwrap_or(0);
+          if ver_inner.content.byte_len() != 1 || v_val != 2 {
+            return Err(CertError.InvalidVersion(v_val + 1));
+          }
+        }
+        None => {
+          return Err(CertError.InvalidVersion(1));
+        }
+      }
+    }
+    None => {
+      return Err(CertError.InvalidVersion(1));
+    }
+  }
+
+  // 2. serialNumber
+  let mut serial_number = Bytes.new();
+  match tbs_children.get(1) {
+    Some(sn_elem) => {
+      if sn_elem.tag != tag_integer() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(sn_elem.tag)));
+      }
+      serial_number = sn_elem.content.clone();
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 3. signature (AlgorithmIdentifier)
+  match tbs_children.get(2) {
+    Some(sig_alg_elem) => {
+      if sig_alg_elem.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(sig_alg_elem.tag)));
+      }
+      if !bytes_equal(&sig_alg_elem.raw, &outer_sig_alg_raw) {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("Certificate signatureAlgorithm mismatch between outer and TBS")));
+      }
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 4. issuer (Name SEQUENCE)
+  let mut issuer_der = Bytes.new();
+  match tbs_children.get(3) {
+    Some(issuer_elem) => {
+      if issuer_elem.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(issuer_elem.tag)));
+      }
+      issuer_der = issuer_elem.raw.clone();
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 5. validity (SEQUENCE { notBefore Time, notAfter Time })
+  let mut not_before = 0;
+  let mut not_after = 0;
+  match tbs_children.get(4) {
+    Some(val_elem) => {
+      if val_elem.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(val_elem.tag)));
+      }
+      let val_children = read_children_cert(&val_elem)?;
+      if val_children.len() != 2 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("Validity must have 2 fields")));
+      }
+      match val_children.get(0) {
+        Some(nb_elem) => {
+          not_before = parse_asn1_time(&nb_elem)?;
+        }
+        None => {
+          return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+        }
+      }
+      match val_children.get(1) {
+        Some(na_elem) => {
+          not_after = parse_asn1_time(&na_elem)?;
+        }
+        None => {
+          return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+        }
+      }
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 6. subject (Name SEQUENCE)
+  let mut subject_der = Bytes.new();
+  match tbs_children.get(5) {
+    Some(subj_elem) => {
+      if subj_elem.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(subj_elem.tag)));
+      }
+      subject_der = subj_elem.raw.clone();
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 7. subjectPublicKeyInfo (SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING })
+  let mut spki_alg_oid = Bytes.new();
+  let mut spki_curve_oid = Bytes.new();
+  let mut spki_public_key = Bytes.new();
+  match tbs_children.get(6) {
+    Some(spki_elem) => {
+      if spki_elem.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(spki_elem.tag)));
+      }
+      let spki_children = read_children_cert(&spki_elem)?;
+      if spki_children.len() != 2 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("SPKI must have 2 fields")));
+      }
+
+      match spki_children.get(0) {
+        Some(spki_alg_elem) => {
+          let spki_alg_children = read_children_cert(&spki_alg_elem)?;
+          if spki_alg_children.is_empty() {
+            return Err(CertError.InvalidPublicKey);
+          }
+          match spki_alg_children.get(0) {
+            Some(alg_id_elem) => {
+              if alg_id_elem.tag != tag_oid() {
+                return Err(CertError.InvalidPublicKey);
+              }
+              spki_alg_oid = alg_id_elem.content.clone();
+            }
+            None => {
+              return Err(CertError.InvalidPublicKey);
+            }
+          }
+
+          if spki_alg_children.len() > 1 {
+            match spki_alg_children.get(1) {
+              Some(curve_id_elem) => {
+                if curve_id_elem.tag == tag_oid() {
+                  spki_curve_oid = curve_id_elem.content.clone();
+                }
+              }
+              None => {}
+            }
+          }
+        }
+        None => {
+          return Err(CertError.InvalidPublicKey);
+        }
+      }
+
+      match spki_children.get(1) {
+        Some(spk_bitstr) => {
+          if spk_bitstr.tag != tag_bit_string() {
+            return Err(CertError.InvalidPublicKey);
+          }
+          let bslen = spk_bitstr.content.byte_len();
+          if bslen < 1 {
+            return Err(CertError.InvalidPublicKey);
+          }
+          if spk_bitstr.content.get(0).unwrap_or(255) != 0 {
+            return Err(CertError.InvalidPublicKey);
+          }
+          match spk_bitstr.content.slice(1, bslen) {
+            Ok(s) => {
+              spki_public_key = s;
+            }
+            Err(_) => {
+              return Err(CertError.InvalidPublicKey);
+            }
+          }
+        }
+        None => {
+          return Err(CertError.InvalidPublicKey);
+        }
+      }
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 8. extensions: [3] EXPLICIT Extensions (Tag 163 / 0xA3)
+  let mut san_dns_names = List.new();
+  let mut tbs_idx = 7;
+  while tbs_idx < tbs_children.len() {
+    match tbs_children.get(tbs_idx) {
+      Some(ext_outer) => {
+        if ext_outer.tag == tag_context_3() {
+          let ext_seqs = read_children_cert(&ext_outer)?;
+          match ext_seqs.get(0) {
+            Some(ext_seq) => {
+              if ext_seq.tag == tag_sequence() {
+                let extensions = read_children_cert(&ext_seq)?;
+                let mut ei = 0;
+                while ei < extensions.len() {
+                  match extensions.get(ei) {
+                    Some(extension) => {
+                      if extension.tag == tag_sequence() {
+                        let ext_fields = read_children_cert(&extension)?;
+                        if ext_fields.len() >= 2 {
+                          match ext_fields.get(0) {
+                            Some(ext_id) => {
+                              if ext_id.tag == tag_oid() && bytes_equal(&ext_id.content, &oid_subject_alt_name()) {
+                                let val_idx = ext_fields.len() - 1;
+                                match ext_fields.get(val_idx) {
+                                  Some(extn_val) => {
+                                    if extn_val.tag == tag_octet_string() {
+                                      let gn_root = read_elem_cert(&extn_val.content, 0)?;
+                                      if gn_root.tag == tag_sequence() {
+                                        let general_names = read_children_cert(&gn_root)?;
+                                        let mut gi = 0;
+                                        while gi < general_names.len() {
+                                          match general_names.get(gi) {
+                                            Some(gn) => {
+                                              if gn.tag == tag_context_primitive_2() {
+                                                let name_str = match gn.content.to_string_utf8() {
+                                                  Ok(s) => s,
+                                                  Err(_) => "",
+                                                };
+                                                if !name_str.is_empty() {
+                                                  san_dns_names.push(name_str);
+                                                  if san_dns_names.len() > max_san_count() {
+                                                    return Err(CertError.SanCountExceeded(san_dns_names.len(), max_san_count()));
+                                                  }
+                                                }
+                                              }
+                                            }
+                                            None => {}
+                                          }
+                                          gi = gi + 1;
+                                        }
+                                      }
+                                    }
+                                  }
+                                  None => {}
+                                }
+                              }
+                            }
+                            None => {}
+                          }
+                        }
+                      }
+                    }
+                    None => {}
+                  }
+                  ei = ei + 1;
+                }
+              }
+            }
+            None => {}
+          }
+        }
+      }
+      None => {}
+    }
+    tbs_idx = tbs_idx + 1;
+  }
+
+  return Ok(ParsedCertificate { raw_der: der.clone(), version: 3, serial_number: serial_number, issuer_der: issuer_der, not_before: not_before, not_after: not_after, subject_der: subject_der, spki_alg_oid: spki_alg_oid, spki_curve_oid: spki_curve_oid, spki_public_key: spki_public_key, san_dns_names: san_dns_names });
+}
+
+fn ascii_lower_byte(b: Int) -> Int
+  intent "ASCII 英大文字（A-Z）を小文字（a-z）に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 65 && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
+pub fn match_san_pattern(pattern: &String, host: &String) -> Bool
+  intent "SAN パターン（完全一致または *.domain ワイルドカード）とホスト名を照合する（ASCII 大文字小文字不区別）"
+  requires none
+  ensures none
+  effects none
+{
+  let p_bytes = pattern.as_bytes();
+  let h_bytes = host.as_bytes();
+  let plen = p_bytes.byte_len();
+  let hlen = h_bytes.byte_len();
+
+  if plen == 0 || hlen == 0 {
+    return false;
+  }
+
+  // 完全一致照合（ASCII 大文字小文字不区別）
+  if plen == hlen {
+    let mut exact_match = true;
+    let mut i = 0;
+    while i < plen && exact_match {
+      let pb = p_bytes.get(i).unwrap_or(0);
+      let hb = h_bytes.get(i).unwrap_or(0);
+      if ascii_lower_byte(pb) != ascii_lower_byte(hb) {
+        exact_match = false;
+      }
+      i = i + 1;
+    }
+    if exact_match {
+      return true;
+    }
+  }
+
+  // ワイルドカード照合: *.domain（ASCII 大文字小文字不区別）
+  // 先頭の 1 ラベルだけが * で、ちょうど 1 ラベルに一致し、apex ドメイン自身には一致しない（決定 2.4）
+  if plen > 2 && p_bytes.get(0).unwrap_or(0) == 42 && p_bytes.get(1).unwrap_or(0) == 46 {  // "*."
+    let suffix_len = plen - 2;  // domain.tld の長さ
+    if hlen <= suffix_len + 1 {
+      return false;
+    }
+
+    // host が .domain.tld で終わるか検査
+    let host_dot_pos = hlen - suffix_len - 1;
+    if h_bytes.get(host_dot_pos).unwrap_or(0) != 46 {  // '.'
+      return false;
+    }
+
+    let mut si = 0;
+    while si < suffix_len {
+      let pb = p_bytes.get(2 + si).unwrap_or(0);
+      let hb = h_bytes.get(host_dot_pos + 1 + si).unwrap_or(0);
+      if ascii_lower_byte(pb) != ascii_lower_byte(hb) {
+        return false;
+      }
+      si = si + 1;
+    }
+
+    // 先頭のプレフィックス部（host_dot_pos 未満）に '.' が含まれていないこと（ちょうど 1 ラベルのみ）
+    let mut pi = 0;
+    while pi < host_dot_pos {
+      if h_bytes.get(pi).unwrap_or(0) == 46 {
+        return false;
+      }
+      pi = pi + 1;
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+pub fn validate_certificate_chain(chain: &List<ParsedCertificate>, private_key: &EcdsaP256PrivateKey, now_secs: Option<Int>, configured_names: &List<String>) -> Result<Bool, CertError>
+  intent "証明書チェーンおよび秘密鍵の適合性を検査する（決定 2.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let clen = chain.len();
+  if clen == 0 {
+    return Err(CertError.ChainEmpty);
+  }
+  if clen > max_cert_chain_count() {
+    return Err(CertError.ChainTooLong(clen, max_cert_chain_count()));
+  }
+
+  // 時計が取得できない場合は受理しない（決定 2.3）
+  let mut now = 0;
+  match now_secs {
+    Some(t) => {
+      now = t;
+    }
+    None => {
+      return Err(CertError.ClockUnavailable);
+    }
+  }
+
+  // 1. リーフ証明書の公開鍵と秘密鍵の一致検査（リーフのみ P-256 を強制）
+  match chain.get(0) {
+    Some(leaf) => {
+      // アルゴリズム検査
+      if bytes_equal(&leaf.spki_alg_oid, &oid_rsa()) {
+        return Err(CertError.UnsupportedAlgorithm("RSA"));
+      }
+      if bytes_equal(&leaf.spki_alg_oid, &oid_ed25519()) {
+        return Err(CertError.UnsupportedAlgorithm("Ed25519"));
+      }
+      if !bytes_equal(&leaf.spki_alg_oid, &oid_id_ec_public_key()) {
+        return Err(CertError.UnsupportedAlgorithm("Unknown"));
+      }
+
+      // 曲線検査
+      if bytes_equal(&leaf.spki_curve_oid, &oid_secp384r1()) {
+        return Err(CertError.UnsupportedCurve("secp384r1"));
+      }
+      if !bytes_equal(&leaf.spki_curve_oid, &oid_secp256r1()) {
+        return Err(CertError.UnsupportedCurve("Unknown"));
+      }
+
+      // 公開鍵形式検査（65 バイト非圧縮 P-256 形式: 0x04 || X || Y）
+      if leaf.spki_public_key.byte_len() != 65 || leaf.spki_public_key.get(0).unwrap_or(0) != 4 {
+        return Err(CertError.InvalidPublicKey);
+      }
+
+      let derived_pub = ecdsa_p256_public_key(&private_key);
+      let derived_pub_bytes = derived_pub.to_bytes();
+      if !bytes_equal(&leaf.spki_public_key, &derived_pub_bytes) {
+        return Err(CertError.PublicKeyMismatch);
+      }
+
+      // 2. 設定された各名前がリーフ証明書の SAN に包含されているかの検査
+      let mut ni = 0;
+      while ni < configured_names.len() {
+        let name = match configured_names.get(ni) {
+          Some(n) => n.clone(),
+          None => "",
+        };
+        let mut covered = false;
+        let mut sani = 0;
+        while sani < leaf.san_dns_names.len() {
+          let san = match leaf.san_dns_names.get(sani) {
+            Some(s) => s.clone(),
+            None => "",
+          };
+          if match_san_pattern(&san, &name) {
+            covered = true;
+          }
+          sani = sani + 1;
+        }
+        if !covered {
+          return Err(CertError.ConfiguredNameNotCovered(name.clone()));
+        }
+        ni = ni + 1;
+      }
+    }
+    None => {
+      return Err(CertError.ChainEmpty);
+    }
+  }
+
+  // 3. 有効期間の検査（現在時刻が notBefore 以上 notAfter 以下）
+  let mut ci = 0;
+  while ci < clen {
+    match chain.get(ci) {
+      Some(cert) => {
+        if now < cert.not_before {
+          return Err(CertError.CertificateNotYetValid(now, cert.not_before));
+        }
+        if now > cert.not_after {
+          return Err(CertError.CertificateExpired(now, cert.not_after));
+        }
+      }
+      None => {
+        return Err(CertError.ChainEmpty);
+      }
+    }
+    ci = ci + 1;
+  }
+
+  // 4. チェーンの連接検査（リーフ以外は直前証明書の発行者名と自分の主体者名が DER 完全一致）
+  let mut li = 1;
+  while li < clen {
+    match chain.get(li - 1) {
+      Some(prev) => {
+        match chain.get(li) {
+          Some(curr) => {
+            if !bytes_equal(&prev.issuer_der, &curr.subject_der) {
+              return Err(CertError.ChainIssuerMismatch(li));
+            }
+          }
+          None => {
+            return Err(CertError.ChainEmpty);
+          }
+        }
+      }
+      None => {
+        return Err(CertError.ChainEmpty);
+      }
+    }
+    li = li + 1;
+  }
+
+  return Ok(true);
+}

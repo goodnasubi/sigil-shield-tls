@@ -1,0 +1,344 @@
+module shield_asn1
+  targets server
+  trust none
+
+// ASN.1 DER 厳密デコーダ（ADR 0063 決定 2.3）
+// - DER の長さ・入れ子の厳格な検証（不正長・不定長 0x80・非最小長表現の拒否）
+// - コンテナ内の余剰バイト（trailing bytes）の拒否
+
+pub struct Asn1Element {
+  tag: Int,
+  header_len: Int,
+  content_len: Int,
+  total_len: Int,
+  content: Bytes,
+  raw: Bytes,
+}
+
+pub enum Asn1Error {
+  UnexpectedEof,
+  IndefiniteLengthForbidden,
+  NonMinimalLengthEncoding,
+  LengthOutOfRange,
+  TrailingBytesInContainer,
+  InvalidTag(Int),
+  InvalidValue(String),
+}
+
+// 共通 ASN.1 タグ番号
+pub fn tag_boolean() -> Int
+  intent "BOOLEAN タグ (1)"
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn tag_integer() -> Int
+  intent "INTEGER タグ (2)"
+  requires none
+  ensures none
+  effects none
+{
+  return 2;
+}
+
+pub fn tag_bit_string() -> Int
+  intent "BIT STRING タグ (3)"
+  requires none
+  ensures none
+  effects none
+{
+  return 3;
+}
+
+pub fn tag_octet_string() -> Int
+  intent "OCTET STRING タグ (4)"
+  requires none
+  ensures none
+  effects none
+{
+  return 4;
+}
+
+pub fn tag_null() -> Int
+  intent "NULL タグ (5)"
+  requires none
+  ensures none
+  effects none
+{
+  return 5;
+}
+
+pub fn tag_oid() -> Int
+  intent "OBJECT IDENTIFIER タグ (6)"
+  requires none
+  ensures none
+  effects none
+{
+  return 6;
+}
+
+pub fn tag_utf8_string() -> Int
+  intent "UTF8String タグ (12)"
+  requires none
+  ensures none
+  effects none
+{
+  return 12;
+}
+
+pub fn tag_printable_string() -> Int
+  intent "PrintableString タグ (19)"
+  requires none
+  ensures none
+  effects none
+{
+  return 19;
+}
+
+pub fn tag_ia5_string() -> Int
+  intent "IA5String タグ (22)"
+  requires none
+  ensures none
+  effects none
+{
+  return 22;
+}
+
+pub fn tag_utc_time() -> Int
+  intent "UTCTime タグ (23)"
+  requires none
+  ensures none
+  effects none
+{
+  return 23;
+}
+
+pub fn tag_generalized_time() -> Int
+  intent "GeneralizedTime タグ (24)"
+  requires none
+  ensures none
+  effects none
+{
+  return 24;
+}
+
+pub fn tag_sequence() -> Int
+  intent "SEQUENCE タグ (48 / 0x30)"
+  requires none
+  ensures none
+  effects none
+{
+  return 48;
+}
+
+pub fn tag_set() -> Int
+  intent "SET タグ (49 / 0x31)"
+  requires none
+  ensures none
+  effects none
+{
+  return 49;
+}
+
+// コンテキスト固有タグ（Constructed: 0xA0..0xA3）
+pub fn tag_context_0() -> Int
+  intent "コンテキスト固有タグ [0] Constructed (160 / 0xA0)"
+  requires none
+  ensures none
+  effects none
+{
+  return 160;
+}
+
+pub fn tag_context_1() -> Int
+  intent "コンテキスト固有タグ [1] Constructed (161 / 0xA1)"
+  requires none
+  ensures none
+  effects none
+{
+  return 161;
+}
+
+pub fn tag_context_2() -> Int
+  intent "コンテキスト固有タグ [2] Constructed (162 / 0xA2)"
+  requires none
+  ensures none
+  effects none
+{
+  return 162;
+}
+
+pub fn tag_context_3() -> Int
+  intent "コンテキスト固有タグ [3] Constructed (163 / 0xA3)"
+  requires none
+  ensures none
+  effects none
+{
+  return 163;
+}
+
+// コンテキスト固有タグ（Primitive: 0x80..0x83）
+pub fn tag_context_primitive_0() -> Int
+  intent "コンテキスト固有タグ [0] Primitive (128 / 0x80)"
+  requires none
+  ensures none
+  effects none
+{
+  return 128;
+}
+
+pub fn tag_context_primitive_1() -> Int
+  intent "コンテキスト固有タグ [1] Primitive (129 / 0x81)"
+  requires none
+  ensures none
+  effects none
+{
+  return 129;
+}
+
+pub fn tag_context_primitive_2() -> Int
+  intent "コンテキスト固有タグ [2] Primitive dNSName (130 / 0x82)"
+  requires none
+  ensures none
+  effects none
+{
+  return 130;
+}
+
+pub fn tag_context_primitive_3() -> Int
+  intent "コンテキスト固有タグ [3] Primitive (131 / 0x83)"
+  requires none
+  ensures none
+  effects none
+{
+  return 131;
+}
+
+pub fn read_element(data: &Bytes, offset: Int) -> Result<Asn1Element, Asn1Error>
+  intent "DER バイト列から 1 つの ASN.1 要素を厳格に読み取る"
+  requires none
+  ensures none
+  effects none
+{
+  let dlen = data.byte_len();
+  if offset >= dlen {
+    return Err(Asn1Error.UnexpectedEof);
+  }
+
+  let tag = data.get(offset).unwrap_or(0);
+  if offset + 1 >= dlen {
+    return Err(Asn1Error.UnexpectedEof);
+  }
+
+  let len_byte = data.get(offset + 1).unwrap_or(0);
+  let mut content_len = 0;
+  let mut header_len = 2;
+
+  if len_byte < 128 {
+    // 短縮形: 0..127
+    content_len = len_byte;
+    header_len = 2;
+  } else if len_byte == 128 {
+    // 不定長 (0x80) は DER では禁止
+    return Err(Asn1Error.IndefiniteLengthForbidden);
+  } else if len_byte == 255 {
+    // 0xFF は予約・不正
+    return Err(Asn1Error.LengthOutOfRange);
+  } else {
+    // 拡張形 (0x81..0x84)
+    let num_octets = len_byte & 127;
+    if num_octets < 1 || num_octets > 4 {
+      return Err(Asn1Error.LengthOutOfRange);
+    }
+    if offset + 2 + num_octets > dlen {
+      return Err(Asn1Error.UnexpectedEof);
+    }
+
+    // 非最小長エンコーディングの検証: 先頭バイトが 0x00 であってはならない
+    let first_len_octet = data.get(offset + 2).unwrap_or(0);
+    if first_len_octet == 0 {
+      return Err(Asn1Error.NonMinimalLengthEncoding);
+    }
+
+    let mut parsed_len = 0;
+    let mut i = 0;
+    while i < num_octets {
+      let b = data.get(offset + 2 + i).unwrap_or(0);
+      parsed_len = parsed_len * 256 + b;
+      i = i + 1;
+    }
+
+    // 1 オクテット拡張形で値が 128 未満の場合は短縮形を使うべきなので非最小長
+    if num_octets == 1 && parsed_len < 128 {
+      return Err(Asn1Error.NonMinimalLengthEncoding);
+    }
+
+    content_len = parsed_len;
+    header_len = 2 + num_octets;
+  }
+
+  let total_len = header_len + content_len;
+  if offset + total_len > dlen {
+    return Err(Asn1Error.UnexpectedEof);
+  }
+
+  let mut raw_bytes = Bytes.new();
+  match data.slice(offset, offset + total_len) {
+    Ok(s) => {
+      raw_bytes = s;
+    }
+    Err(_) => {
+      return Err(Asn1Error.UnexpectedEof);
+    }
+  }
+
+  let mut content_bytes = Bytes.new();
+  match data.slice(offset + header_len, offset + total_len) {
+    Ok(s) => {
+      content_bytes = s;
+    }
+    Err(_) => {
+      return Err(Asn1Error.UnexpectedEof);
+    }
+  }
+
+  return Ok(Asn1Element { tag: tag, header_len: header_len, content_len: content_len, total_len: total_len, content: content_bytes, raw: raw_bytes });
+}
+
+pub fn read_children(container: &Asn1Element) -> Result<List<Asn1Element>, Asn1Error>
+  intent "コンテナ要素の内容から子要素の一覧を厳格に読み取り、余剰バイトがないことを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut children = List.new();
+  let clen = container.content.byte_len();
+  let mut offset = 0;
+
+  while offset < clen {
+    let elem = read_element(&container.content, offset)?;
+    offset = offset + elem.total_len;
+    children.push(elem);
+  }
+
+  if offset != clen {
+    return Err(Asn1Error.TrailingBytesInContainer);
+  }
+
+  return Ok(children);
+}
+
+pub fn expect_tag(elem: &Asn1Element, expected: Int) -> Result<Bool, Asn1Error>
+  intent "要素のタグが期待値と一致することを検証する"
+  requires none
+  ensures none
+  effects none
+{
+  if elem.tag != expected {
+    return Err(Asn1Error.InvalidTag(elem.tag));
+  }
+  return Ok(true);
+}

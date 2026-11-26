@@ -95,6 +95,51 @@ pub fn max_cert_file_size() -> Int
   return 65536;
 }
 
+pub fn max_single_cert_size() -> Int
+  intent "単一証明書の最大バイト数（16 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 16384;
+}
+
+pub fn default_reload_interval_secs() -> Int
+  intent "証明書の既定再読み込み間隔（300 秒）"
+  requires none
+  ensures none
+  effects none
+{
+  return 300;
+}
+
+pub fn min_reload_interval_secs() -> Int
+  intent "証明書の最小再読み込み間隔（30 秒）"
+  requires none
+  ensures none
+  effects none
+{
+  return 30;
+}
+
+pub fn max_reload_interval_secs() -> Int
+  intent "証明書の最大再読み込み間隔（86400 秒 = 24 時間）"
+  requires none
+  ensures none
+  effects none
+{
+  return 86400;
+}
+
+pub fn cert_expiry_warning_secs() -> Int
+  intent "証明書期限切れ警告を発する猶予秒数（14 日 = 1209600 秒）"
+  requires none
+  ensures none
+  effects none
+{
+  return 1209600;
+}
+
 pub fn max_server_names_count() -> Int
   intent "設定可能な名前の最大数（256 個）"
   requires none

@@ -1,0 +1,600 @@
+module shield_certificate
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_handshake.HandshakeSession;
+use shield_handshake.new_handshake_session;
+use shield_limits.cert_expiry_warning_secs;
+use shield_limits.max_cert_chain_count;
+use shield_limits.max_server_names_count;
+use shield_pem.PemBlock;
+use shield_pem.PemError;
+use shield_pem.parse_pem;
+use shield_x509.CertError;
+use shield_x509.ParsedCertificate;
+use shield_x509.match_san_pattern;
+use shield_x509.parse_certificate;
+use shield_x509.parse_private_key;
+use shield_x509.validate_certificate_chain;
+
+// 証明書の読み込みと管理（ADR 0063 決定 2.2, 2.3, 2.4, 2.5）
+// - ファイル権限 0o077 立入禁止（validate_file_mode）
+// - follow_symlinks(false) による安全なファイル読み取り
+// - SNI の小文字正規化・ドメイン名検証・ワイルドカード照合（決定 2.4）
+// - 一致しない名前・名前なし接続に対する unrecognized_name 致命的アラート送出
+// - default_server_name による暗黙の既定の排除（明示的指定のみ許容）
+// - アトミックな再読み込みと失敗時の旧設定維持（決定 2.5）
+// - 証明書期限切れ監視（14 日前警告、期限切れ後の動作継続）
+
+pub struct CertificateBundle {
+  configured_names: List<String>,
+  cert_chain_der: List<Bytes>,
+  leaf_cert: ParsedCertificate,
+  private_key: EcdsaP256PrivateKey,
+  not_after: Int,
+}
+
+pub struct CertificateStore {
+  bundles: List<CertificateBundle>,
+  default_server_name: Option<String>,
+}
+
+pub enum ExpiryStatus {
+  Valid,
+  ExpiringSoon(Int),  // 残り秒数（14 日以内）
+  Expired(Int),  // 経過秒数（期限切れ）
+}
+
+pub enum ReloadOutcome {
+  Success,
+  PreservedPrevious(String),
+}
+
+pub struct CertificateStoreManager {
+  current_store: Option<CertificateStore>,
+}
+
+pub fn new_store_manager() -> CertificateStoreManager
+  intent "空の CertificateStoreManager を初期化する"
+  requires none
+  ensures none
+  effects none
+{
+  return CertificateStoreManager { current_store: None };
+}
+
+pub fn validate_file_mode(mode: Int) -> Result<Bool, CertError>
+  intent "秘密鍵ファイルの権限ビットに 0o077（グループ・その他）が立っていないか検証する（決定 2.2）"
+  requires none
+  ensures none
+  effects none
+{
+  // 0o077 は 10 進数で 63
+  if (mode & 63) != 0 {
+    return Err(CertError.InsecureFilePermissions(mode));
+  }
+  return Ok(true);
+}
+
+fn is_ascii_digit(c: Int) -> Bool
+  intent "文字コードが 0-9 か判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return c >= 48 && c <= 57;
+}
+
+fn is_ascii_alpha(c: Int) -> Bool
+  intent "文字コードが a-z か判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return c >= 97 && c <= 122;
+}
+
+pub fn normalize_hostname(host: &String) -> Result<String, CertError>
+  intent "ホスト名を ASCII 小文字に正規化し、RFC 1035 / ADR 0063 決定 2.4 の規則を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  let b = host.as_bytes();
+  let blen = b.byte_len();
+
+  if blen == 0 || blen > 253 {
+    return Err(CertError.InvalidSubpath("Host length out of range"));
+  }
+
+  // 末尾の '.' は不一致扱い（決定 2.4）
+  if b.get(blen - 1).unwrap_or(0) == 46 {
+    return Err(CertError.InvalidSubpath("Trailing dot forbidden"));
+  }
+
+  // 先頭の '.' も不一致扱い
+  if b.get(0).unwrap_or(0) == 46 {
+    return Err(CertError.InvalidSubpath("Leading dot forbidden"));
+  }
+
+  // IPv6 リテラル（':' を含む）の検出
+  let mut has_colon = false;
+  let mut norm = Bytes.with_capacity(blen);
+  let mut i = 0;
+  while i < blen {
+    let c = b.get(i).unwrap_or(0);
+    if c == 58 {  // ':'
+      has_colon = true;
+    }
+    // 大文字 A-Z は小文字 a-z に変換
+    if c >= 65 && c <= 90 {
+      norm.push(c + 32);
+    } else {
+      norm.push(c);
+    }
+    i = i + 1;
+  }
+
+  if has_colon {
+    return Err(CertError.InvalidSubpath("IPv6 literal not allowed as SNI"));
+  }
+
+  // ラベルごとの検証
+  let mut all_labels_numeric = true;
+  let mut current_label_numeric = true;
+  let mut label_len = 0;
+  let mut label_start = 0;
+  let mut li = 0;
+
+  while li < blen {
+    let c = norm.get(li).unwrap_or(0);
+    if c == 46 {  // '.'
+      if label_len == 0 || label_len > 63 {
+        return Err(CertError.InvalidSubpath("Label length out of range"));
+      }
+      // ラベル先頭・末尾の '-' は禁止
+      if norm.get(label_start).unwrap_or(0) == 45 || norm.get(li - 1).unwrap_or(0) == 45 {
+        return Err(CertError.InvalidSubpath("Hyphen at label boundary"));
+      }
+      if !current_label_numeric {
+        all_labels_numeric = false;
+      }
+      label_len = 0;
+      label_start = li + 1;
+      current_label_numeric = true;
+    } else {
+      label_len = label_len + 1;
+      let is_dig = is_ascii_digit(c);
+      let is_alp = is_ascii_alpha(c);
+      let is_hyp = c == 45;  // '-'
+
+      if !is_dig && !is_alp && !is_hyp {
+        return Err(CertError.InvalidSubpath("Invalid character in hostname"));
+      }
+      if !is_dig {
+        current_label_numeric = false;
+      }
+    }
+    li = li + 1;
+  }
+
+  if label_len == 0 || label_len > 63 {
+    return Err(CertError.InvalidSubpath("Label length out of range"));
+  }
+  if norm.get(label_start).unwrap_or(0) == 45 || norm.get(blen - 1).unwrap_or(0) == 45 {
+    return Err(CertError.InvalidSubpath("Hyphen at label boundary"));
+  }
+  if !current_label_numeric {
+    all_labels_numeric = false;
+  }
+
+  // 全ラベルが数字の場合は IPv4 リテラルなので拒否（決定 2.4）
+  if all_labels_numeric {
+    return Err(CertError.InvalidSubpath("IPv4 literal not allowed as SNI"));
+  }
+
+  return match norm.to_string_utf8() {
+    Ok(s) => Ok(s),
+    Err(_) => Err(CertError.InvalidSubpath("Invalid UTF-8 in hostname")),
+  };
+}
+
+pub fn normalize_configured_name(name: &String) -> Result<String, CertError>
+  intent "設定された名前（完全修飾ホスト名または *.domain ワイルドカード）を小文字正規化・検証する（決定 2.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  let blen = b.byte_len();
+  if blen > 2 && b.get(0).unwrap_or(0) == 42 && b.get(1).unwrap_or(0) == 46 {
+    // "*."
+    let mut sub_bytes = Bytes.new();
+    match b.slice(2, blen) {
+      Ok(s) => {
+        sub_bytes = s;
+      }
+      Err(_) => {
+        return Err(CertError.InvalidSubpath("Failed to slice wildcard hostname"));
+      }
+    }
+    let mut sub = "";
+    match sub_bytes.to_string_utf8() {
+      Ok(s) => {
+        sub = s;
+      }
+      Err(_) => {
+        return Err(CertError.InvalidSubpath("Invalid UTF-8 in wildcard hostname"));
+      }
+    }
+    let norm_sub = normalize_hostname(&sub)?;
+    let mut out_bytes = Bytes.with_capacity(2 + norm_sub.as_bytes().byte_len());
+    out_bytes.push(42);
+    out_bytes.push(46);
+    out_bytes.extend(&norm_sub.as_bytes());
+    return match out_bytes.to_string_utf8() {
+      Ok(s) => Ok(s),
+      Err(_) => Err(CertError.InvalidSubpath("Invalid UTF-8 in normalized hostname")),
+    };
+  }
+
+  return normalize_hostname(&name);
+}
+
+pub fn new_certificate_bundle(configured_names: List<String>, cert_chain_der: List<Bytes>, leaf_cert: ParsedCertificate, private_key: EcdsaP256PrivateKey) -> CertificateBundle
+  intent "検証済みの証明書バンドルを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  let not_after = leaf_cert.not_after;
+  return CertificateBundle { configured_names: configured_names, cert_chain_der: cert_chain_der, leaf_cert: leaf_cert, private_key: private_key, not_after: not_after };
+}
+
+pub fn empty_certificate_store() -> CertificateStore
+  intent "空の証明書ストアを生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return CertificateStore { bundles: List.new(), default_server_name: None };
+}
+
+pub fn new_certificate_store(bundles: List<CertificateBundle>, default_server_name: Option<String>) -> Result<CertificateStore, CertError>
+  intent "証明書ストアを構築し、名前の重複と上限を検査する（決定 2.4）"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 設定可能な名前の最大数検査（max_server_names_count <= 256）
+  let mut total_names = 0;
+  let mut bi = 0;
+  while bi < bundles.len() {
+    match bundles.get(bi) {
+      Some(b) => {
+        total_names = total_names + b.configured_names.len();
+      }
+      None => {}
+    }
+    bi = bi + 1;
+  }
+
+  if total_names > max_server_names_count() {
+    return Err(CertError.SanCountExceeded(total_names, max_server_names_count()));
+  }
+
+  // 2. 名前の重複検査と正規化（重複した名前の設定は起動時に拒否。決定 2.4）
+  let mut seen_names = List.new();
+  let mut norm_bundles = List.new();
+  bi = 0;
+  while bi < bundles.len() {
+    match bundles.get(bi) {
+      Some(b) => {
+        let mut norm_names = List.new();
+        let mut ni = 0;
+        while ni < b.configured_names.len() {
+          match b.configured_names.get(ni) {
+            Some(name) => {
+              let norm_name = normalize_configured_name(&name)?;
+              let mut si = 0;
+              while si < seen_names.len() {
+                match seen_names.get(si) {
+                  Some(existing) => {
+                    if existing == norm_name {
+                      return Err(CertError.DuplicateConfiguredName(norm_name.clone()));
+                    }
+                  }
+                  None => {}
+                }
+                si = si + 1;
+              }
+              seen_names.push(norm_name.clone());
+              norm_names.push(norm_name);
+            }
+            None => {}
+          }
+          ni = ni + 1;
+        }
+        norm_bundles.push(CertificateBundle { configured_names: norm_names, cert_chain_der: b.cert_chain_der.clone(), leaf_cert: b.leaf_cert.clone(), private_key: b.private_key.clone(), not_after: b.not_after });
+      }
+      None => {}
+    }
+    bi = bi + 1;
+  }
+
+  // 3. default_server_name が設定されている場合、正規化していずれかのバンドルに存在すること
+  let mut norm_default_server_name = None;
+  match &default_server_name {
+    Some(def_raw) => {
+      let def_name = normalize_configured_name(&def_raw)?;
+      let mut found = false;
+      let mut si = 0;
+      while si < seen_names.len() {
+        match seen_names.get(si) {
+          Some(existing) => {
+            if existing == def_name {
+              found = true;
+            }
+          }
+          None => {}
+        }
+        si = si + 1;
+      }
+      if !found {
+        return Err(CertError.ConfiguredNameNotCovered(def_name.clone()));
+      }
+      norm_default_server_name = Some(def_name);
+    }
+    None => {}
+  }
+
+  return Ok(CertificateStore { bundles: norm_bundles, default_server_name: norm_default_server_name });
+}
+
+pub fn select_certificate_for_sni(store: &CertificateStore, raw_sni: &Option<String>) -> Result<Int, AlertDescription>
+  intent "SNI に合致する証明書バンドルのインデックスを返す（不一致時は unrecognized_name アラート）"
+  requires none
+  ensures none
+  effects none
+{
+  match raw_sni {
+    Some(sni_str) => {
+      let mut normalized = "";
+      match normalize_hostname(&sni_str) {
+        Ok(n) => {
+          normalized = n;
+        }
+        Err(_) => {
+          // 不正な SNI（IP リテラル・使えない文字等）は一致しない名前と同じ扱い（決定 2.4）
+          return Err(AlertDescription.UnrecognizedName);
+        }
+      }
+
+      // 1. 完全一致照合
+      let mut bi = 0;
+      while bi < store.bundles.len() {
+        match store.bundles.get(bi) {
+          Some(bundle) => {
+            let mut ni = 0;
+            while ni < bundle.configured_names.len() {
+              match bundle.configured_names.get(ni) {
+                Some(name) => {
+                  if name == normalized {
+                    return Ok(bi);
+                  }
+                }
+                None => {}
+              }
+              ni = ni + 1;
+            }
+          }
+          None => {}
+        }
+        bi = bi + 1;
+      }
+
+      // 2. ワイルドカード照合 (*.domain)
+      bi = 0;
+      while bi < store.bundles.len() {
+        match store.bundles.get(bi) {
+          Some(bundle) => {
+            let mut ni = 0;
+            while ni < bundle.configured_names.len() {
+              match bundle.configured_names.get(ni) {
+                Some(name) => {
+                  if match_san_pattern(&name, &normalized) {
+                    return Ok(bi);
+                  }
+                }
+                None => {}
+              }
+              ni = ni + 1;
+            }
+          }
+          None => {}
+        }
+        bi = bi + 1;
+      }
+
+      // 一致する名前がない場合は unrecognized_name（暗黙の既定証明書は置かない。決定 2.4）
+      return Err(AlertDescription.UnrecognizedName);
+    }
+    None => {
+      // SNI のない接続: default_server_name が明示されている場合のみ照合（決定 2.4）
+      match store.default_server_name {
+        Some(def_name) => {
+          let mut bi = 0;
+          while bi < store.bundles.len() {
+            match store.bundles.get(bi) {
+              Some(bundle) => {
+                let mut ni = 0;
+                while ni < bundle.configured_names.len() {
+                  match bundle.configured_names.get(ni) {
+                    Some(name) => {
+                      if name == def_name {
+                        return Ok(bi);
+                      }
+                    }
+                    None => {}
+                  }
+                  ni = ni + 1;
+                }
+              }
+              None => {}
+            }
+            bi = bi + 1;
+          }
+          return Err(AlertDescription.UnrecognizedName);
+        }
+        None => {
+          // 暗黙の既定証明書はないため unrecognized_name で拒否
+          return Err(AlertDescription.UnrecognizedName);
+        }
+      }
+    }
+  }
+}
+
+pub fn check_expiry(bundle: &CertificateBundle, now_secs: Int) -> ExpiryStatus
+  intent "証明書の有効期限の状態を判定する（14 日以内警告 / 期限切れ）"
+  requires none
+  ensures none
+  effects none
+{
+  if now_secs > bundle.not_after {
+    return ExpiryStatus.Expired(now_secs - bundle.not_after);
+  }
+  let remaining = bundle.not_after - now_secs;
+  if remaining <= cert_expiry_warning_secs() {
+    return ExpiryStatus.ExpiringSoon(remaining);
+  }
+  return ExpiryStatus.Valid;
+}
+
+pub fn create_session_for_bundle(bundle: &CertificateBundle) -> HandshakeSession
+  intent "選択された証明書バンドルを用いて HandshakeSession を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return new_handshake_session(bundle.cert_chain_der.clone(), bundle.private_key.clone());
+}
+
+fn map_pem_error(e: PemError) -> CertError
+  intent "PemError を CertError に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  return match e {
+    PemError.FileTooLarge(l, m) => CertError.CertTooLarge(l, m),
+    PemError.EncryptedKeyForbidden => CertError.EncryptedKeyForbidden,
+    PemError.MalformedPem(s) => CertError.Io(s),
+    PemError.InvalidBase64(s) => CertError.Io(s),
+    PemError.NoBlocksFound => CertError.Io("No PEM blocks found"),
+  };
+}
+
+fn parse_pem_cert(text: &String) -> Result<List<PemBlock>, CertError>
+  intent "PEM を解析し、PemError を CertError に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  return match parse_pem(&text) {
+    Ok(b) => Ok(b),
+    Err(e) => Err(map_pem_error(e)),
+  };
+}
+
+pub fn load_bundle_from_pem_text(cert_pem_text: &String, key_pem_text: &String, configured_names: &List<String>, now_secs: Option<Int>) -> Result<CertificateBundle, CertError>
+  intent "証明書と鍵の PEM 文字列から単一の CertificateBundle を読み込み・検証する（決定 2.3）"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 秘密鍵の解析
+  let key_blocks = parse_pem_cert(&key_pem_text)?;
+  if key_blocks.is_empty() {
+    return Err(CertError.InvalidPrivateKey);
+  }
+  match key_blocks.get(0) {
+    Some(key_block) => {
+      let private_key = parse_private_key(&key_block)?;
+
+      // 2. 証明書チェーンの解析
+      let cert_blocks = parse_pem_cert(&cert_pem_text)?;
+      let num_certs = cert_blocks.len();
+      if num_certs == 0 {
+        return Err(CertError.ChainEmpty);
+      }
+      if num_certs > max_cert_chain_count() {
+        return Err(CertError.ChainTooLong(num_certs, max_cert_chain_count()));
+      }
+
+      let mut parsed_chain = List.new();
+      let mut cert_chain_der = List.new();
+      let mut ci = 0;
+      while ci < num_certs {
+        match cert_blocks.get(ci) {
+          Some(cb) => {
+            if cb.label != "CERTIFICATE" {
+              return Err(CertError.Io("Expected CERTIFICATE block"));
+            }
+            let parsed = parse_certificate(&cb.data)?;
+            cert_chain_der.push(cb.data.clone());
+            parsed_chain.push(parsed);
+          }
+          None => {}
+        }
+        ci = ci + 1;
+      }
+
+      // 3. 設定された名前の正規化
+      let mut normalized_names = List.new();
+      let mut ni = 0;
+      while ni < configured_names.len() {
+        match configured_names.get(ni) {
+          Some(raw_name) => {
+            let norm_name = normalize_configured_name(&raw_name)?;
+            normalized_names.push(norm_name);
+          }
+          None => {}
+        }
+        ni = ni + 1;
+      }
+
+      // 4. チェーンおよび公開鍵・有効期間・名前の適合性検証
+      validate_certificate_chain(&parsed_chain, &private_key, now_secs, &normalized_names)?;
+
+      return match parsed_chain.get(0) {
+        Some(leaf) => Ok(new_certificate_bundle(normalized_names, cert_chain_der, leaf.clone(), private_key)),
+        None => Err(CertError.ChainEmpty),
+      };
+    }
+    None => {
+      return Err(CertError.InvalidPrivateKey);
+    }
+  }
+}
+
+pub fn reload_store(manager: &mut CertificateStoreManager, new_bundles: List<CertificateBundle>, default_server_name: Option<String>) -> Result<ReloadOutcome, CertError>
+  intent "新しい証明書設定を検証し、アトミックに差し替える。失敗時は旧設定を維持する（決定 2.5）"
+  requires none
+  ensures none
+  effects none
+{
+  match new_certificate_store(new_bundles, default_server_name) {
+    Ok(new_store) => {
+      manager.current_store = Some(new_store);
+      return Ok(ReloadOutcome.Success);
+    }
+    Err(e) => {
+      if manager.current_store.is_some() {
+        return Ok(ReloadOutcome.PreservedPrevious("Validation failed, preserving existing store"));
+      }
+      return Err(e);
+    }
+  }
+}

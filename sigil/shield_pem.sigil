@@ -1,0 +1,292 @@
+module shield_pem
+  targets server
+  trust none
+
+use shield_limits.max_cert_file_size;
+
+// PEM および Base64 デコーダ（ADR 0063 決定 2.2, 2.3）
+// - ファイルサイズ 64 KiB 上限（max_cert_file_size）
+// - 暗号化された秘密鍵（Proc-Type: 4,ENCRYPTED / ENCRYPTED PRIVATE KEY）の拒否
+// - RFC 4648 厳密な Base64 デコード（不正文字・不正パディング・ビット残りの拒否）
+
+pub struct PemBlock {
+  label: String,
+  data: Bytes,
+}
+
+pub enum PemError {
+  FileTooLarge(Int, Int),
+  MalformedPem(String),
+  EncryptedKeyForbidden,
+  InvalidBase64(String),
+  NoBlocksFound,
+}
+
+fn b64_char_value(c: Int) -> Int
+  intent "Base64 文字コードを 6 ビット値に変換する（不正な文字は -1）"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 65 && c <= 90 {
+    return c - 65;
+  }
+  if c >= 97 && c <= 122 {
+    return c - 97 + 26;
+  }
+  if c >= 48 && c <= 57 {
+    return c - 48 + 52;
+  }
+  if c == 43 {
+    return 62;
+  }
+  if c == 47 {
+    return 63;
+  }
+  return -1;
+}
+
+pub fn base64_decode(input: &String) -> Result<Bytes, PemError>
+  intent "RFC 4648 に準拠した厳密な Base64 デコードを行う"
+  requires none
+  ensures none
+  effects none
+{
+  let b = input.as_bytes();
+  let blen = b.byte_len();
+
+  // 空白文字（スペース、タブ、CR、LF）を除去したバイト列を抽出する
+  let mut clean = Bytes.with_capacity(blen);
+  let mut i = 0;
+  while i < blen {
+    let c = b.get(i).unwrap_or(0);
+    if c != 32 && c != 9 && c != 10 && c != 13 {
+      clean.push(c);
+    }
+    i = i + 1;
+  }
+
+  let clen = clean.byte_len();
+  if clen == 0 {
+    return Ok(Bytes.new());
+  }
+  if clen % 4 != 0 {
+    return Err(PemError.InvalidBase64("Base64 length must be a multiple of 4"));
+  }
+
+  let mut out = Bytes.with_capacity(clen / 4 * 3);
+  let mut pos = 0;
+  let mut seen_padding = false;
+
+  while pos < clen {
+    if seen_padding {
+      return Err(PemError.InvalidBase64("Data after padding characters"));
+    }
+
+    let c0 = clean.get(pos).unwrap_or(0);
+    let c1 = clean.get(pos + 1).unwrap_or(0);
+    let c2 = clean.get(pos + 2).unwrap_or(0);
+    let c3 = clean.get(pos + 3).unwrap_or(0);
+
+    let v0 = b64_char_value(c0);
+    let v1 = b64_char_value(c1);
+
+    if v0 < 0 || v1 < 0 {
+      return Err(PemError.InvalidBase64("Invalid character in Base64"));
+    }
+
+    if c2 == 61 {
+      // c2 == '=': c3 も '=' でなければならない
+      if c3 != 61 {
+        return Err(PemError.InvalidBase64("Invalid padding sequence"));
+      }
+      seen_padding = true;
+      // v1 の下位 4 ビットは 0 でなければならない
+      if (v1 & 15) != 0 {
+        return Err(PemError.InvalidBase64("Non-zero residual bits before padding"));
+      }
+      out.push(v0 * 4 + v1 / 16);
+    } else if c3 == 61 {
+      // c3 == '=': c2 は通常の文字
+      let v2 = b64_char_value(c2);
+      if v2 < 0 {
+        return Err(PemError.InvalidBase64("Invalid character in Base64"));
+      }
+      seen_padding = true;
+      // v2 の下位 2 ビットは 0 でなければならない
+      if (v2 & 3) != 0 {
+        return Err(PemError.InvalidBase64("Non-zero residual bits before padding"));
+      }
+      out.push(v0 * 4 + v1 / 16);
+      out.push((v1 & 15) * 16 + v2 / 4);
+    } else {
+      let v2 = b64_char_value(c2);
+      let v3 = b64_char_value(c3);
+      if v2 < 0 || v3 < 0 {
+        return Err(PemError.InvalidBase64("Invalid character in Base64"));
+      }
+      out.push(v0 * 4 + v1 / 16);
+      out.push((v1 & 15) * 16 + v2 / 4);
+      out.push((v2 & 3) * 64 + v3);
+    }
+
+    pos = pos + 4;
+  }
+
+  return Ok(out);
+}
+
+fn starts_with_bytes(b: &Bytes, offset: Int, prefix: &Bytes) -> Bool
+  intent "バイト列が指定オフセットから prefix で始まるか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let plen = prefix.byte_len();
+  if offset + plen > b.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < plen {
+    if b.get(offset + i).unwrap_or(0) != prefix.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+pub fn parse_pem(text: &String) -> Result<List<PemBlock>, PemError>
+  intent "PEM 形式テキストを解析し、PemBlock の一覧を返す"
+  requires none
+  ensures none
+  effects none
+{
+  let text_bytes = text.as_bytes();
+  if text_bytes.byte_len() > max_cert_file_size() {
+    return Err(PemError.FileTooLarge(text_bytes.byte_len(), max_cert_file_size()));
+  }
+
+  let begin_prefix = "-----BEGIN ".as_bytes();
+  let end_prefix = "-----END ".as_bytes();
+  let dashes = "-----".as_bytes();
+
+  let lines = text.lines();
+  let num_lines = lines.len();
+
+  let mut blocks = List.new();
+  let mut in_block = false;
+  let mut current_label = "";
+  let mut current_b64 = Bytes.new();
+
+  let mut idx = 0;
+  let mut loop_ok = true;
+  let mut failure = None;
+
+  while idx < num_lines && loop_ok {
+    let line = match lines.get(idx) {
+      Some(l) => l.trim(),
+      None => "",
+    };
+    let line_b = line.as_bytes();
+
+    if !in_block {
+      // 暗号化ヘッダの事前検出
+      if starts_with_bytes(&line_b, 0, &"Proc-Type:".as_bytes()) {
+        failure = Some(PemError.EncryptedKeyForbidden);
+        loop_ok = false;
+      } else if starts_with_bytes(&line_b, 0, &begin_prefix) {
+        let llen = line_b.byte_len();
+        if llen > 16 && starts_with_bytes(&line_b, llen - 5, &dashes) {
+          // ラベルを抽出する
+          let label_bytes = match line_b.slice(11, llen - 5) {
+            Ok(s) => s,
+            Err(_) => Bytes.new(),
+          };
+          let label = match label_bytes.to_string_utf8() {
+            Ok(s) => s,
+            Err(_) => "",
+          };
+
+          if label == "ENCRYPTED PRIVATE KEY" {
+            failure = Some(PemError.EncryptedKeyForbidden);
+            loop_ok = false;
+          } else {
+            in_block = true;
+            current_label = label;
+            current_b64 = Bytes.new();
+          }
+        }
+      }
+    } else {
+      // ブロック内
+      if starts_with_bytes(&line_b, 0, &"Proc-Type:".as_bytes()) || starts_with_bytes(&line_b, 0, &"DEK-Info:".as_bytes()) {
+        failure = Some(PemError.EncryptedKeyForbidden);
+        loop_ok = false;
+      } else if starts_with_bytes(&line_b, 0, &end_prefix) {
+        let llen = line_b.byte_len();
+        if llen > 14 && starts_with_bytes(&line_b, llen - 5, &dashes) {
+          let label_bytes = match line_b.slice(9, llen - 5) {
+            Ok(s) => s,
+            Err(_) => Bytes.new(),
+          };
+          let end_label = match label_bytes.to_string_utf8() {
+            Ok(s) => s,
+            Err(_) => "",
+          };
+
+          if end_label != current_label {
+            failure = Some(PemError.MalformedPem("END label mismatch"));
+            loop_ok = false;
+          } else {
+            let b64_str = match current_b64.to_string_utf8() {
+              Ok(s) => s,
+              Err(_) => "",
+            };
+            match base64_decode(&b64_str) {
+              Ok(decoded) => {
+                blocks.push(PemBlock { label: current_label, data: decoded });
+                in_block = false;
+                current_label = "";
+                current_b64 = Bytes.new();
+              }
+              Err(e) => {
+                failure = Some(e);
+                loop_ok = false;
+              }
+            }
+          }
+        } else {
+          failure = Some(PemError.MalformedPem("Malformed END line"));
+          loop_ok = false;
+        }
+      } else if starts_with_bytes(&line_b, 0, &begin_prefix) {
+        // ネストした BEGIN は不正
+        failure = Some(PemError.MalformedPem("Nested BEGIN tag"));
+        loop_ok = false;
+      } else {
+        // Base64 行
+        current_b64.extend(&line_b);
+      }
+    }
+
+    idx = idx + 1;
+  }
+
+  match failure {
+    Some(err) => {
+      return Err(err);
+    }
+    None => {}
+  }
+
+  if in_block {
+    return Err(PemError.MalformedPem("Unterminated BEGIN block"));
+  }
+
+  if blocks.is_empty() {
+    return Err(PemError.NoBlocksFound);
+  }
+
+  return Ok(blocks);
+}
