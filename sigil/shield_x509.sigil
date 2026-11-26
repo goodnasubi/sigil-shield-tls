@@ -587,6 +587,57 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
     return Err(CertError.Asn1(Asn1Error.InvalidValue("Certificate must have exactly 3 children")));
   }
 
+  // 外側の署名アルゴリズム (signatureAlgorithm: AlgorithmIdentifier) の構造検証
+  let mut outer_sig_alg_raw = Bytes.new();
+  match cert_children.get(1) {
+    Some(outer_sig_alg) => {
+      if outer_sig_alg.tag != tag_sequence() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(outer_sig_alg.tag)));
+      }
+      let sig_alg_children = read_children_cert(&outer_sig_alg)?;
+      if sig_alg_children.len() < 1 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("signatureAlgorithm must have at least 1 field")));
+      }
+      match sig_alg_children.get(0) {
+        Some(oid_elem) => {
+          if oid_elem.tag != tag_oid() {
+            return Err(CertError.Asn1(Asn1Error.InvalidTag(oid_elem.tag)));
+          }
+          if oid_elem.content.byte_len() == 0 {
+            return Err(CertError.Asn1(Asn1Error.InvalidValue("signatureAlgorithm OID is empty")));
+          }
+        }
+        None => {
+          return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+        }
+      }
+      outer_sig_alg_raw = outer_sig_alg.raw.clone();
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
+  // 外側の署名値 (signatureValue: BIT STRING) の構造検証
+  match cert_children.get(2) {
+    Some(sig_val_elem) => {
+      if sig_val_elem.tag != tag_bit_string() {
+        return Err(CertError.Asn1(Asn1Error.InvalidTag(sig_val_elem.tag)));
+      }
+      let sig_len = sig_val_elem.content.byte_len();
+      if sig_len < 2 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("signatureValue BIT STRING is too short")));
+      }
+      let unused_bits = sig_val_elem.content.get(0).unwrap_or(255);
+      if unused_bits > 7 {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("Invalid unused bits in signatureValue")));
+      }
+    }
+    None => {
+      return Err(CertError.Asn1(Asn1Error.UnexpectedEof));
+    }
+  }
+
   let mut tbs_children = List.new();
   match cert_children.get(0) {
     Some(tbs_elem) => {
@@ -650,6 +701,9 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
     Some(sig_alg_elem) => {
       if sig_alg_elem.tag != tag_sequence() {
         return Err(CertError.Asn1(Asn1Error.InvalidTag(sig_alg_elem.tag)));
+      }
+      if !bytes_equal(&sig_alg_elem.raw, &outer_sig_alg_raw) {
+        return Err(CertError.Asn1(Asn1Error.InvalidValue("Certificate signatureAlgorithm mismatch between outer and TBS")));
       }
     }
     None => {

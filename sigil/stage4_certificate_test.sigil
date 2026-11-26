@@ -422,6 +422,86 @@ fn test_certificate_parsing_and_san() -> Int
           if !has_exact || !has_wild {
             return 504;
           }
+
+          // 外側 signatureValue の不正タグ（BIT STRING -> OCTET STRING）検出テスト（P2 指摘）
+          let mut bad_sig_tag_der = b.data.clone();
+          let _ = bad_sig_tag_der.set(273, 4);
+          match parse_certificate(&bad_sig_tag_der) {
+            Ok(_) => {
+              return 505;
+            }
+            Err(e) => {
+              match e {
+                CertError.Asn1(ae) => {
+                  match ae {
+                    Asn1Error.InvalidTag(t) => {
+                      if t != 4 {
+                        return 506;
+                      }
+                    }
+                    _ => {
+                      return 507;
+                    }
+                  }
+                }
+                _ => {
+                  return 508;
+                }
+              }
+            }
+          }
+
+          // 外側 signatureAlgorithm の不正タグ（SEQUENCE -> OCTET STRING）検出テスト（P2 指摘）
+          let mut bad_alg_tag_der = b.data.clone();
+          let _ = bad_alg_tag_der.set(261, 4);
+          match parse_certificate(&bad_alg_tag_der) {
+            Ok(_) => {
+              return 509;
+            }
+            Err(e) => {
+              match e {
+                CertError.Asn1(ae) => {
+                  match ae {
+                    Asn1Error.InvalidTag(t) => {
+                      if t != 4 {
+                        return 510;
+                      }
+                    }
+                    _ => {
+                      return 511;
+                    }
+                  }
+                }
+                _ => {
+                  return 512;
+                }
+              }
+            }
+          }
+
+          // 外側と内側の signatureAlgorithm 不一致検出テスト（P2 指摘）
+          let mut mismatch_sig_der = b.data.clone();
+          let _ = mismatch_sig_der.set(26, 3);
+          match parse_certificate(&mismatch_sig_der) {
+            Ok(_) => {
+              return 513;
+            }
+            Err(e) => {
+              match e {
+                CertError.Asn1(ae) => {
+                  match ae {
+                    Asn1Error.InvalidValue(_) => {}
+                    _ => {
+                      return 514;
+                    }
+                  }
+                }
+                _ => {
+                  return 515;
+                }
+              }
+            }
+          }
         }
         Err(_) => {
           return 502;
