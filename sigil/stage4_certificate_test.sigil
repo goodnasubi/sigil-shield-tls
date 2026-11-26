@@ -116,6 +116,15 @@ fn get_p384_ca_chain_pem() -> String
   return "-----BEGIN CERTIFICATE-----\nMIIBgjCCAQigAwIBAgIBZTAKBggqhkjOPQQDAzA1MRYwFAYDVQQDDA1UZXN0IFAt\nMzg0IENBMRswGQYDVQQKDBJTaGllbGQgVExTIFAzODQgQ0EwHhcNMjUwMTAxMDAw\nMDAwWhcNMjgwMTAxMDAwMDAwWjAdMRswGQYDVQQDDBJwMzg0Y2EuZXhhbXBsZS5j\nb20wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQsjimmI6QJfZtzEjO7tDVwEdD3\nFDaGFNceg/i8+Od5h4vee9/+QglHMgchn7hqguuMfQgPiyd39KnTRghFUJseoyEw\nHzAdBgNVHREEFjAUghJwMzg0Y2EuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwMDaAAw\nZQIxANXCNrDzwHhUW7G1SpjZsj07Qf0eqQv2STy3EBxpbgoSdblnBVZMM3cxLmzL\nUMjJ8gIwWG4euIs6dM8jFtLbZvKGpQXUxG7pKWO8zhzJCdPZaMKOW/JoNEZr05iZ\nSbks4mi2\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBqDCCAS+gAwIBAgIBZDAKBggqhkjOPQQDAzA1MRYwFAYDVQQDDA1UZXN0IFAt\nMzg0IENBMRswGQYDVQQKDBJTaGllbGQgVExTIFAzODQgQ0EwHhcNMjUwMTAxMDAw\nMDAwWhcNMjgwMTAxMDAwMDAwWjA1MRYwFAYDVQQDDA1UZXN0IFAtMzg0IENBMRsw\nGQYDVQQKDBJTaGllbGQgVExTIFAzODQgQ0EwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\nAARWuuV3vVyKDHz2XD/2TwaghpaBJYPgF8dStaBWUZNUZlBjpW1Z5cNUsghYDm/H\ndvTYpCxxz6HlcWC1c2vaOmIiebvddUJT2aEMmm83OACn7bORiJp42oj/VviIrw+q\nZUajEzARMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDZwAwZAIwf4jYZv6n\n6R/TXs8LP99yopvR0GBGHAh4ljOk6ZOZYM0YSu06n30HQ6/X36CrJj6fAjBDHmdw\nP9WHcDjvw1BsY4497ZGymeijtXRtGw/y8jl0g/tSr2oXDu9T0ko/4WLhYtQ=\n-----END CERTIFICATE-----\n";
 }
 
+fn get_uppercase_san_chain_pem() -> String
+  intent "SAN に大文字を含むリーフ証明書と CA 証明書のチェーン PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBVjCB/qADAgECAgECMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAWMRQwEgYDVQQDDAtFWEFNUExFLkNPTTBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABCyOKaYjpAl9m3MSM7u0NXAR0PcUNoYU1x6D+Lz453mHi9573/5C\nCUcyByGfuGqC64x9CA+LJ3f0qdNGCEVQmx6jKTAnMCUGA1UdEQQeMByCC0VYQU1Q\nTEUuQ09Ngg0qLkV4YW1wbGUuQ09NMAoGCCqGSM49BAMCA0cAMEQCIBwPwgIYt/HT\nFjg38v/ztFwZSNUvesJx5EYF1lnL773lAiAS4oI8uwonf2OgwhcSeaeRPd4WkBgS\nQuVXzxohuYlvNw==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBVTCB/KADAgECAgEBMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAqMRAwDgYDVQQDDAdUZXN0IENBMRYwFAYDVQQKDA1TaGllbGQgVExT\nIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExPyFTXe4R43oDNkBL8Vo2FYv\nWdlb5xCH8GvRf2gbu8MMmPzvupBajfVjZA8Cry9W2mZJ4K/Hp0Wp0V0uFCtNBaMT\nMBEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3+ozQ5fDf3mCs\nMYu/I0Cdd6iIOzGQd9OYKmZupKnV5wIhAMSh6uvvLlZgqYLTsGftiqaR7yCFBgyE\nIa6AnmlqfbLJ\n-----END CERTIFICATE-----\n";
+}
+
 fn test_base64_strict() -> Int
   intent "Base64 厳格デコードのテスト（決定 2.1）"
   requires none
@@ -537,6 +546,19 @@ fn test_chain_validation() -> Int
     }
   }
 
+  // 大文字 SAN を持つ証明書に対する小文字設定名でのバンドル読み込みテスト（P2 指摘: 大文字小文字不区別照合）
+  let upper_chain = get_uppercase_san_chain_pem();
+  let mut upper_configured_names = List.new();
+  upper_configured_names.push("example.com");
+  upper_configured_names.push("www.example.com");
+  let bundle_upper_san = load_bundle_from_pem_text(&upper_chain, &key_pem, &upper_configured_names, Some(1748736000));
+  match bundle_upper_san {
+    Ok(_) => {}
+    Err(_) => {
+      return 613;
+    }
+  }
+
   return 0;
 }
 
@@ -751,6 +773,71 @@ fn test_hostname_and_sni() -> Int
     }
     Err(_) => {
       return 730;
+    }
+  }
+
+  // 大文字・小文字混合の SAN パターン照合（ASCII 大文字小文字不区別）
+  if !match_san_pattern(&"EXAMPLE.COM", &"example.com") {
+    return 731;
+  }
+  if !match_san_pattern(&"example.com", &"EXAMPLE.COM") {
+    return 732;
+  }
+  if !match_san_pattern(&"*.Example.COM", &"foo.example.com") {
+    return 733;
+  }
+  if !match_san_pattern(&"*.example.com", &"FOO.EXAMPLE.COM") {
+    return 734;
+  }
+  if !match_san_pattern(&"*.EXAMPLE.COM", &"*.example.com") {
+    return 735;
+  }
+  if match_san_pattern(&"*.Example.COM", &"EXAMPLE.COM") {
+    return 736;
+  }
+  if match_san_pattern(&"*.Example.COM", &"bar.foo.example.com") {
+    return 737;
+  }
+
+  // 大文字 SAN バンドルでの SNI 選択
+  let upper_chain = get_uppercase_san_chain_pem();
+  let mut upper_cfg_names = List.new();
+  upper_cfg_names.push("example.com");
+  upper_cfg_names.push("www.example.com");
+  match load_bundle_from_pem_text(&upper_chain, &key_pem, &upper_cfg_names, Some(1748736000)) {
+    Ok(b_upper) => {
+      let mut upper_store_bundles = List.new();
+      upper_store_bundles.push(b_upper);
+      match new_certificate_store(upper_store_bundles, None) {
+        Ok(upper_store) => {
+          match select_certificate_for_sni(&upper_store, &Some("example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 738;
+              }
+            }
+            Err(_) => {
+              return 739;
+            }
+          }
+          match select_certificate_for_sni(&upper_store, &Some("www.example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 740;
+              }
+            }
+            Err(_) => {
+              return 741;
+            }
+          }
+        }
+        Err(_) => {
+          return 742;
+        }
+      }
+    }
+    Err(_) => {
+      return 743;
     }
   }
 

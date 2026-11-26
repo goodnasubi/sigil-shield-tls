@@ -878,8 +878,20 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
   return Ok(ParsedCertificate { raw_der: der.clone(), version: 3, serial_number: serial_number, issuer_der: issuer_der, not_before: not_before, not_after: not_after, subject_der: subject_der, spki_alg_oid: spki_alg_oid, spki_curve_oid: spki_curve_oid, spki_public_key: spki_public_key, san_dns_names: san_dns_names });
 }
 
+fn ascii_lower_byte(b: Int) -> Int
+  intent "ASCII 英大文字（A-Z）を小文字（a-z）に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if b >= 65 && b <= 90 {
+    return b + 32;
+  }
+  return b;
+}
+
 pub fn match_san_pattern(pattern: &String, host: &String) -> Bool
-  intent "SAN パターン（完全一致または *.domain ワイルドカード）とホスト名を照合する"
+  intent "SAN パターン（完全一致または *.domain ワイルドカード）とホスト名を照合する（ASCII 大文字小文字不区別）"
   requires none
   ensures none
   effects none
@@ -893,12 +905,24 @@ pub fn match_san_pattern(pattern: &String, host: &String) -> Bool
     return false;
   }
 
-  // 完全一致照合
-  if bytes_equal(&p_bytes, &h_bytes) {
-    return true;
+  // 完全一致照合（ASCII 大文字小文字不区別）
+  if plen == hlen {
+    let mut exact_match = true;
+    let mut i = 0;
+    while i < plen && exact_match {
+      let pb = p_bytes.get(i).unwrap_or(0);
+      let hb = h_bytes.get(i).unwrap_or(0);
+      if ascii_lower_byte(pb) != ascii_lower_byte(hb) {
+        exact_match = false;
+      }
+      i = i + 1;
+    }
+    if exact_match {
+      return true;
+    }
   }
 
-  // ワイルドカード照合: *.domain
+  // ワイルドカード照合: *.domain（ASCII 大文字小文字不区別）
   // 先頭の 1 ラベルだけが * で、ちょうど 1 ラベルに一致し、apex ドメイン自身には一致しない（決定 2.4）
   if plen > 2 && p_bytes.get(0).unwrap_or(0) == 42 && p_bytes.get(1).unwrap_or(0) == 46 {  // "*."
     let suffix_len = plen - 2;  // domain.tld の長さ
@@ -914,7 +938,9 @@ pub fn match_san_pattern(pattern: &String, host: &String) -> Bool
 
     let mut si = 0;
     while si < suffix_len {
-      if h_bytes.get(host_dot_pos + 1 + si).unwrap_or(0) != p_bytes.get(2 + si).unwrap_or(0) {
+      let pb = p_bytes.get(2 + si).unwrap_or(0);
+      let hb = h_bytes.get(host_dot_pos + 1 + si).unwrap_or(0);
+      if ascii_lower_byte(pb) != ascii_lower_byte(hb) {
         return false;
       }
       si = si + 1;
