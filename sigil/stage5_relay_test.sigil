@@ -52,6 +52,7 @@ use shield_relay.tracker_handshake_finished;
 use shield_relay.tracker_release_crypto;
 use shield_relay.tracker_try_accept;
 use shield_relay.tracker_try_acquire_crypto;
+use shield_relay.tracker_try_acquire_waiting_crypto;
 use shield_relay.validate_listen_config;
 use shield_relay.validate_upstream_config;
 
@@ -199,6 +200,70 @@ fn test_upstream_config_and_loopback_validation() -> Int
     Ok(_) => {}
     Err(_) => {
       return 18;
+    }
+  }
+
+  // 5.1 15文字で末尾が1の非ループバック IPv6 (2001:db8:0:0::1) は拒否（P1 指摘対応）
+  let u5_fake_loop = new_upstream_config("2001:db8:0:0::1", 8080, false);
+  match validate_upstream_config(&u5_fake_loop) {
+    Ok(_) => {
+      return 161;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.NonLoopbackUpstreamDisallowed(_) => {}
+        _ => {
+          return 162;
+        }
+      }
+    }
+  }
+
+  // 5.2 展開された IPv6 ループバック (0:0:0:0:0:0:0:1) はループバックとして受領
+  let u5_full_loop = new_upstream_config("0:0:0:0:0:0:0:1", 8080, false);
+  match validate_upstream_config(&u5_full_loop) {
+    Ok(_) => {}
+    Err(_) => {
+      return 163;
+    }
+  }
+
+  // 5.3 有効な末尾 "::" 形式 (1:2:3:4:5:6:7::) は許可（P2 指摘対応）
+  let u5_trailing_double = new_upstream_config("1:2:3:4:5:6:7::", 8080, true);
+  match validate_upstream_config(&u5_trailing_double) {
+    Ok(_) => {}
+    Err(_) => {
+      return 164;
+    }
+  }
+
+  // 5.4 不正なグループ構造 (a:b や 1:::2) は数値 IPv6 ではないため拒否（P2 指摘対応）
+  let u5_bad_groups = new_upstream_config("a:b", 8080, true);
+  match validate_upstream_config(&u5_bad_groups) {
+    Ok(_) => {
+      return 165;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.DnsUpstreamDisallowed(_) => {}
+        _ => {
+          return 166;
+        }
+      }
+    }
+  }
+  let u5_triple_colon = new_upstream_config("1:::2", 8080, true);
+  match validate_upstream_config(&u5_triple_colon) {
+    Ok(_) => {
+      return 167;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.DnsUpstreamDisallowed(_) => {}
+        _ => {
+          return 168;
+        }
+      }
     }
   }
 
@@ -572,19 +637,58 @@ fn test_relay_limits_per_source_boundary() -> Int
     }
   }
 
-  // 3. 接続元キー抽出ヘルパーの検証（IPv4 /32, IPv6 /64）
+  // 3. 接続元キー抽出ヘルパーの検証（IPv4 /32, IPv6 デコード済み /64, 括弧・ポート除去）
   if extract_source_key(&"192.168.1.1:1234") != "192.168.1.1" {
     return 88;
   }
   if extract_source_key(&"2001:db8:1234:5678:abcd:ef01:2345:6789") != "2001:db8:1234:5678" {
     return 89;
   }
+  // 圧縮 IPv6 でも同一 /64 は同一キーになる（P1 指摘対応）
+  if extract_source_key(&"2001:db8::1") != "2001:db8:0:0" {
+    return 891;
+  }
+  if extract_source_key(&"2001:db8::2") != "2001:db8:0:0" {
+    return 892;
+  }
+  // 括弧付きポート付きエンドポイントでもポートを除去しデコード済み /64 になる（P1 指摘対応）
+  if extract_source_key(&"[2001:db8::1]:10001") != "2001:db8:0:0" {
+    return 893;
+  }
+  if extract_source_key(&"[::1]:10001") != "0:0:0:0" {
+    return 894;
+  }
+  if extract_source_key(&"[::1]:10002") != "0:0:0:0" {
+    return 895;
+  }
+
+  // 4. 異なるポートの [::1] 同士が同一 /64 として接続数上限に合算される検証
+  let l_v6_src = limits_with_max_handshaking_per_source(&base_limits, 1);
+  let mut tracker_v6 = new_relay_tracker();
+  let _ = tracker_try_accept(&mut tracker_v6, &l_v6_src, &"[::1]:10001");
+  match tracker_try_accept(&mut tracker_v6, &l_v6_src, &"[::1]:10002") {
+    Ok(_) => {
+      return 896;
+    }
+    Err(e) => {
+      match e {
+        RelayRejectReason.SourceMaxHandshakingExceeded(src, cur, max) => {
+          if src != "0:0:0:0" || cur != 1 || max != 1 {
+            return 897;
+          }
+        }
+        _ => {
+          return 898;
+        }
+      }
+    }
+  }
 
   return 0;
 }
 
 fn test_concurrent_crypto_tasks() -> Int
-  intent "鍵交換・署名並行計算タスクのキューイングと待機（決定 4.5）"
+  intent "鍵交換・署名並行計算タスクのキューイングと待機・解放・取得（決定 4.5、P2 指摘対応）"
   requires none
   ensures none
   effects none
@@ -616,15 +720,34 @@ fn test_concurrent_crypto_tasks() -> Int
     return 96;
   }
 
-  // タスク完了解放
-  tracker_release_crypto(&mut tracker);
-  if tracker_crypto_waiting_count(&tracker) != 0 {
-    return 97;
-  }
-
+  // 1 つ目のタスク完了解放: active が 1 に減算され、パーミットが空く
   tracker_release_crypto(&mut tracker);
   if tracker_active_crypto_tasks(&tracker) != 1 {
+    return 97;
+  }
+  if tracker_crypto_waiting_count(&tracker) != 1 {
     return 98;
+  }
+
+  // 待機中のタスクが解放されたパーミットを取得: active は 2 に戻り、waiting_count は 0 に減算
+  if !tracker_try_acquire_waiting_crypto(&mut tracker, &base_limits) {
+    return 99;
+  }
+  if tracker_active_crypto_tasks(&tracker) != 2 {
+    return 100;
+  }
+  if tracker_crypto_waiting_count(&tracker) != 0 {
+    return 101;
+  }
+
+  // 残り全タスク解放: phantom active task が残らないことを検証
+  tracker_release_crypto(&mut tracker);
+  if tracker_active_crypto_tasks(&tracker) != 1 {
+    return 102;
+  }
+  tracker_release_crypto(&mut tracker);
+  if tracker_active_crypto_tasks(&tracker) != 0 {
+    return 103;
   }
 
   return 0;

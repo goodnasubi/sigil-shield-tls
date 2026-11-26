@@ -121,8 +121,8 @@ fn is_hex_digit(c: Int) -> Bool
   return false;
 }
 
-pub fn is_ipv4_numeric(host: &String) -> Bool
-  intent "文字列が数値 IPv4 アドレス (x.x.x.x, 0-255) か厳密に判定する"
+pub fn parse_ipv4_octets(host: &String) -> Option<List<Int>>
+  intent "文字列が数値 IPv4 アドレス (x.x.x.x, 0-255) の場合に 4 オクテットをパースする"
   requires none
   ensures none
   effects none
@@ -130,10 +130,10 @@ pub fn is_ipv4_numeric(host: &String) -> Bool
   let b = host.as_bytes();
   let blen = b.byte_len();
   if blen < 7 || blen > 15 {
-    return false;
+    return None;
   }
 
-  let mut dots = 0;
+  let mut octets = List.new();
   let mut current_val = 0;
   let mut segment_len = 0;
   let mut i = 0;
@@ -142,34 +142,124 @@ pub fn is_ipv4_numeric(host: &String) -> Bool
     let c = b.get(i).unwrap_or(0);
     if c == 46 {  // '.'
       if segment_len == 0 || segment_len > 3 {
-        return false;
+        return None;
       }
       if current_val > 255 {
-        return false;
+        return None;
       }
-      dots = dots + 1;
+      if segment_len > 1 {
+        let first_ch = b.get(i - segment_len).unwrap_or(0);
+        if first_ch == 48 {
+          return None;
+        }
+      }
+      octets.push(current_val);
       current_val = 0;
       segment_len = 0;
     } else if is_ascii_digit(c) {
       current_val = current_val * 10 + (c - 48);
       segment_len = segment_len + 1;
       if segment_len > 3 || current_val > 255 {
-        return false;
+        return None;
       }
     } else {
-      return false;
+      return None;
     }
     i = i + 1;
   }
 
-  if dots != 3 || segment_len == 0 || segment_len > 3 || current_val > 255 {
-    return false;
+  if octets.len() != 3 || segment_len == 0 || segment_len > 3 || current_val > 255 {
+    return None;
   }
-  return true;
+  if segment_len > 1 {
+    let first_ch = b.get(blen - segment_len).unwrap_or(0);
+    if first_ch == 48 {
+      return None;
+    }
+  }
+  octets.push(current_val);
+  return Some(octets);
 }
 
-pub fn is_ipv6_numeric(host: &String) -> Bool
-  intent "文字列が数値 IPv6 アドレス（16 進数とコロンのみ）か判定する"
+pub fn is_ipv4_numeric(host: &String) -> Bool
+  intent "文字列が数値 IPv4 アドレス (x.x.x.x, 0-255) か厳密に判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match parse_ipv4_octets(&host) {
+    Some(_) => true,
+    None => false,
+  };
+}
+
+fn hex_char_to_val(c: Int) -> Option<Int>
+  intent "16 進文字コードを 0..15 の数値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return Some(c - 48);
+  }
+  if c >= 97 && c <= 102 {
+    return Some(c - 97 + 10);
+  }
+  if c >= 65 && c <= 70 {
+    return Some(c - 65 + 10);
+  }
+  return None;
+}
+
+fn parse_hextet_segment(b: &Bytes, start: Int, end: Int) -> Option<List<Int>>
+  intent "コロン区切りの hextet 群 (0..4 桁の 16 進数) をパースする"
+  requires none
+  ensures none
+  effects none
+{
+  if start >= end {
+    return Some(List.new());
+  }
+
+  let mut list = List.new();
+  let mut seg_start = start;
+  let mut pos = start;
+  while pos <= end {
+    let is_delim = match pos == end {
+      true => true,
+      false => b.get(pos).unwrap_or(0) == 58,
+    };
+    if is_delim {
+      let seg_len = pos - seg_start;
+      if seg_len < 1 || seg_len > 4 {
+        return None;
+      }
+      let mut val = 0;
+      let mut k = seg_start;
+      while k < pos {
+        let ch = b.get(k).unwrap_or(0);
+        let mut digit = 0;
+        match hex_char_to_val(ch) {
+          Some(d) => {
+            digit = d;
+          }
+          None => {
+            return None;
+          }
+        }
+        val = val * 16 + digit;
+        k = k + 1;
+      }
+      list.push(val);
+      seg_start = pos + 1;
+    }
+    pos = pos + 1;
+  }
+  return Some(list);
+}
+
+pub fn parse_ipv6_hextets(host: &String) -> Option<List<Int>>
+  intent "IPv6 アドレスのグループ構造・hextet 長・:: 位置を検証し 8 つの hextet にデコードする"
   requires none
   ensures none
   effects none
@@ -177,68 +267,182 @@ pub fn is_ipv6_numeric(host: &String) -> Bool
   let b = host.as_bytes();
   let blen = b.byte_len();
   if blen < 2 || blen > 39 {
-    return false;
+    return None;
   }
 
-  let mut colons = 0;
+  let mut double_colon_pos = -1;
   let mut i = 0;
   while i < blen {
     let c = b.get(i).unwrap_or(0);
     if c == 58 {  // ':'
-      colons = colons + 1;
-    } else if is_hex_digit(c) {
-      // 16 進文字
+      if i + 1 < blen {
+        if b.get(i + 1).unwrap_or(0) == 58 {
+          // "::" を発見
+          if double_colon_pos >= 0 {
+            // "::" は 1 つのアドレスに 1 回のみ許可
+            return None;
+          }
+          if i + 2 < blen {
+            if b.get(i + 2).unwrap_or(0) == 58 {
+              // ":::" (3 つ以上連続したコロン) は不正
+              return None;
+            }
+          }
+          double_colon_pos = i;
+          i = i + 1;
+        }
+      }
     } else {
-      // コロンでも 16 進数でもない文字（DNS ドメイン名等）
-      return false;
+      if !is_hex_digit(c) {
+        return None;
+      }
     }
     i = i + 1;
   }
 
-  // IPv6 は少なくとも 1 つ以上のコロンを含む
-  return colons >= 1 && colons <= 7;
+  // 先頭または末尾の単独コロン（"::" 以外）は不正
+  if double_colon_pos < 0 {
+    if b.get(0).unwrap_or(0) == 58 || b.get(blen - 1).unwrap_or(0) == 58 {
+      return None;
+    }
+  } else {
+    if double_colon_pos > 0 && b.get(0).unwrap_or(0) == 58 {
+      return None;
+    }
+    if double_colon_pos + 2 < blen && b.get(blen - 1).unwrap_or(0) == 58 {
+      return None;
+    }
+  }
+
+  if double_colon_pos >= 0 {
+    let left_opt = parse_hextet_segment(&b, 0, double_colon_pos);
+    let right_opt = parse_hextet_segment(&b, double_colon_pos + 2, blen);
+    let mut left = List.new();
+    match left_opt {
+      Some(l) => {
+        left = l;
+      }
+      None => {
+        return None;
+      }
+    }
+    let mut right = List.new();
+    match right_opt {
+      Some(r) => {
+        right = r;
+      }
+      None => {
+        return None;
+      }
+    }
+
+    let total_groups = left.len() + right.len();
+    if total_groups >= 8 {
+      // :: は 1 つ以上のゼログループを置換するため、明示グループ数は最大 7
+      return None;
+    }
+    let zeros_to_insert = 8 - total_groups;
+    let mut out_hextets = List.new();
+    let mut li = 0;
+    while li < left.len() {
+      match left.get(li) {
+        Some(v) => {
+          out_hextets.push(v + 0);
+        }
+        None => {}
+      }
+      li = li + 1;
+    }
+    let mut zi = 0;
+    while zi < zeros_to_insert {
+      out_hextets.push(0);
+      zi = zi + 1;
+    }
+    let mut ri = 0;
+    while ri < right.len() {
+      match right.get(ri) {
+        Some(v) => {
+          out_hextets.push(v + 0);
+        }
+        None => {}
+      }
+      ri = ri + 1;
+    }
+    return Some(out_hextets);
+  }
+
+  let groups_opt = parse_hextet_segment(&b, 0, blen);
+  let mut groups = List.new();
+  match groups_opt {
+    Some(g) => {
+      groups = g;
+    }
+    None => {
+      return None;
+    }
+  }
+  if groups.len() != 8 {
+    return None;
+  }
+  return Some(groups);
 }
 
-pub fn is_loopback_address(host: &String) -> Bool
-  intent "アドレスがループバック（127.0.0.0/8 または ::1 等）か判定する（決定 3）"
+pub fn is_ipv6_numeric(host: &String) -> Bool
+  intent "文字列が正しいグループ構造を持つ数値 IPv6 アドレスか判定する"
   requires none
   ensures none
   effects none
 {
-  let b = host.as_bytes();
-  let blen = b.byte_len();
+  return match parse_ipv6_hextets(&host) {
+    Some(_) => true,
+    None => false,
+  };
+}
 
-  // IPv4 ループバック: 127.x.x.x
-  if is_ipv4_numeric(&host) {
-    if blen >= 4 {
-      let c0 = b.get(0).unwrap_or(0);
-      let c1 = b.get(1).unwrap_or(0);
-      let c2 = b.get(2).unwrap_or(0);
-      let c3 = b.get(3).unwrap_or(0);
-      if c0 == 49 && c1 == 50 && c2 == 55 && c3 == 46 {  // "127."
-        return true;
+fn list_get_or_zero(l: &List<Int>, idx: Int) -> Int
+  intent "リストの要素を取得するか 0 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(idx) {
+    Some(v) => v + 0,
+    None => 0,
+  };
+}
+
+pub fn is_loopback_address(host: &String) -> Bool
+  intent "アドレスがループバック（127.0.0.0/8 または ::1）か判定する（決定 3）"
+  requires none
+  ensures none
+  effects none
+{
+  // IPv4 ループバック: 127.0.0.0/8
+  match parse_ipv4_octets(&host) {
+    Some(octets) => {
+      let o0 = list_get_or_zero(&octets, 0);
+      return o0 == 127;
+    }
+    None => {}
+  }
+
+  // IPv6 ループバック: ::1（128 ビット全体が 0:0:0:0:0:0:0:1）
+  match parse_ipv6_hextets(&host) {
+    Some(hextets) => {
+      if hextets.len() != 8 {
+        return false;
       }
+      let h0 = list_get_or_zero(&hextets, 0);
+      let h1 = list_get_or_zero(&hextets, 1);
+      let h2 = list_get_or_zero(&hextets, 2);
+      let h3 = list_get_or_zero(&hextets, 3);
+      let h4 = list_get_or_zero(&hextets, 4);
+      let h5 = list_get_or_zero(&hextets, 5);
+      let h6 = list_get_or_zero(&hextets, 6);
+      let h7 = list_get_or_zero(&hextets, 7);
+      return h0 == 0 && h1 == 0 && h2 == 0 && h3 == 0 && h4 == 0 && h5 == 0 && h6 == 0 && h7 == 1;
     }
-    return false;
-  }
-
-  // IPv6 ループバック: "::1"
-  if blen == 3 {
-    let c0 = b.get(0).unwrap_or(0);
-    let c1 = b.get(1).unwrap_or(0);
-    let c2 = b.get(2).unwrap_or(0);
-    if c0 == 58 && c1 == 58 && c2 == 49 {  // "::1"
-      return true;
-    }
-  }
-
-  // IPv6 完全表記: 0000:0000:0000:0000:0000:0000:0000:0001 または 0:0:0:0:0:0:0:1
-  if blen == 15 {
-    // "0:0:0:0:0:0:0:1"
-    let c_last = b.get(14).unwrap_or(0);
-    if c_last == 49 {
-      return true;
-    }
+    None => {}
   }
 
   return false;
@@ -337,47 +541,189 @@ pub fn tracker_crypto_waiting_count(t: &RelayTracker) -> Int
   return t.crypto_waiting_count;
 }
 
+fn push_hex_nibble(buf: &mut Bytes, d: Int)
+  intent "4 ビット数値を小文字 16 進文字としてバッファに追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if d >= 0 && d <= 9 {
+    buf.push(48 + d);
+  } else if d >= 10 && d <= 15 {
+    buf.push(97 + (d - 10));
+  }
+}
+
+fn push_hextet_hex(buf: &mut Bytes, val: Int)
+  intent "16 ビット数値を小文字 16 進文字列としてバッファに追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if val == 0 {
+    buf.push(48);
+    return;
+  }
+  let mut temp = List.new();
+  let mut v = val;
+  while v > 0 {
+    temp.push(v % 16);
+    v = v / 16;
+  }
+  let mut i = temp.len() - 1;
+  while i >= 0 {
+    match temp.get(i) {
+      Some(d) => {
+        push_hex_nibble(&mut buf, d + 0);
+      }
+      None => {}
+    }
+    i = i - 1;
+  }
+}
+
+fn format_ipv6_slash64(hextets: &List<Int>) -> String
+  intent "先頭 4 つの hextet をコロン区切り 16 進文字列として整形する (/64)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  let mut i = 0;
+  while i < 4 {
+    if i > 0 {
+      buf.push(58);  // ':'
+    }
+    let h = list_get_or_zero(&hextets, i);
+    push_hextet_hex(&mut buf, h);
+    i = i + 1;
+  }
+  return buf.to_string_utf8().unwrap_or("");
+}
+
+fn push_dec_uint(buf: &mut Bytes, val: Int)
+  intent "正の整数を 10 進数文字としてバッファに追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if val == 0 {
+    buf.push(48);
+    return;
+  }
+  let mut temp = List.new();
+  let mut v = val;
+  while v > 0 {
+    temp.push(v % 10);
+    v = v / 10;
+  }
+  let mut i = temp.len() - 1;
+  while i >= 0 {
+    match temp.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+    i = i - 1;
+  }
+}
+
+fn format_ipv4(o0: Int, o1: Int, o2: Int, o3: Int) -> String
+  intent "4 つのオクテットをドット 10 進表記の IPv4 文字列に整形する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  push_dec_uint(&mut buf, o0);
+  buf.push(46);
+  push_dec_uint(&mut buf, o1);
+  buf.push(46);
+  push_dec_uint(&mut buf, o2);
+  buf.push(46);
+  push_dec_uint(&mut buf, o3);
+  return buf.to_string_utf8().unwrap_or("");
+}
+
 pub fn extract_source_key(peer_addr: &String) -> String
-  intent "接続元 IP（IPv4 は /32、IPv6 は /64 相当のプレフィクス）を抽出する（決定 4.5）"
+  intent "接続元 IP（IPv4 は /32、IPv6 はデコードした /64 相当のプレフィクス）を抽出する（決定 4.5）"
   requires none
   ensures none
   effects none
 {
   let b = peer_addr.as_bytes();
   let blen = b.byte_len();
+  if blen == 0 {
+    return peer_addr.clone();
+  }
 
-  // IPv6（コロンを含む）の場合: 最初の 4 セグメント（/64）までを取り出す
+  // 1. 角括弧形式 [ipv6]:port または [ipv6]
+  if b.get(0).unwrap_or(0) == 91 {  // '['
+    let mut close_idx = -1;
+    let mut i = 1;
+    while i < blen {
+      if b.get(i).unwrap_or(0) == 93 {  // ']'
+        close_idx = i;
+        i = blen;
+      }
+      i = i + 1;
+    }
+    if close_idx > 1 {
+      let raw_v6_bytes = b.slice(1, close_idx).unwrap_or(Bytes.new());
+      let raw_v6_str = raw_v6_bytes.to_string_utf8().unwrap_or(peer_addr.clone());
+      return match parse_ipv6_hextets(&raw_v6_str) {
+        Some(hextets) => format_ipv6_slash64(&hextets),
+        None => raw_v6_str,
+      };
+    }
+  }
+
+  // 2. ドットを含む場合（IPv4 または IPv4:port）
   let mut dot_count = 0;
-  let mut colon_count = 0;
-  let mut port_colon = blen;
-  let mut cut_idx_v6 = blen;
-  let mut i = 0;
-
-  while i < blen {
-    let c = b.get(i).unwrap_or(0);
+  let mut last_dot = -1;
+  let mut colon_after_dot = -1;
+  let mut j = 0;
+  while j < blen {
+    let c = b.get(j).unwrap_or(0);
     if c == 46 {  // '.'
       dot_count = dot_count + 1;
-    }
-    if c == 58 {  // ':'
-      colon_count = colon_count + 1;
-      port_colon = i;
-      if colon_count == 4 {
-        cut_idx_v6 = i;
+      last_dot = j;
+    } else if c == 58 {  // ':'
+      if last_dot >= 0 {
+        colon_after_dot = j;
       }
     }
-    i = i + 1;
+    j = j + 1;
   }
 
-  // IPv4: 3 個のドットがある場合
   if dot_count == 3 {
-    let ip_only = b.slice(0, port_colon).unwrap_or(Bytes.new());
-    return ip_only.to_string_utf8().unwrap_or(peer_addr.clone());
+    let end_pos = match colon_after_dot >= 0 {
+      true => colon_after_dot,
+      false => blen,
+    };
+    let ip_bytes = b.slice(0, end_pos).unwrap_or(Bytes.new());
+    let ip_str = ip_bytes.to_string_utf8().unwrap_or(peer_addr.clone());
+    match parse_ipv4_octets(&ip_str) {
+      Some(octets) => {
+        let o0 = list_get_or_zero(&octets, 0);
+        let o1 = list_get_or_zero(&octets, 1);
+        let o2 = list_get_or_zero(&octets, 2);
+        let o3 = list_get_or_zero(&octets, 3);
+        return format_ipv4(o0, o1, o2, o3);
+      }
+      None => {
+        return ip_str;
+      }
+    }
   }
 
-  // IPv6: 2 個以上のコロンがある場合
-  if colon_count >= 2 {
-    let prefix = b.slice(0, cut_idx_v6).unwrap_or(Bytes.new());
-    return prefix.to_string_utf8().unwrap_or(peer_addr.clone());
+  // 3. IPv6（括弧なし、例: "2001:db8::1", "::1"）
+  match parse_ipv6_hextets(&peer_addr) {
+    Some(hextets) => {
+      return format_ipv6_slash64(&hextets);
+    }
+    None => {}
   }
 
   return peer_addr.clone();
@@ -594,7 +940,7 @@ pub fn tracker_connection_closed(tracker: &mut RelayTracker, peer_addr: &String,
 }
 
 pub fn tracker_try_acquire_crypto(tracker: &mut RelayTracker, limits: &ShieldLimits) -> Bool
-  intent "鍵交換・署名並行計算タスクの取得を試みる（既定 2、超過時は待機）"
+  intent "鍵交換・署名並行計算タスクの取得を試みる（既定 2、超過時は待機数を加算して false）"
   requires none
   ensures none
   effects none
@@ -607,15 +953,40 @@ pub fn tracker_try_acquire_crypto(tracker: &mut RelayTracker, limits: &ShieldLim
   return false;
 }
 
-pub fn tracker_release_crypto(tracker: &mut RelayTracker)
-  intent "鍵交換・署名並行計算タスクの完了を通知し解放する"
+pub fn tracker_try_acquire_waiting_crypto(tracker: &mut RelayTracker, limits: &ShieldLimits) -> Bool
+  intent "待機中だったタスクが空いた暗号計算パーミットの取得を試みる（成功時に待機数を減算）"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_crypto_tasks < limits.max_concurrent_crypto_tasks {
+    tracker.active_crypto_tasks = tracker.active_crypto_tasks + 1;
+    if tracker.crypto_waiting_count > 0 {
+      tracker.crypto_waiting_count = tracker.crypto_waiting_count - 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+pub fn tracker_cancel_waiting_crypto(tracker: &mut RelayTracker)
+  intent "タイムアウト等により暗号計算タスクの待機を取り消す"
   requires none
   ensures none
   effects none
 {
   if tracker.crypto_waiting_count > 0 {
     tracker.crypto_waiting_count = tracker.crypto_waiting_count - 1;
-  } else if tracker.active_crypto_tasks > 0 {
+  }
+}
+
+pub fn tracker_release_crypto(tracker: &mut RelayTracker)
+  intent "鍵交換・署名並行計算タスクの完了を通知し解放する"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_crypto_tasks > 0 {
     tracker.active_crypto_tasks = tracker.active_crypto_tasks - 1;
   }
 }
