@@ -35,6 +35,8 @@ pub struct ParsedCertificate {
   not_before: Int,
   not_after: Int,
   subject_der: Bytes,
+  spki_alg_oid: Bytes,
+  spki_curve_oid: Bytes,
   spki_public_key: Bytes,
   san_dns_names: List<String>,
 }
@@ -718,7 +720,9 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
   }
 
   // 7. subjectPublicKeyInfo (SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING })
-  let mut spki_public_key = Bytes.with_capacity(65);
+  let mut spki_alg_oid = Bytes.new();
+  let mut spki_curve_oid = Bytes.new();
+  let mut spki_public_key = Bytes.new();
   match tbs_children.get(6) {
     Some(spki_elem) => {
       if spki_elem.tag != tag_sequence() {
@@ -732,7 +736,7 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
       match spki_children.get(0) {
         Some(spki_alg_elem) => {
           let spki_alg_children = read_children_cert(&spki_alg_elem)?;
-          if spki_alg_children.len() < 2 {
+          if spki_alg_children.is_empty() {
             return Err(CertError.InvalidPublicKey);
           }
           match spki_alg_children.get(0) {
@@ -740,35 +744,21 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
               if alg_id_elem.tag != tag_oid() {
                 return Err(CertError.InvalidPublicKey);
               }
-              if bytes_equal(&alg_id_elem.content, &oid_rsa()) {
-                return Err(CertError.UnsupportedAlgorithm("RSA"));
-              }
-              if bytes_equal(&alg_id_elem.content, &oid_ed25519()) {
-                return Err(CertError.UnsupportedAlgorithm("Ed25519"));
-              }
-              if !bytes_equal(&alg_id_elem.content, &oid_id_ec_public_key()) {
-                return Err(CertError.UnsupportedAlgorithm("Unknown"));
-              }
+              spki_alg_oid = alg_id_elem.content.clone();
             }
             None => {
               return Err(CertError.InvalidPublicKey);
             }
           }
 
-          match spki_alg_children.get(1) {
-            Some(curve_id_elem) => {
-              if curve_id_elem.tag != tag_oid() {
-                return Err(CertError.InvalidPublicKey);
+          if spki_alg_children.len() > 1 {
+            match spki_alg_children.get(1) {
+              Some(curve_id_elem) => {
+                if curve_id_elem.tag == tag_oid() {
+                  spki_curve_oid = curve_id_elem.content.clone();
+                }
               }
-              if bytes_equal(&curve_id_elem.content, &oid_secp384r1()) {
-                return Err(CertError.UnsupportedCurve("secp384r1"));
-              }
-              if !bytes_equal(&curve_id_elem.content, &oid_secp256r1()) {
-                return Err(CertError.UnsupportedCurve("Unknown"));
-              }
-            }
-            None => {
-              return Err(CertError.InvalidPublicKey);
+              None => {}
             }
           }
         }
@@ -782,16 +772,14 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
           if spk_bitstr.tag != tag_bit_string() {
             return Err(CertError.InvalidPublicKey);
           }
-          if spk_bitstr.content.byte_len() != 66 {
+          let bslen = spk_bitstr.content.byte_len();
+          if bslen < 1 {
             return Err(CertError.InvalidPublicKey);
           }
           if spk_bitstr.content.get(0).unwrap_or(255) != 0 {
             return Err(CertError.InvalidPublicKey);
           }
-          if spk_bitstr.content.get(1).unwrap_or(0) != 4 {
-            return Err(CertError.InvalidPublicKey);
-          }
-          match spk_bitstr.content.slice(1, 66) {
+          match spk_bitstr.content.slice(1, bslen) {
             Ok(s) => {
               spki_public_key = s;
             }
@@ -887,7 +875,7 @@ pub fn parse_certificate(der: &Bytes) -> Result<ParsedCertificate, CertError>
     tbs_idx = tbs_idx + 1;
   }
 
-  return Ok(ParsedCertificate { raw_der: der.clone(), version: 3, serial_number: serial_number, issuer_der: issuer_der, not_before: not_before, not_after: not_after, subject_der: subject_der, spki_public_key: spki_public_key, san_dns_names: san_dns_names });
+  return Ok(ParsedCertificate { raw_der: der.clone(), version: 3, serial_number: serial_number, issuer_der: issuer_der, not_before: not_before, not_after: not_after, subject_der: subject_der, spki_alg_oid: spki_alg_oid, spki_curve_oid: spki_curve_oid, spki_public_key: spki_public_key, san_dns_names: san_dns_names });
 }
 
 pub fn match_san_pattern(pattern: &String, host: &String) -> Bool
@@ -972,9 +960,33 @@ pub fn validate_certificate_chain(chain: &List<ParsedCertificate>, private_key: 
     }
   }
 
-  // 1. リーフ証明書の公開鍵と秘密鍵の一致検査
+  // 1. リーフ証明書の公開鍵と秘密鍵の一致検査（リーフのみ P-256 を強制）
   match chain.get(0) {
     Some(leaf) => {
+      // アルゴリズム検査
+      if bytes_equal(&leaf.spki_alg_oid, &oid_rsa()) {
+        return Err(CertError.UnsupportedAlgorithm("RSA"));
+      }
+      if bytes_equal(&leaf.spki_alg_oid, &oid_ed25519()) {
+        return Err(CertError.UnsupportedAlgorithm("Ed25519"));
+      }
+      if !bytes_equal(&leaf.spki_alg_oid, &oid_id_ec_public_key()) {
+        return Err(CertError.UnsupportedAlgorithm("Unknown"));
+      }
+
+      // 曲線検査
+      if bytes_equal(&leaf.spki_curve_oid, &oid_secp384r1()) {
+        return Err(CertError.UnsupportedCurve("secp384r1"));
+      }
+      if !bytes_equal(&leaf.spki_curve_oid, &oid_secp256r1()) {
+        return Err(CertError.UnsupportedCurve("Unknown"));
+      }
+
+      // 公開鍵形式検査（65 バイト非圧縮 P-256 形式: 0x04 || X || Y）
+      if leaf.spki_public_key.byte_len() != 65 || leaf.spki_public_key.get(0).unwrap_or(0) != 4 {
+        return Err(CertError.InvalidPublicKey);
+      }
+
       let derived_pub = ecdsa_p256_public_key(&private_key);
       let derived_pub_bytes = derived_pub.to_bytes();
       if !bytes_equal(&leaf.spki_public_key, &derived_pub_bytes) {

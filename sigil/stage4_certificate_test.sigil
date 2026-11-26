@@ -107,6 +107,15 @@ fn get_fullchain_pem() -> String
   return "-----BEGIN CERTIFICATE-----\nMIIBVjCB/qADAgECAgECMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABCyOKaYjpAl9m3MSM7u0NXAR0PcUNoYU1x6D+Lz453mHi9573/5C\nCUcyByGfuGqC64x9CA+LJ3f0qdNGCEVQmx6jKTAnMCUGA1UdEQQeMByCC2V4YW1w\nbGUuY29tgg0qLmV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0cAMEQCIBwPwgIYt/HT\nFjg38v/ztFwZSNUvesJx5EYF1lnL773lAiAS4oI8uwonf2OgwhcSeaeRPd4WkBgS\nQuVXzxohuYlvNw==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBVTCB/KADAgECAgEBMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAqMRAwDgYDVQQDDAdUZXN0IENBMRYwFAYDVQQKDA1TaGllbGQgVExT\nIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExPyFTXe4R43oDNkBL8Vo2FYv\nWdlb5xCH8GvRf2gbu8MMmPzvupBajfVjZA8Cry9W2mZJ4K/Hp0Wp0V0uFCtNBaMT\nMBEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3+ozQ5fDf3mCs\nMYu/I0Cdd6iIOzGQd9OYKmZupKnV5wIhAMSh6uvvLlZgqYLTsGftiqaR7yCFBgyE\nIa6AnmlqfbLJ\n-----END CERTIFICATE-----\n";
 }
 
+fn get_p384_ca_chain_pem() -> String
+  intent "P-384 中間 CA が署名した P-256 リーフの証明書チェーン PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBgjCCAQigAwIBAgIBZTAKBggqhkjOPQQDAzA1MRYwFAYDVQQDDA1UZXN0IFAt\nMzg0IENBMRswGQYDVQQKDBJTaGllbGQgVExTIFAzODQgQ0EwHhcNMjUwMTAxMDAw\nMDAwWhcNMjgwMTAxMDAwMDAwWjAdMRswGQYDVQQDDBJwMzg0Y2EuZXhhbXBsZS5j\nb20wWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQsjimmI6QJfZtzEjO7tDVwEdD3\nFDaGFNceg/i8+Od5h4vee9/+QglHMgchn7hqguuMfQgPiyd39KnTRghFUJseoyEw\nHzAdBgNVHREEFjAUghJwMzg0Y2EuZXhhbXBsZS5jb20wCgYIKoZIzj0EAwMDaAAw\nZQIxANXCNrDzwHhUW7G1SpjZsj07Qf0eqQv2STy3EBxpbgoSdblnBVZMM3cxLmzL\nUMjJ8gIwWG4euIs6dM8jFtLbZvKGpQXUxG7pKWO8zhzJCdPZaMKOW/JoNEZr05iZ\nSbks4mi2\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBqDCCAS+gAwIBAgIBZDAKBggqhkjOPQQDAzA1MRYwFAYDVQQDDA1UZXN0IFAt\nMzg0IENBMRswGQYDVQQKDBJTaGllbGQgVExTIFAzODQgQ0EwHhcNMjUwMTAxMDAw\nMDAwWhcNMjgwMTAxMDAwMDAwWjA1MRYwFAYDVQQDDA1UZXN0IFAtMzg0IENBMRsw\nGQYDVQQKDBJTaGllbGQgVExTIFAzODQgQ0EwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\nAARWuuV3vVyKDHz2XD/2TwaghpaBJYPgF8dStaBWUZNUZlBjpW1Z5cNUsghYDm/H\ndvTYpCxxz6HlcWC1c2vaOmIiebvddUJT2aEMmm83OACn7bORiJp42oj/VviIrw+q\nZUajEzARMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDZwAwZAIwf4jYZv6n\n6R/TXs8LP99yopvR0GBGHAh4ljOk6ZOZYM0YSu06n30HQ6/X36CrJj6fAjBDHmdw\nP9WHcDjvw1BsY4497ZGymeijtXRtGw/y8jl0g/tSr2oXDu9T0ko/4WLhYtQ=\n-----END CERTIFICATE-----\n";
+}
+
 fn test_base64_strict() -> Int
   intent "Base64 厳格デコードのテスト（決定 2.1）"
   requires none
@@ -516,6 +525,18 @@ fn test_chain_validation() -> Int
     }
   }
 
+  // P-384 中間 CA を持つ P-256 リーフ証明書チェーンの受理テスト（P2 指摘 2）
+  let p384_chain = get_p384_ca_chain_pem();
+  let mut p384_names = List.new();
+  p384_names.push("p384ca.example.com");
+  let bundle_p384_ca = load_bundle_from_pem_text(&p384_chain, &key_pem, &p384_names, Some(1748736000));
+  match bundle_p384_ca {
+    Ok(_) => {}
+    Err(_) => {
+      return 612;
+    }
+  }
+
   return 0;
 }
 
@@ -637,6 +658,99 @@ fn test_hostname_and_sni() -> Int
     }
     Err(_) => {
       return 709;
+    }
+  }
+
+  // 混合ケース設定名の正規化と SNI 選択・default_server_name 照合（P2 指摘 1）
+  let mut mixed_names = List.new();
+  mixed_names.push("WWW.example.com");
+
+  match load_bundle_from_pem_text(&fullchain, &key_pem, &mixed_names, Some(1748736000)) {
+    Ok(mixed_bundle) => {
+      let mut mixed_bundles = List.new();
+      mixed_bundles.push(mixed_bundle);
+
+      match new_certificate_store(mixed_bundles, Some("WWW.example.com")) {
+        Ok(mixed_store) => {
+          // 小文字のクライアント SNI で一致すること
+          match select_certificate_for_sni(&mixed_store, &Some("www.example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 719;
+              }
+            }
+            Err(_) => {
+              return 720;
+            }
+          }
+
+          // 混合ケースのクライアント SNI でも一致すること
+          match select_certificate_for_sni(&mixed_store, &Some("WWW.example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 721;
+              }
+            }
+            Err(_) => {
+              return 722;
+            }
+          }
+
+          // SNI なし時に正規化された default_server_name で一致すること
+          match select_certificate_for_sni(&mixed_store, &None) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 723;
+              }
+            }
+            Err(_) => {
+              return 724;
+            }
+          }
+        }
+        Err(_) => {
+          return 725;
+        }
+      }
+    }
+    Err(_) => {
+      return 726;
+    }
+  }
+
+  // 混合ケースでの重複名検査（WWW.example.com と www.example.com）
+  let mut dup_names1 = List.new();
+  dup_names1.push("WWW.example.com");
+  match load_bundle_from_pem_text(&fullchain, &key_pem, &dup_names1, Some(1748736000)) {
+    Ok(b_dup1) => {
+      let mut dup_names2 = List.new();
+      dup_names2.push("www.example.com");
+      match load_bundle_from_pem_text(&fullchain, &key_pem, &dup_names2, Some(1748736000)) {
+        Ok(b_dup2) => {
+          let mut dup_bundles = List.new();
+          dup_bundles.push(b_dup1);
+          dup_bundles.push(b_dup2);
+          match new_certificate_store(dup_bundles, None) {
+            Ok(_) => {
+              return 727;
+            }
+            Err(e) => {
+              match e {
+                CertError.DuplicateConfiguredName(_) => {}
+                _ => {
+                  return 728;
+                }
+              }
+            }
+          }
+        }
+        Err(_) => {
+          return 729;
+        }
+      }
+    }
+    Err(_) => {
+      return 730;
     }
   }
 

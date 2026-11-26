@@ -200,6 +200,48 @@ pub fn normalize_hostname(host: &String) -> Result<String, CertError>
   };
 }
 
+pub fn normalize_configured_name(name: &String) -> Result<String, CertError>
+  intent "設定された名前（完全修飾ホスト名または *.domain ワイルドカード）を小文字正規化・検証する（決定 2.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = name.as_bytes();
+  let blen = b.byte_len();
+  if blen > 2 && b.get(0).unwrap_or(0) == 42 && b.get(1).unwrap_or(0) == 46 {
+    // "*."
+    let mut sub_bytes = Bytes.new();
+    match b.slice(2, blen) {
+      Ok(s) => {
+        sub_bytes = s;
+      }
+      Err(_) => {
+        return Err(CertError.InvalidSubpath("Failed to slice wildcard hostname"));
+      }
+    }
+    let mut sub = "";
+    match sub_bytes.to_string_utf8() {
+      Ok(s) => {
+        sub = s;
+      }
+      Err(_) => {
+        return Err(CertError.InvalidSubpath("Invalid UTF-8 in wildcard hostname"));
+      }
+    }
+    let norm_sub = normalize_hostname(&sub)?;
+    let mut out_bytes = Bytes.with_capacity(2 + norm_sub.as_bytes().byte_len());
+    out_bytes.push(42);
+    out_bytes.push(46);
+    out_bytes.extend(&norm_sub.as_bytes());
+    return match out_bytes.to_string_utf8() {
+      Ok(s) => Ok(s),
+      Err(_) => Err(CertError.InvalidSubpath("Invalid UTF-8 in normalized hostname")),
+    };
+  }
+
+  return normalize_hostname(&name);
+}
+
 pub fn new_certificate_bundle(configured_names: List<String>, cert_chain_der: List<Bytes>, leaf_cert: ParsedCertificate, private_key: EcdsaP256PrivateKey) -> CertificateBundle
   intent "検証済みの証明書バンドルを生成する"
   requires none
@@ -242,43 +284,50 @@ pub fn new_certificate_store(bundles: List<CertificateBundle>, default_server_na
     return Err(CertError.SanCountExceeded(total_names, max_server_names_count()));
   }
 
-  // 2. 名前の重複検査（重複した名前の設定は起動時に拒否。決定 2.4）
+  // 2. 名前の重複検査と正規化（重複した名前の設定は起動時に拒否。決定 2.4）
   let mut seen_names = List.new();
+  let mut norm_bundles = List.new();
   bi = 0;
   while bi < bundles.len() {
     match bundles.get(bi) {
       Some(b) => {
+        let mut norm_names = List.new();
         let mut ni = 0;
         while ni < b.configured_names.len() {
           match b.configured_names.get(ni) {
             Some(name) => {
+              let norm_name = normalize_configured_name(&name)?;
               let mut si = 0;
               while si < seen_names.len() {
                 match seen_names.get(si) {
                   Some(existing) => {
-                    if existing == name {
-                      return Err(CertError.DuplicateConfiguredName(name.clone()));
+                    if existing == norm_name {
+                      return Err(CertError.DuplicateConfiguredName(norm_name.clone()));
                     }
                   }
                   None => {}
                 }
                 si = si + 1;
               }
-              seen_names.push(name.clone());
+              seen_names.push(norm_name.clone());
+              norm_names.push(norm_name);
             }
             None => {}
           }
           ni = ni + 1;
         }
+        norm_bundles.push(CertificateBundle { configured_names: norm_names, cert_chain_der: b.cert_chain_der.clone(), leaf_cert: b.leaf_cert.clone(), private_key: b.private_key.clone(), not_after: b.not_after });
       }
       None => {}
     }
     bi = bi + 1;
   }
 
-  // 3. default_server_name が設定されている場合、いずれかのバンドルに存在すること
+  // 3. default_server_name が設定されている場合、正規化していずれかのバンドルに存在すること
+  let mut norm_default_server_name = None;
   match &default_server_name {
-    Some(def_name) => {
+    Some(def_raw) => {
+      let def_name = normalize_configured_name(&def_raw)?;
       let mut found = false;
       let mut si = 0;
       while si < seen_names.len() {
@@ -295,11 +344,12 @@ pub fn new_certificate_store(bundles: List<CertificateBundle>, default_server_na
       if !found {
         return Err(CertError.ConfiguredNameNotCovered(def_name.clone()));
       }
+      norm_default_server_name = Some(def_name);
     }
     None => {}
   }
 
-  return Ok(CertificateStore { bundles: bundles, default_server_name: default_server_name });
+  return Ok(CertificateStore { bundles: norm_bundles, default_server_name: norm_default_server_name });
 }
 
 pub fn select_certificate_for_sni(store: &CertificateStore, raw_sni: &Option<String>) -> Result<Int, AlertDescription>
@@ -501,11 +551,25 @@ pub fn load_bundle_from_pem_text(cert_pem_text: &String, key_pem_text: &String, 
         ci = ci + 1;
       }
 
-      // 3. チェーンおよび公開鍵・有効期間・名前の適合性検証
-      validate_certificate_chain(&parsed_chain, &private_key, now_secs, &configured_names)?;
+      // 3. 設定された名前の正規化
+      let mut normalized_names = List.new();
+      let mut ni = 0;
+      while ni < configured_names.len() {
+        match configured_names.get(ni) {
+          Some(raw_name) => {
+            let norm_name = normalize_configured_name(&raw_name)?;
+            normalized_names.push(norm_name);
+          }
+          None => {}
+        }
+        ni = ni + 1;
+      }
+
+      // 4. チェーンおよび公開鍵・有効期間・名前の適合性検証
+      validate_certificate_chain(&parsed_chain, &private_key, now_secs, &normalized_names)?;
 
       return match parsed_chain.get(0) {
-        Some(leaf) => Ok(new_certificate_bundle(configured_names.clone(), cert_chain_der, leaf.clone(), private_key)),
+        Some(leaf) => Ok(new_certificate_bundle(normalized_names, cert_chain_der, leaf.clone(), private_key)),
         None => Err(CertError.ChainEmpty),
       };
     }
