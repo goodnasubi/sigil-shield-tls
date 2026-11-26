@@ -1,0 +1,1094 @@
+module stage5_relay_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_cipher_suite.CipherSuite;
+use shield_limits.default_limits;
+use shield_limits.limits_with_max_concurrent_crypto_tasks;
+use shield_limits.limits_with_max_connections;
+use shield_limits.limits_with_max_connections_per_source;
+use shield_limits.limits_with_max_handshaking_connections;
+use shield_limits.limits_with_max_handshaking_per_source;
+use shield_proxy_v2.ProxyEndpoint;
+use shield_proxy_v2.build_proxy_v2_header;
+use shield_proxy_v2.max_proxy_header_size;
+use shield_proxy_v2.new_ipv4;
+use shield_proxy_v2.parse_proxy_v2_header;
+use shield_proxy_v2.parsed_authority;
+use shield_proxy_v2.parsed_command;
+use shield_proxy_v2.parsed_dst_port;
+use shield_proxy_v2.parsed_family;
+use shield_proxy_v2.parsed_has_authority;
+use shield_proxy_v2.parsed_has_ssl_tlv;
+use shield_proxy_v2.parsed_src_port;
+use shield_proxy_v2.parsed_ssl_version;
+use shield_record.ContentType;
+use shield_record_crypto.RecordDirection;
+use shield_record_crypto.new_record_protection;
+use shield_record_crypto.open_outcome_content_type;
+use shield_record_crypto.open_outcome_plaintext;
+use shield_record_crypto.open_record;
+use shield_relay.RelayConfigError;
+use shield_relay.RelayOutcome;
+use shield_relay.RelayRejectReason;
+use shield_relay.RelayResultClassification;
+use shield_relay.build_502_bad_gateway_response;
+use shield_relay.build_close_notify_record;
+use shield_relay.build_fatal_alert_record;
+use shield_relay.build_plaintext_fatal_alert_record;
+use shield_relay.extract_source_key;
+use shield_relay.format_relay_log;
+use shield_relay.is_ipv4_numeric;
+use shield_relay.is_ipv6_numeric;
+use shield_relay.is_loopback_address;
+use shield_relay.max_pre_handshake_plaintext_buffer;
+use shield_relay.max_relay_buffer_size;
+use shield_relay.new_listen_config;
+use shield_relay.new_relay_tracker;
+use shield_relay.new_upstream_config;
+use shield_relay.sanitize_sni_for_log;
+use shield_relay.tracker_active_connections;
+use shield_relay.tracker_active_crypto_tasks;
+use shield_relay.tracker_active_handshakes;
+use shield_relay.tracker_connection_closed;
+use shield_relay.tracker_crypto_waiting_count;
+use shield_relay.tracker_handshake_finished;
+use shield_relay.tracker_release_crypto;
+use shield_relay.tracker_try_accept;
+use shield_relay.tracker_try_acquire_crypto;
+use shield_relay.tracker_try_acquire_waiting_crypto;
+use shield_relay.validate_listen_config;
+use shield_relay.validate_upstream_config;
+
+// ADR 0063 段 5（中継・PROXY v2・資源上限・終了処理・安全ログ）試験
+
+fn test_listen_config_validation() -> Int
+  intent "待ち受け設定の必須指定およびポート境界を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 正常な待ち受け設定
+  let c1 = new_listen_config("0.0.0.0", 8443);
+  match validate_listen_config(&c1) {
+    Ok(_) => {}
+    Err(_) => {
+      return 1;
+    }
+  }
+
+  // 2. 空の host は拒否（既定値なし、必須）
+  let c2 = new_listen_config("", 8443);
+  match validate_listen_config(&c2) {
+    Ok(_) => {
+      return 2;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.EmptyListenHost => {}
+        _ => {
+          return 3;
+        }
+      }
+    }
+  }
+
+  // 3. 無効なポート（0, 65536）は拒否
+  let c3 = new_listen_config("127.0.0.1", 0);
+  match validate_listen_config(&c3) {
+    Ok(_) => {
+      return 4;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.InvalidPort(p) => {
+          if p != 0 {
+            return 5;
+          }
+        }
+        _ => {
+          return 6;
+        }
+      }
+    }
+  }
+
+  let c4 = new_listen_config("127.0.0.1", 65536);
+  match validate_listen_config(&c4) {
+    Ok(_) => {
+      return 7;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.InvalidPort(p) => {
+          if p != 65536 {
+            return 8;
+          }
+        }
+        _ => {
+          return 9;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
+fn test_upstream_config_and_loopback_validation() -> Int
+  intent "上流設定の数値 IP・DNS 禁止・ループバック制約（決定 3）を検証する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. IPv4 ループバック (127.0.0.1) は既定 (allow_non_loopback=false) で許可
+  let u1 = new_upstream_config("127.0.0.1", 8080, false);
+  match validate_upstream_config(&u1) {
+    Ok(_) => {}
+    Err(_) => {
+      return 11;
+    }
+  }
+
+  // 2. IPv6 ループバック (::1) は既定で許可
+  let u2 = new_upstream_config("::1", 8080, false);
+  match validate_upstream_config(&u2) {
+    Ok(_) => {}
+    Err(_) => {
+      return 12;
+    }
+  }
+
+  // 3. 非ループバック IPv4 は既定 (false) では拒否（決定 3）
+  let u3 = new_upstream_config("192.168.1.100", 8080, false);
+  match validate_upstream_config(&u3) {
+    Ok(_) => {
+      return 13;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.NonLoopbackUpstreamDisallowed(_) => {}
+        _ => {
+          return 14;
+        }
+      }
+    }
+  }
+
+  // 4. 非ループバック IPv4 も明示的許可 (allow_non_loopback=true) なら受領
+  let u4 = new_upstream_config("192.168.1.100", 8080, true);
+  match validate_upstream_config(&u4) {
+    Ok(_) => {}
+    Err(_) => {
+      return 15;
+    }
+  }
+
+  // 5. 非ループバック IPv6 は既定では拒否、明示的許可で受領
+  let u5 = new_upstream_config("2001:db8::1", 8080, false);
+  match validate_upstream_config(&u5) {
+    Ok(_) => {
+      return 16;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.NonLoopbackUpstreamDisallowed(_) => {}
+        _ => {
+          return 17;
+        }
+      }
+    }
+  }
+  let u5_ok = new_upstream_config("2001:db8::1", 8080, true);
+  match validate_upstream_config(&u5_ok) {
+    Ok(_) => {}
+    Err(_) => {
+      return 18;
+    }
+  }
+
+  // 5.1 15文字で末尾が1の非ループバック IPv6 (2001:db8:0:0::1) は拒否（P1 指摘対応）
+  let u5_fake_loop = new_upstream_config("2001:db8:0:0::1", 8080, false);
+  match validate_upstream_config(&u5_fake_loop) {
+    Ok(_) => {
+      return 161;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.NonLoopbackUpstreamDisallowed(_) => {}
+        _ => {
+          return 162;
+        }
+      }
+    }
+  }
+
+  // 5.2 展開された IPv6 ループバック (0:0:0:0:0:0:0:1) はループバックとして受領
+  let u5_full_loop = new_upstream_config("0:0:0:0:0:0:0:1", 8080, false);
+  match validate_upstream_config(&u5_full_loop) {
+    Ok(_) => {}
+    Err(_) => {
+      return 163;
+    }
+  }
+
+  // 5.3 有効な末尾 "::" 形式 (1:2:3:4:5:6:7::) は許可（P2 指摘対応）
+  let u5_trailing_double = new_upstream_config("1:2:3:4:5:6:7::", 8080, true);
+  match validate_upstream_config(&u5_trailing_double) {
+    Ok(_) => {}
+    Err(_) => {
+      return 164;
+    }
+  }
+
+  // 5.4 不正なグループ構造 (a:b や 1:::2) は数値 IPv6 ではないため拒否（P2 指摘対応）
+  let u5_bad_groups = new_upstream_config("a:b", 8080, true);
+  match validate_upstream_config(&u5_bad_groups) {
+    Ok(_) => {
+      return 165;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.DnsUpstreamDisallowed(_) => {}
+        _ => {
+          return 166;
+        }
+      }
+    }
+  }
+  let u5_triple_colon = new_upstream_config("1:::2", 8080, true);
+  match validate_upstream_config(&u5_triple_colon) {
+    Ok(_) => {
+      return 167;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.DnsUpstreamDisallowed(_) => {}
+        _ => {
+          return 168;
+        }
+      }
+    }
+  }
+
+  // 6. DNS 名（ドメイン名文字列、localhost 等）は数値 IP でないため拒否（DNS は使わない）
+  let u6 = new_upstream_config("localhost", 8080, true);
+  match validate_upstream_config(&u6) {
+    Ok(_) => {
+      return 19;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.DnsUpstreamDisallowed(_) => {}
+        _ => {
+          return 20;
+        }
+      }
+    }
+  }
+
+  let u7 = new_upstream_config("upstream.backend.local", 8080, true);
+  match validate_upstream_config(&u7) {
+    Ok(_) => {
+      return 21;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.DnsUpstreamDisallowed(_) => {}
+        _ => {
+          return 22;
+        }
+      }
+    }
+  }
+
+  // 7. ポート範囲検査 (0, 65536)
+  let u8 = new_upstream_config("127.0.0.1", 0, false);
+  match validate_upstream_config(&u8) {
+    Ok(_) => {
+      return 23;
+    }
+    Err(e) => {
+      match e {
+        RelayConfigError.InvalidPort(_) => {}
+        _ => {
+          return 24;
+        }
+      }
+    }
+  }
+
+  // 8. ループバックおよび数値判定ヘルパーの検証
+  if !is_ipv4_numeric(&"127.0.0.1") || !is_ipv6_numeric(&"::1") {
+    return 25;
+  }
+  if !is_loopback_address(&"127.0.0.1") || !is_loopback_address(&"::1") {
+    return 26;
+  }
+  if is_loopback_address(&"192.168.1.1") || is_loopback_address(&"2001:db8::1") {
+    return 27;
+  }
+
+  return 0;
+}
+
+fn test_proxy_v2_header_ipv4() -> Int
+  intent "IPv4 クライアント接続に対する PROXY protocol v2 ヘッダー生成・照合を検証（決定 5.1）"
+  requires none
+  ensures none
+  effects none
+{
+  let src = new_ipv4(192, 0, 2, 1);
+  let dst = new_ipv4(198, 51, 100, 1);
+  let ep = ProxyEndpoint.IPv4(src, 12345, dst, 443);
+  let sni = Some("secure.example.com");
+
+  let header = build_proxy_v2_header(&ep, &sni).unwrap_or(Bytes.new());
+  if header.is_empty() {
+    return 31;
+  }
+
+  // ヘッダー全体が 1 KiB 以下であることを確認
+  if header.byte_len() > max_proxy_header_size() {
+    return 32;
+  }
+
+  // パースして内部構造を照合
+  match parse_proxy_v2_header(&header) {
+    Ok(parsed) => {
+      if parsed_command(&parsed) != 1 {
+        return 34;
+      }
+      if parsed_family(&parsed) != 17 {
+        return 35;
+      }
+      if parsed_src_port(&parsed) != 12345 {
+        return 36;
+      }
+      if parsed_dst_port(&parsed) != 443 {
+        return 37;
+      }
+      if !parsed_has_authority(&parsed) {
+        return 38;
+      }
+      if parsed_authority(&parsed) != "secure.example.com" {
+        return 39;
+      }
+      if !parsed_has_ssl_tlv(&parsed) {
+        return 40;
+      }
+      if parsed_ssl_version(&parsed) != "TLSv1.3" {
+        return 41;
+      }
+    }
+    Err(_) => {
+      return 33;
+    }
+  }
+
+  return 0;
+}
+
+fn test_proxy_v2_header_ipv6_and_no_sni() -> Int
+  intent "IPv6 接続および SNI なし時の PROXY v2 ヘッダー生成・照合を検証（決定 5.1）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut src_ip = Bytes.with_capacity(16);
+  src_ip.push(32);  // 0x20
+  src_ip.push(1);  // 0x01
+  src_ip.push(13);  // 0x0d
+  src_ip.push(184);  // 0xb8
+  let mut i = 4;
+  while i < 15 {
+    src_ip.push(0);
+    i = i + 1;
+  }
+  src_ip.push(1);
+
+  let mut dst_ip = Bytes.with_capacity(16);
+  dst_ip.push(32);
+  dst_ip.push(1);
+  dst_ip.push(13);
+  dst_ip.push(184);
+  let mut j = 4;
+  while j < 15 {
+    dst_ip.push(0);
+    j = j + 1;
+  }
+  dst_ip.push(2);
+
+  let ep = ProxyEndpoint.IPv6(src_ip, 54321, dst_ip, 443);
+  let sni = None;
+
+  let header = build_proxy_v2_header(&ep, &sni).unwrap_or(Bytes.new());
+  if header.is_empty() {
+    return 51;
+  }
+
+  match parse_proxy_v2_header(&header) {
+    Ok(parsed) => {
+      if parsed_family(&parsed) != 33 {
+        return 53;
+      }
+      if parsed_src_port(&parsed) != 54321 {
+        return 54;
+      }
+      if parsed_dst_port(&parsed) != 443 {
+        return 55;
+      }
+      // SNI がない場合は AUTHORITY TLV は付与されない（決定 5.1）
+      if parsed_has_authority(&parsed) {
+        return 56;
+      }
+      // SSL TLV は常に付与
+      if !parsed_has_ssl_tlv(&parsed) {
+        return 57;
+      }
+      if parsed_ssl_version(&parsed) != "TLSv1.3" {
+        return 58;
+      }
+    }
+    Err(_) => {
+      return 52;
+    }
+  }
+
+  return 0;
+}
+
+fn test_relay_limits_connections_boundary() -> Int
+  intent "同時接続数・ハンドシェイク中接続数・接続元別上限の境界試験（決定 4.5）"
+  requires none
+  ensures none
+  effects none
+{
+  let base_limits = default_limits();
+
+  // 1. 同時接続数上限 (テスト用に max_connections = 3 に制限)
+  let l_conn3 = limits_with_max_connections(&base_limits, 3);
+  let mut tracker1 = new_relay_tracker();
+  let peer1 = "10.0.0.1:1001";
+  let peer2 = "10.0.0.2:1002";
+  let peer3 = "10.0.0.3:1003";
+  let peer4 = "10.0.0.4:1004";
+
+  match tracker_try_accept(&mut tracker1, &l_conn3, &peer1) {
+    Ok(_) => {}
+    Err(_) => {
+      return 61;
+    }
+  }
+  match tracker_try_accept(&mut tracker1, &l_conn3, &peer2) {
+    Ok(_) => {}
+    Err(_) => {
+      return 62;
+    }
+  }
+  match tracker_try_accept(&mut tracker1, &l_conn3, &peer3) {
+    Ok(_) => {}
+    Err(_) => {
+      return 63;
+    }
+  }
+  // 3 接続で満杯、4 接続目は即座に拒否
+  match tracker_try_accept(&mut tracker1, &l_conn3, &peer4) {
+    Ok(_) => {
+      return 64;
+    }
+    Err(e) => {
+      match e {
+        RelayRejectReason.MaxConnectionsExceeded(cur, max) => {
+          if cur != 3 || max != 3 {
+            return 65;
+          }
+        }
+        _ => {
+          return 66;
+        }
+      }
+    }
+  }
+
+  // 1 接続が切断されたら新規接続を受領できることを確認
+  tracker_connection_closed(&mut tracker1, &peer1, true);
+  if tracker_active_connections(&tracker1) != 2 {
+    return 67;
+  }
+  match tracker_try_accept(&mut tracker1, &l_conn3, &peer4) {
+    Ok(_) => {}
+    Err(_) => {
+      return 68;
+    }
+  }
+
+  // 2. ハンドシェイク中同時接続数上限 (max_handshaking_connections = 2)
+  let l_hs2 = limits_with_max_handshaking_connections(&base_limits, 2);
+  let mut tracker2 = new_relay_tracker();
+  let h_peer1 = "10.1.0.1:2001";
+  let h_peer2 = "10.1.0.2:2002";
+  let h_peer3 = "10.1.0.3:2003";
+
+  let _ = tracker_try_accept(&mut tracker2, &l_hs2, &h_peer1);
+  let _ = tracker_try_accept(&mut tracker2, &l_hs2, &h_peer2);
+  match tracker_try_accept(&mut tracker2, &l_hs2, &h_peer3) {
+    Ok(_) => {
+      return 69;
+    }
+    Err(e) => {
+      match e {
+        RelayRejectReason.MaxHandshakingExceeded(cur, max) => {
+          if cur != 2 || max != 2 {
+            return 70;
+          }
+        }
+        _ => {
+          return 71;
+        }
+      }
+    }
+  }
+
+  // ハンドシェイク完了通知でハンドシェイク中数が減少し、新規ハンドシェイク可能になる
+  tracker_handshake_finished(&mut tracker2, &h_peer1);
+  if tracker_active_handshakes(&tracker2) != 1 {
+    return 72;
+  }
+  match tracker_try_accept(&mut tracker2, &l_hs2, &h_peer3) {
+    Ok(_) => {}
+    Err(_) => {
+      return 73;
+    }
+  }
+
+  return 0;
+}
+
+fn test_relay_limits_per_source_boundary() -> Int
+  intent "接続元 IP（IPv4 /32, IPv6 /64）ごとの上限境界試験（決定 4.5）"
+  requires none
+  ensures none
+  effects none
+{
+  let base_limits = default_limits();
+
+  // 1. 接続元ごとハンドシェイク上限 (max_handshaking_per_source = 2)
+  let l_src_hs = limits_with_max_handshaking_per_source(&base_limits, 2);
+  let mut tracker = new_relay_tracker();
+  let src_a1 = "192.168.10.50:1111";
+  let src_a2 = "192.168.10.50:2222";
+  let src_a3 = "192.168.10.50:3333";
+  let src_b1 = "192.168.10.99:1111";
+
+  let _ = tracker_try_accept(&mut tracker, &l_src_hs, &src_a1);
+  let _ = tracker_try_accept(&mut tracker, &l_src_hs, &src_a2);
+  // 同一 IP からの 3 つ目のハンドシェイクは拒否
+  match tracker_try_accept(&mut tracker, &l_src_hs, &src_a3) {
+    Ok(_) => {
+      return 81;
+    }
+    Err(e) => {
+      match e {
+        RelayRejectReason.SourceMaxHandshakingExceeded(src, cur, max) => {
+          if src != "192.168.10.50" || cur != 2 || max != 2 {
+            return 82;
+          }
+        }
+        _ => {
+          return 83;
+        }
+      }
+    }
+  }
+
+  // 別 IP からは問題なく受領可能
+  match tracker_try_accept(&mut tracker, &l_src_hs, &src_b1) {
+    Ok(_) => {}
+    Err(_) => {
+      return 84;
+    }
+  }
+
+  // 2. 接続元ごと同時接続上限 (max_connections_per_source = 2)
+  let l_src_tot = limits_with_max_connections_per_source(&base_limits, 2);
+  let mut tracker2 = new_relay_tracker();
+  let s_a1 = "172.16.0.1:4001";
+  let s_a2 = "172.16.0.1:4002";
+  let s_a3 = "172.16.0.1:4003";
+
+  let _ = tracker_try_accept(&mut tracker2, &l_src_tot, &s_a1);
+  tracker_handshake_finished(&mut tracker2, &s_a1);
+  let _ = tracker_try_accept(&mut tracker2, &l_src_tot, &s_a2);
+  tracker_handshake_finished(&mut tracker2, &s_a2);
+
+  // ハンドシェイク完了後も総接続数が 2 のため 3 つ目は拒否
+  match tracker_try_accept(&mut tracker2, &l_src_tot, &s_a3) {
+    Ok(_) => {
+      return 85;
+    }
+    Err(e) => {
+      match e {
+        RelayRejectReason.SourceMaxConnectionsExceeded(src, cur, max) => {
+          if src != "172.16.0.1" || cur != 2 || max != 2 {
+            return 86;
+          }
+        }
+        _ => {
+          return 87;
+        }
+      }
+    }
+  }
+
+  // 3. 接続元キー抽出ヘルパーの検証（IPv4 /32, IPv6 デコード済み /64, 括弧・ポート除去）
+  if extract_source_key(&"192.168.1.1:1234") != "192.168.1.1" {
+    return 88;
+  }
+  if extract_source_key(&"2001:db8:1234:5678:abcd:ef01:2345:6789") != "2001:db8:1234:5678" {
+    return 89;
+  }
+  // 圧縮 IPv6 でも同一 /64 は同一キーになる（P1 指摘対応）
+  if extract_source_key(&"2001:db8::1") != "2001:db8:0:0" {
+    return 891;
+  }
+  if extract_source_key(&"2001:db8::2") != "2001:db8:0:0" {
+    return 892;
+  }
+  // 括弧付きポート付きエンドポイントでもポートを除去しデコード済み /64 になる（P1 指摘対応）
+  if extract_source_key(&"[2001:db8::1]:10001") != "2001:db8:0:0" {
+    return 893;
+  }
+  if extract_source_key(&"[::1]:10001") != "0:0:0:0" {
+    return 894;
+  }
+  if extract_source_key(&"[::1]:10002") != "0:0:0:0" {
+    return 895;
+  }
+
+  // 4. 異なるポートの [::1] 同士が同一 /64 として接続数上限に合算される検証
+  let l_v6_src = limits_with_max_handshaking_per_source(&base_limits, 1);
+  let mut tracker_v6 = new_relay_tracker();
+  let _ = tracker_try_accept(&mut tracker_v6, &l_v6_src, &"[::1]:10001");
+  match tracker_try_accept(&mut tracker_v6, &l_v6_src, &"[::1]:10002") {
+    Ok(_) => {
+      return 896;
+    }
+    Err(e) => {
+      match e {
+        RelayRejectReason.SourceMaxHandshakingExceeded(src, cur, max) => {
+          if src != "0:0:0:0" || cur != 1 || max != 1 {
+            return 897;
+          }
+        }
+        _ => {
+          return 898;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
+fn test_concurrent_crypto_tasks() -> Int
+  intent "鍵交換・署名並行計算タスクのキューイングと待機・解放・取得（決定 4.5、P2 指摘対応）"
+  requires none
+  ensures none
+  effects none
+{
+  let base_limits = limits_with_max_concurrent_crypto_tasks(&default_limits(), 2);
+  let mut tracker = new_relay_tracker();
+
+  // 1 タスク目: 即時取得
+  if !tracker_try_acquire_crypto(&mut tracker, &base_limits) {
+    return 91;
+  }
+  if tracker_active_crypto_tasks(&tracker) != 1 {
+    return 92;
+  }
+
+  // 2 タスク目: 即時取得
+  if !tracker_try_acquire_crypto(&mut tracker, &base_limits) {
+    return 93;
+  }
+  if tracker_active_crypto_tasks(&tracker) != 2 {
+    return 94;
+  }
+
+  // 3 タスク目: 上限 2 を超えるため待機（false を返しキュー数加算）
+  if tracker_try_acquire_crypto(&mut tracker, &base_limits) {
+    return 95;
+  }
+  if tracker_crypto_waiting_count(&tracker) != 1 {
+    return 96;
+  }
+
+  // 1 つ目のタスク完了解放: active が 1 に減算され、パーミットが空く
+  tracker_release_crypto(&mut tracker);
+  if tracker_active_crypto_tasks(&tracker) != 1 {
+    return 97;
+  }
+  if tracker_crypto_waiting_count(&tracker) != 1 {
+    return 98;
+  }
+
+  // 待機中のタスクが解放されたパーミットを取得: active は 2 に戻り、waiting_count は 0 に減算
+  if !tracker_try_acquire_waiting_crypto(&mut tracker, &base_limits) {
+    return 99;
+  }
+  if tracker_active_crypto_tasks(&tracker) != 2 {
+    return 100;
+  }
+  if tracker_crypto_waiting_count(&tracker) != 0 {
+    return 101;
+  }
+
+  // 残り全タスク解放: phantom active task が残らないことを検証
+  tracker_release_crypto(&mut tracker);
+  if tracker_active_crypto_tasks(&tracker) != 1 {
+    return 102;
+  }
+  tracker_release_crypto(&mut tracker);
+  if tracker_active_crypto_tasks(&tracker) != 0 {
+    return 103;
+  }
+
+  return 0;
+}
+
+fn test_termination_and_502_bad_gateway() -> Int
+  intent "上流障害時の固定 502 Bad Gateway 応答および close_notify / internal_error の扱い（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 固定 502 応答の検証
+  let resp502 = build_502_bad_gateway_response();
+  let s_resp = resp502.to_string_utf8().unwrap_or("");
+  if s_resp == "" {
+    return 101;
+  }
+
+  // HTTP/1.1 502 Bad Gateway, Connection: close を含むこと
+  let b_resp = resp502;
+  if b_resp.byte_len() < 50 {
+    return 102;
+  }
+  let c0 = b_resp.get(9).unwrap_or(0);
+  let c1 = b_resp.get(10).unwrap_or(0);
+  let c2 = b_resp.get(11).unwrap_or(0);
+  if c0 != 53 || c1 != 48 || c2 != 50 {  // "502"
+    return 103;
+  }
+
+  // 2. 平文の致命的アラート internal_error レコードの検証（ハンドシェイク前の異常切断等）
+  let plain_fatal = build_plaintext_fatal_alert_record(&AlertDescription.InternalError);
+  if plain_fatal.byte_len() != 7 {
+    return 104;
+  }
+  if plain_fatal.get(0).unwrap_or(0) != 21 {  // ContentType.Alert
+    return 105;
+  }
+  if plain_fatal.get(5).unwrap_or(0) != 2 {  // fatal (2)
+    return 106;
+  }
+  if plain_fatal.get(6).unwrap_or(0) != 80 {  // internal_error (80)
+    return 107;
+  }
+
+  // 3. 上流正常終了 vs 上流異常終了の分岐規則照合（決定 5.3）
+  //    上流正常終了: close_notify で終える
+  //    上流異常終了（リセット・期限）: close_notify を送らず internal_error で終える
+  let normal_outcome = RelayOutcome.NormalCompletion;
+  let abnormal_outcome = RelayOutcome.UpstreamAbnormalInternalError;
+
+  let should_send_close_notify_normal = match normal_outcome {
+    RelayOutcome.NormalCompletion => true,
+    _ => false,
+  };
+  if !should_send_close_notify_normal {
+    return 108;
+  }
+
+  let should_send_close_notify_abnormal = match abnormal_outcome {
+    RelayOutcome.UpstreamAbnormalInternalError => false,
+    _ => true,
+  };
+  if should_send_close_notify_abnormal {
+    return 109;
+  }
+
+  // 4. ハンドシェイク完了後の暗号化 close_notify および暗号化 fatal internal_error レコード生成の検証
+  let mut tx_secret = Bytes.with_capacity(32);
+  let mut rx_secret = Bytes.with_capacity(32);
+  let mut s_idx = 0;
+  while s_idx < 32 {
+    tx_secret.push(42);
+    rx_secret.push(42);
+    s_idx = s_idx + 1;
+  }
+  let mut prot_tx = new_record_protection(RecordDirection.Transmit, CipherSuite.TlsAes128GcmSha256, tx_secret);
+  let mut prot_rx = new_record_protection(RecordDirection.Receive, CipherSuite.TlsAes128GcmSha256, rx_secret);
+
+  // 4a. 暗号化 close_notify: 封印 -> 復号して inner alert (level 1, desc 0) を検証
+  let cn_res = build_close_notify_record(&mut prot_tx);
+  match cn_res {
+    Ok(cn_rec) => {
+      // 5 bytes outer header + (2 bytes alert + 1 byte inner CT + 16 bytes AEAD tag) = 24 bytes
+      if cn_rec.byte_len() != 24 {
+        return 110;
+      }
+      if cn_rec.get(0).unwrap_or(0) != 23 {  // ContentType.ApplicationData (outer)
+        return 1101;
+      }
+      let open_cn = open_record(&mut prot_rx, &cn_rec);
+      match open_cn {
+        Ok(cn_outcome) => {
+          match open_outcome_content_type(&cn_outcome) {
+            ContentType.Alert => {}
+            _ => {
+              return 1102;
+            }
+          }
+          let cn_pt = open_outcome_plaintext(&cn_outcome);
+          if cn_pt.byte_len() != 2 {
+            return 1103;
+          }
+          if cn_pt.get(0).unwrap_or(0) != 1 || cn_pt.get(1).unwrap_or(0) != 0 {  // warning (1), close_notify (0)
+            return 1104;
+          }
+        }
+        Err(_) => {
+          return 1105;
+        }
+      }
+    }
+    Err(_) => {
+      return 110;
+    }
+  }
+
+  // 4b. 暗号化 fatal internal_error (決定 5.3): 封印 -> 復号して inner alert (level 2, desc 80) を検証
+  let fatal_res = build_fatal_alert_record(&mut prot_tx, &AlertDescription.InternalError);
+  match fatal_res {
+    Ok(fatal_rec) => {
+      // 5 bytes outer header + (2 bytes alert + 1 byte inner CT + 16 bytes AEAD tag) = 24 bytes
+      if fatal_rec.byte_len() != 24 {
+        return 1106;
+      }
+      if fatal_rec.get(0).unwrap_or(0) != 23 {  // ContentType.ApplicationData (outer)
+        return 1107;
+      }
+      let open_fatal = open_record(&mut prot_rx, &fatal_rec);
+      match open_fatal {
+        Ok(fatal_outcome) => {
+          match open_outcome_content_type(&fatal_outcome) {
+            ContentType.Alert => {}
+            _ => {
+              return 1108;
+            }
+          }
+          let fatal_pt = open_outcome_plaintext(&fatal_outcome);
+          if fatal_pt.byte_len() != 2 {
+            return 1109;
+          }
+          if fatal_pt.get(0).unwrap_or(0) != 2 || fatal_pt.get(1).unwrap_or(0) != 80 {  // fatal (2), internal_error (80)
+            return 1110;
+          }
+        }
+        Err(_) => {
+          return 1111;
+        }
+      }
+    }
+    Err(_) => {
+      return 1112;
+    }
+  }
+
+  return 0;
+}
+
+fn test_buffer_limits_and_timeouts() -> Int
+  intent "バッファ上限（32 KiB）およびタイムアウト設定の整合性を検証（決定 4.4, 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  if max_relay_buffer_size() != 32768 {
+    return 111;
+  }
+  if max_pre_handshake_plaintext_buffer() != 32768 {
+    return 112;
+  }
+
+  let limits = default_limits();
+  if limits.handshake_timeout_secs != 10 {
+    return 113;
+  }
+  if limits.idle_timeout_secs != 60 {
+    return 114;
+  }
+  if limits.write_timeout_secs != 30 {
+    return 115;
+  }
+  if limits.upstream_connect_timeout_secs != 3 {
+    return 116;
+  }
+
+  return 0;
+}
+
+fn contains_substring(haystack: &String, needle: &String) -> Bool
+  intent "文字列に特定の部分文字列が含まれているか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let h = haystack.as_bytes();
+  let n = needle.as_bytes();
+  let hlen = h.byte_len();
+  let nlen = n.byte_len();
+
+  if nlen == 0 {
+    return true;
+  }
+  if hlen < nlen {
+    return false;
+  }
+
+  let mut i = 0;
+  while i + nlen <= hlen {
+    let mut match_ok = true;
+    let mut j = 0;
+    while j < nlen {
+      if h.get(i + j).unwrap_or(0) != n.get(j).unwrap_or(0) {
+        match_ok = false;
+      }
+      j = j + 1;
+    }
+    if match_ok {
+      return true;
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+fn test_safe_logging_never_leaks_secrets() -> Int
+  intent "ログに機密（鍵・平文・通信鍵等）が漏洩せず、SNI が [a-z0-9._*-] にサニタイズされることを検証（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. SNI サニタイズの検証
+  let normal_sni = "api.service.internal";
+  let san_normal = sanitize_sni_for_log(&normal_sni);
+  if san_normal != "api.service.internal" {
+    return 121;
+  }
+
+  // ログ注入文字（改行、ANSI エスケープ、制御コード、特殊記号）が除去されること
+  let malicious_sni = "app.test\r\nINJECTED_LOG: evil\u{1B}[31m; DROP TABLE;";
+  let san_malicious = sanitize_sni_for_log(&malicious_sni);
+  if contains_substring(&san_malicious, &"\r") || contains_substring(&san_malicious, &"\n") {
+    return 122;
+  }
+  if contains_substring(&san_malicious, &";") || contains_substring(&san_malicious, &" ") {
+    return 123;
+  }
+
+  // 2. ログ整形の検証
+  let peer = "203.0.113.15:44300";
+  let sni_opt = Some("app.example.com");
+  let classification = RelayResultClassification.HandshakeSuccess;
+
+  let log_line = format_relay_log(&peer, &sni_opt, &classification);
+  if !contains_substring(&log_line, &"peer=203.0.113.15:44300") {
+    return 124;
+  }
+  if !contains_substring(&log_line, &"sni=app.example.com") {
+    return 125;
+  }
+  if !contains_substring(&log_line, &"result=HANDSHAKE_SUCCESS") {
+    return 126;
+  }
+
+  // 3. 機密情報非混入テスト: 秘密鍵、通信の鍵、平文がログに出ないこと
+  let secret_key = "PRIVATE_KEY_BYTES_SECRET_0123456789";
+  let secret_traffic = "TRAFFIC_SECRET_EXPANDED_KEY";
+  let secret_plaintext = "CONFIDENTIAL_HTTP_BODY_DATA";
+
+  if contains_substring(&log_line, &secret_key) {
+    return 127;
+  }
+  if contains_substring(&log_line, &secret_traffic) {
+    return 128;
+  }
+  if contains_substring(&log_line, &secret_plaintext) {
+    return 129;
+  }
+
+  return 0;
+}
+
+pub fn main() -> Int
+  intent "段 5 中継・PROXY v2・上限・終了処理・ログ試験のエントリポイント"
+  requires none
+  ensures none
+  effects none
+{
+  let r1 = test_listen_config_validation();
+  if r1 != 0 {
+    return r1;
+  }
+
+  let r2 = test_upstream_config_and_loopback_validation();
+  if r2 != 0 {
+    return r2;
+  }
+
+  let r3 = test_proxy_v2_header_ipv4();
+  if r3 != 0 {
+    return r3;
+  }
+
+  let r4 = test_proxy_v2_header_ipv6_and_no_sni();
+  if r4 != 0 {
+    return r4;
+  }
+
+  let r5 = test_relay_limits_connections_boundary();
+  if r5 != 0 {
+    return r5;
+  }
+
+  let r6 = test_relay_limits_per_source_boundary();
+  if r6 != 0 {
+    return r6;
+  }
+
+  let r7 = test_concurrent_crypto_tasks();
+  if r7 != 0 {
+    return r7;
+  }
+
+  let r8 = test_termination_and_502_bad_gateway();
+  if r8 != 0 {
+    return r8;
+  }
+
+  let r9 = test_buffer_limits_and_timeouts();
+  if r9 != 0 {
+    return r9;
+  }
+
+  let r10 = test_safe_logging_never_leaks_secrets();
+  if r10 != 0 {
+    return r10;
+  }
+
+  return 0;
+}

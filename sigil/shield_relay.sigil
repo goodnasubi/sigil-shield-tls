@@ -1,0 +1,1151 @@
+module shield_relay
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_alert.ShieldError;
+use shield_alert.alert_description_to_u8;
+use shield_limits.ShieldLimits;
+use shield_record.ContentType;
+use shield_record_crypto.RecordProtection;
+use shield_record_crypto.seal_record;
+
+// 中継部品（ADR 0063 決定 3, 決定 4.4, 4.5, 決定 5.1, 5.3）
+//
+// 1. 待ち受け: 待ち受けアドレスは設定で必須とし、既定値を置かない。
+// 2. 上流（決定 3）:
+//    - 設定で数値の IP アドレスとポートを 1 つ指定する（DNS は使わない）。
+//    - 1 つの待ち受けに上流は 1 つ。名前による後段の振り分けは終端部品では行わない。
+//    - 既定でループバック（127.0.0.1・::1）だけを許す。
+//    - 非ループバックは allow_non_loopback_upstream = true の明示がある場合だけ許し、違反は起動拒否。
+// 3. 接続ごとのタスク:
+//    - 1 つの TLS 接続に対して新しい上流接続を 1 つ開き、接続を共有・再利用しない。
+// 4. 上限（決定 4.5）:
+//    - 同時接続数（既定 1024、範囲 1〜65536）
+//    - ハンドシェイク中同時接続数（既定 64、範囲 1〜1024）
+//    - 接続元ごとの同時接続数（既定 32、範囲 1〜1024）
+//    - 接続元ごとのハンドシェイク中接続数（既定 4、範囲 1〜64）
+//    - 鍵交換と署名を同時に計算する数（既定 2、範囲 1〜64、超過時は順番を待つ）
+// 5. タイムアウトとバッファ（決定 4.4）:
+//    - ハンドシェイク全体 10 秒、アイドル期限 60 秒、書き込み期限 30 秒、上流接続 3 秒。
+//    - 各方向のバッファは 2 レコード分、32 KiB 以下で、満ちたら読み取りを止め期限まで待つ。
+// 6. 上流への接続と PROXY v2（決定 5.1, 5.3）:
+//    - 上流接続はハンドシェイク完了後に開く。完了前に届いた平文は 32 KiB までバッファ。
+//    - 先頭に PROXY v2 ヘッダーを 1 回だけ付与（HTTP は解釈しない）。
+// 7. 終了の扱い（決定 5.3）:
+//    - 上流接続失敗/期限超過: 固定 502 Bad Gateway 送信後 close_notify で終了。
+//    - 上流異常終了: close_notify なしで致命的アラート internal_error で終了。
+//    - 上流正常終了: 送り切ってから close_notify で終了。
+//    - クライアント close_notify: 上流 write shutdown、アイドル期限まで待機。
+//    - クライアント切断（close_notify なし）: 切り詰めとして扱い上流切断。
+// 8. ログ（決定 5.3）:
+//    - 接続元・正規化済み SNI（[a-z0-9._*-] に制限・長さ制限）・結果分類のみ。
+//    - 秘密（鍵・平文・ClientHello 中身・通信鍵）は一切出さない。
+
+pub enum RelayConfigError {
+  EmptyListenHost,
+  InvalidPort(Int),
+  DnsUpstreamDisallowed(String),
+  NonLoopbackUpstreamDisallowed(String),
+  InvalidNumericIp(String),
+}
+
+pub struct ListenConfig {
+  host: String,
+  port: Int,
+}
+
+pub fn new_listen_config(host: String, port: Int) -> ListenConfig
+  intent "待ち受け設定を生成する（既定値なし、必須指定）"
+  requires none
+  ensures none
+  effects none
+{
+  return ListenConfig { host: host, port: port };
+}
+
+pub fn validate_listen_config(cfg: &ListenConfig) -> Result<Bool, RelayConfigError>
+  intent "待ち受け設定を検証する（host 必須、ポート 1-65535）"
+  requires none
+  ensures none
+  effects none
+{
+  if cfg.host.as_bytes().is_empty() {
+    return Err(RelayConfigError.EmptyListenHost);
+  }
+  if cfg.port < 1 || cfg.port > 65535 {
+    return Err(RelayConfigError.InvalidPort(cfg.port));
+  }
+  return Ok(true);
+}
+
+pub struct UpstreamConfig {
+  host: String,
+  port: Int,
+  allow_non_loopback: Bool,
+}
+
+pub fn new_upstream_config(host: String, port: Int, allow_non_loopback: Bool) -> UpstreamConfig
+  intent "上流設定を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return UpstreamConfig { host: host, port: port, allow_non_loopback: allow_non_loopback };
+}
+
+fn is_ascii_digit(c: Int) -> Bool
+  intent "文字コードが 0-9 か判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return c >= 48 && c <= 57;
+}
+
+fn is_hex_digit(c: Int) -> Bool
+  intent "文字コードが 16 進数 (0-9, a-f, A-F) か判定する"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return true;
+  }
+  if c >= 97 && c <= 102 {
+    return true;
+  }
+  if c >= 65 && c <= 70 {
+    return true;
+  }
+  return false;
+}
+
+pub fn parse_ipv4_octets(host: &String) -> Option<List<Int>>
+  intent "文字列が数値 IPv4 アドレス (x.x.x.x, 0-255) の場合に 4 オクテットをパースする"
+  requires none
+  ensures none
+  effects none
+{
+  let b = host.as_bytes();
+  let blen = b.byte_len();
+  if blen < 7 || blen > 15 {
+    return None;
+  }
+
+  let mut octets = List.new();
+  let mut current_val = 0;
+  let mut segment_len = 0;
+  let mut i = 0;
+
+  while i < blen {
+    let c = b.get(i).unwrap_or(0);
+    if c == 46 {  // '.'
+      if segment_len == 0 || segment_len > 3 {
+        return None;
+      }
+      if current_val > 255 {
+        return None;
+      }
+      if segment_len > 1 {
+        let first_ch = b.get(i - segment_len).unwrap_or(0);
+        if first_ch == 48 {
+          return None;
+        }
+      }
+      octets.push(current_val);
+      current_val = 0;
+      segment_len = 0;
+    } else if is_ascii_digit(c) {
+      current_val = current_val * 10 + (c - 48);
+      segment_len = segment_len + 1;
+      if segment_len > 3 || current_val > 255 {
+        return None;
+      }
+    } else {
+      return None;
+    }
+    i = i + 1;
+  }
+
+  if octets.len() != 3 || segment_len == 0 || segment_len > 3 || current_val > 255 {
+    return None;
+  }
+  if segment_len > 1 {
+    let first_ch = b.get(blen - segment_len).unwrap_or(0);
+    if first_ch == 48 {
+      return None;
+    }
+  }
+  octets.push(current_val);
+  return Some(octets);
+}
+
+pub fn is_ipv4_numeric(host: &String) -> Bool
+  intent "文字列が数値 IPv4 アドレス (x.x.x.x, 0-255) か厳密に判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match parse_ipv4_octets(&host) {
+    Some(_) => true,
+    None => false,
+  };
+}
+
+fn hex_char_to_val(c: Int) -> Option<Int>
+  intent "16 進文字コードを 0..15 の数値に変換する"
+  requires none
+  ensures none
+  effects none
+{
+  if c >= 48 && c <= 57 {
+    return Some(c - 48);
+  }
+  if c >= 97 && c <= 102 {
+    return Some(c - 97 + 10);
+  }
+  if c >= 65 && c <= 70 {
+    return Some(c - 65 + 10);
+  }
+  return None;
+}
+
+fn parse_hextet_segment(b: &Bytes, start: Int, end: Int) -> Option<List<Int>>
+  intent "コロン区切りの hextet 群 (0..4 桁の 16 進数) をパースする"
+  requires none
+  ensures none
+  effects none
+{
+  if start >= end {
+    return Some(List.new());
+  }
+
+  let mut list = List.new();
+  let mut seg_start = start;
+  let mut pos = start;
+  while pos <= end {
+    let is_delim = match pos == end {
+      true => true,
+      false => b.get(pos).unwrap_or(0) == 58,
+    };
+    if is_delim {
+      let seg_len = pos - seg_start;
+      if seg_len < 1 || seg_len > 4 {
+        return None;
+      }
+      let mut val = 0;
+      let mut k = seg_start;
+      while k < pos {
+        let ch = b.get(k).unwrap_or(0);
+        let mut digit = 0;
+        match hex_char_to_val(ch) {
+          Some(d) => {
+            digit = d;
+          }
+          None => {
+            return None;
+          }
+        }
+        val = val * 16 + digit;
+        k = k + 1;
+      }
+      list.push(val);
+      seg_start = pos + 1;
+    }
+    pos = pos + 1;
+  }
+  return Some(list);
+}
+
+pub fn parse_ipv6_hextets(host: &String) -> Option<List<Int>>
+  intent "IPv6 アドレスのグループ構造・hextet 長・:: 位置を検証し 8 つの hextet にデコードする"
+  requires none
+  ensures none
+  effects none
+{
+  let b = host.as_bytes();
+  let blen = b.byte_len();
+  if blen < 2 || blen > 39 {
+    return None;
+  }
+
+  let mut double_colon_pos = -1;
+  let mut i = 0;
+  while i < blen {
+    let c = b.get(i).unwrap_or(0);
+    if c == 58 {  // ':'
+      if i + 1 < blen {
+        if b.get(i + 1).unwrap_or(0) == 58 {
+          // "::" を発見
+          if double_colon_pos >= 0 {
+            // "::" は 1 つのアドレスに 1 回のみ許可
+            return None;
+          }
+          if i + 2 < blen {
+            if b.get(i + 2).unwrap_or(0) == 58 {
+              // ":::" (3 つ以上連続したコロン) は不正
+              return None;
+            }
+          }
+          double_colon_pos = i;
+          i = i + 1;
+        }
+      }
+    } else {
+      if !is_hex_digit(c) {
+        return None;
+      }
+    }
+    i = i + 1;
+  }
+
+  // 先頭または末尾の単独コロン（"::" 以外）は不正
+  if double_colon_pos < 0 {
+    if b.get(0).unwrap_or(0) == 58 || b.get(blen - 1).unwrap_or(0) == 58 {
+      return None;
+    }
+  } else {
+    if double_colon_pos > 0 && b.get(0).unwrap_or(0) == 58 {
+      return None;
+    }
+    if double_colon_pos + 2 < blen && b.get(blen - 1).unwrap_or(0) == 58 {
+      return None;
+    }
+  }
+
+  if double_colon_pos >= 0 {
+    let left_opt = parse_hextet_segment(&b, 0, double_colon_pos);
+    let right_opt = parse_hextet_segment(&b, double_colon_pos + 2, blen);
+    let mut left = List.new();
+    match left_opt {
+      Some(l) => {
+        left = l;
+      }
+      None => {
+        return None;
+      }
+    }
+    let mut right = List.new();
+    match right_opt {
+      Some(r) => {
+        right = r;
+      }
+      None => {
+        return None;
+      }
+    }
+
+    let total_groups = left.len() + right.len();
+    if total_groups >= 8 {
+      // :: は 1 つ以上のゼログループを置換するため、明示グループ数は最大 7
+      return None;
+    }
+    let zeros_to_insert = 8 - total_groups;
+    let mut out_hextets = List.new();
+    let mut li = 0;
+    while li < left.len() {
+      match left.get(li) {
+        Some(v) => {
+          out_hextets.push(v + 0);
+        }
+        None => {}
+      }
+      li = li + 1;
+    }
+    let mut zi = 0;
+    while zi < zeros_to_insert {
+      out_hextets.push(0);
+      zi = zi + 1;
+    }
+    let mut ri = 0;
+    while ri < right.len() {
+      match right.get(ri) {
+        Some(v) => {
+          out_hextets.push(v + 0);
+        }
+        None => {}
+      }
+      ri = ri + 1;
+    }
+    return Some(out_hextets);
+  }
+
+  let groups_opt = parse_hextet_segment(&b, 0, blen);
+  let mut groups = List.new();
+  match groups_opt {
+    Some(g) => {
+      groups = g;
+    }
+    None => {
+      return None;
+    }
+  }
+  if groups.len() != 8 {
+    return None;
+  }
+  return Some(groups);
+}
+
+pub fn is_ipv6_numeric(host: &String) -> Bool
+  intent "文字列が正しいグループ構造を持つ数値 IPv6 アドレスか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  return match parse_ipv6_hextets(&host) {
+    Some(_) => true,
+    None => false,
+  };
+}
+
+fn list_get_or_zero(l: &List<Int>, idx: Int) -> Int
+  intent "リストの要素を取得するか 0 を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return match l.get(idx) {
+    Some(v) => v + 0,
+    None => 0,
+  };
+}
+
+pub fn is_loopback_address(host: &String) -> Bool
+  intent "アドレスがループバック（127.0.0.0/8 または ::1）か判定する（決定 3）"
+  requires none
+  ensures none
+  effects none
+{
+  // IPv4 ループバック: 127.0.0.0/8
+  match parse_ipv4_octets(&host) {
+    Some(octets) => {
+      let o0 = list_get_or_zero(&octets, 0);
+      return o0 == 127;
+    }
+    None => {}
+  }
+
+  // IPv6 ループバック: ::1（128 ビット全体が 0:0:0:0:0:0:0:1）
+  match parse_ipv6_hextets(&host) {
+    Some(hextets) => {
+      if hextets.len() != 8 {
+        return false;
+      }
+      let h0 = list_get_or_zero(&hextets, 0);
+      let h1 = list_get_or_zero(&hextets, 1);
+      let h2 = list_get_or_zero(&hextets, 2);
+      let h3 = list_get_or_zero(&hextets, 3);
+      let h4 = list_get_or_zero(&hextets, 4);
+      let h5 = list_get_or_zero(&hextets, 5);
+      let h6 = list_get_or_zero(&hextets, 6);
+      let h7 = list_get_or_zero(&hextets, 7);
+      return h0 == 0 && h1 == 0 && h2 == 0 && h3 == 0 && h4 == 0 && h5 == 0 && h6 == 0 && h7 == 1;
+    }
+    None => {}
+  }
+
+  return false;
+}
+
+pub fn validate_upstream_config(cfg: &UpstreamConfig) -> Result<Bool, RelayConfigError>
+  intent "上流設定の数値 IP・ポート・ループバック制約を検証する（決定 3）"
+  requires none
+  ensures none
+  effects none
+{
+  if cfg.port < 1 || cfg.port > 65535 {
+    return Err(RelayConfigError.InvalidPort(cfg.port));
+  }
+
+  // 数値 IP アドレス検査（DNS は使わない）
+  let is_v4 = is_ipv4_numeric(&cfg.host);
+  let is_v6 = is_ipv6_numeric(&cfg.host);
+  if !is_v4 && !is_v6 {
+    return Err(RelayConfigError.DnsUpstreamDisallowed(cfg.host.clone()));
+  }
+
+  // ループバック制約検査（既定でループバックのみ許可、非ループバックは明示的許可が必要）
+  let is_loop = is_loopback_address(&cfg.host);
+  if !is_loop && !cfg.allow_non_loopback {
+    return Err(RelayConfigError.NonLoopbackUpstreamDisallowed(cfg.host.clone()));
+  }
+
+  return Ok(true);
+}
+
+// 資源上限超過による接続拒否理由（決定 4.5）
+pub enum RelayRejectReason {
+  MaxConnectionsExceeded(Int, Int),
+  MaxHandshakingExceeded(Int, Int),
+  SourceMaxConnectionsExceeded(String, Int, Int),
+  SourceMaxHandshakingExceeded(String, Int, Int),
+}
+
+pub struct SourceEntry {
+  source_key: String,
+  total_conns: Int,
+  handshaking_conns: Int,
+}
+
+pub struct RelayTracker {
+  active_connections: Int,
+  active_handshakes: Int,
+  active_crypto_tasks: Int,
+  crypto_waiting_count: Int,
+  sources: List<SourceEntry>,
+}
+
+pub fn new_relay_tracker() -> RelayTracker
+  intent "接続数および暗号タスク管理トラッカーを初期化する"
+  requires none
+  ensures none
+  effects none
+{
+  return RelayTracker { active_connections: 0, active_handshakes: 0, active_crypto_tasks: 0, crypto_waiting_count: 0, sources: List.new() };
+}
+
+pub fn tracker_active_connections(t: &RelayTracker) -> Int
+  intent "現在の接続数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.active_connections;
+}
+
+pub fn tracker_active_handshakes(t: &RelayTracker) -> Int
+  intent "現在のハンドシェイク中接続数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.active_handshakes;
+}
+
+pub fn tracker_active_crypto_tasks(t: &RelayTracker) -> Int
+  intent "現在の並行暗号計算タスク数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.active_crypto_tasks;
+}
+
+pub fn tracker_crypto_waiting_count(t: &RelayTracker) -> Int
+  intent "現在暗号計算待ちのタスク数を返す"
+  requires none
+  ensures none
+  effects none
+{
+  return t.crypto_waiting_count;
+}
+
+fn push_hex_nibble(buf: &mut Bytes, d: Int)
+  intent "4 ビット数値を小文字 16 進文字としてバッファに追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if d >= 0 && d <= 9 {
+    buf.push(48 + d);
+  } else if d >= 10 && d <= 15 {
+    buf.push(97 + (d - 10));
+  }
+}
+
+fn push_hextet_hex(buf: &mut Bytes, val: Int)
+  intent "16 ビット数値を小文字 16 進文字列としてバッファに追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if val == 0 {
+    buf.push(48);
+    return;
+  }
+  let mut temp = List.new();
+  let mut v = val;
+  while v > 0 {
+    temp.push(v % 16);
+    v = v / 16;
+  }
+  let mut i = temp.len() - 1;
+  while i >= 0 {
+    match temp.get(i) {
+      Some(d) => {
+        push_hex_nibble(&mut buf, d + 0);
+      }
+      None => {}
+    }
+    i = i - 1;
+  }
+}
+
+fn format_ipv6_slash64(hextets: &List<Int>) -> String
+  intent "先頭 4 つの hextet をコロン区切り 16 進文字列として整形する (/64)"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  let mut i = 0;
+  while i < 4 {
+    if i > 0 {
+      buf.push(58);  // ':'
+    }
+    let h = list_get_or_zero(&hextets, i);
+    push_hextet_hex(&mut buf, h);
+    i = i + 1;
+  }
+  return buf.to_string_utf8().unwrap_or("");
+}
+
+fn push_dec_uint(buf: &mut Bytes, val: Int)
+  intent "正の整数を 10 進数文字としてバッファに追加する"
+  requires none
+  ensures none
+  effects none
+{
+  if val == 0 {
+    buf.push(48);
+    return;
+  }
+  let mut temp = List.new();
+  let mut v = val;
+  while v > 0 {
+    temp.push(v % 10);
+    v = v / 10;
+  }
+  let mut i = temp.len() - 1;
+  while i >= 0 {
+    match temp.get(i) {
+      Some(d) => {
+        buf.push(48 + d);
+      }
+      None => {}
+    }
+    i = i - 1;
+  }
+}
+
+fn format_ipv4(o0: Int, o1: Int, o2: Int, o3: Int) -> String
+  intent "4 つのオクテットをドット 10 進表記の IPv4 文字列に整形する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut buf = Bytes.new();
+  push_dec_uint(&mut buf, o0);
+  buf.push(46);
+  push_dec_uint(&mut buf, o1);
+  buf.push(46);
+  push_dec_uint(&mut buf, o2);
+  buf.push(46);
+  push_dec_uint(&mut buf, o3);
+  return buf.to_string_utf8().unwrap_or("");
+}
+
+pub fn extract_source_key(peer_addr: &String) -> String
+  intent "接続元 IP（IPv4 は /32、IPv6 はデコードした /64 相当のプレフィクス）を抽出する（決定 4.5）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = peer_addr.as_bytes();
+  let blen = b.byte_len();
+  if blen == 0 {
+    return peer_addr.clone();
+  }
+
+  // 1. 角括弧形式 [ipv6]:port または [ipv6]
+  if b.get(0).unwrap_or(0) == 91 {  // '['
+    let mut close_idx = -1;
+    let mut i = 1;
+    while i < blen {
+      if b.get(i).unwrap_or(0) == 93 {  // ']'
+        close_idx = i;
+        i = blen;
+      }
+      i = i + 1;
+    }
+    if close_idx > 1 {
+      let raw_v6_bytes = b.slice(1, close_idx).unwrap_or(Bytes.new());
+      let raw_v6_str = raw_v6_bytes.to_string_utf8().unwrap_or(peer_addr.clone());
+      return match parse_ipv6_hextets(&raw_v6_str) {
+        Some(hextets) => format_ipv6_slash64(&hextets),
+        None => raw_v6_str,
+      };
+    }
+  }
+
+  // 2. ドットを含む場合（IPv4 または IPv4:port）
+  let mut dot_count = 0;
+  let mut last_dot = -1;
+  let mut colon_after_dot = -1;
+  let mut j = 0;
+  while j < blen {
+    let c = b.get(j).unwrap_or(0);
+    if c == 46 {  // '.'
+      dot_count = dot_count + 1;
+      last_dot = j;
+    } else if c == 58 {  // ':'
+      if last_dot >= 0 {
+        colon_after_dot = j;
+      }
+    }
+    j = j + 1;
+  }
+
+  if dot_count == 3 {
+    let end_pos = match colon_after_dot >= 0 {
+      true => colon_after_dot,
+      false => blen,
+    };
+    let ip_bytes = b.slice(0, end_pos).unwrap_or(Bytes.new());
+    let ip_str = ip_bytes.to_string_utf8().unwrap_or(peer_addr.clone());
+    match parse_ipv4_octets(&ip_str) {
+      Some(octets) => {
+        let o0 = list_get_or_zero(&octets, 0);
+        let o1 = list_get_or_zero(&octets, 1);
+        let o2 = list_get_or_zero(&octets, 2);
+        let o3 = list_get_or_zero(&octets, 3);
+        return format_ipv4(o0, o1, o2, o3);
+      }
+      None => {
+        return ip_str;
+      }
+    }
+  }
+
+  // 3. IPv6（括弧なし、例: "2001:db8::1", "::1"）
+  match parse_ipv6_hextets(&peer_addr) {
+    Some(hextets) => {
+      return format_ipv6_slash64(&hextets);
+    }
+    None => {}
+  }
+
+  return peer_addr.clone();
+}
+
+fn string_eq(a: &String, b: &String) -> Bool
+  intent "2 つの文字列がバイト単位で等しいか判定する"
+  requires none
+  ensures none
+  effects none
+{
+  let ba = a.as_bytes();
+  let bb = b.as_bytes();
+  if ba.byte_len() != bb.byte_len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < ba.byte_len() {
+    if ba.get(i).unwrap_or(0) != bb.get(i).unwrap_or(0) {
+      return false;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+fn find_source_index(sources: &List<SourceEntry>, key: &String) -> Option<Int>
+  intent "接続元キーに対応するリスト内インデックスを検索する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut i = 0;
+  while i < sources.len() {
+    match sources.get(i) {
+      Some(entry) => {
+        if string_eq(&entry.source_key, &key) {
+          return Some(i);
+        }
+      }
+      None => {}
+    }
+    i = i + 1;
+  }
+  return None;
+}
+
+pub fn tracker_try_accept(tracker: &mut RelayTracker, limits: &ShieldLimits, peer_addr: &String) -> Result<Bool, RelayRejectReason>
+  intent "新規接続の受領可否を上限（決定 4.5）に照らして判定し、許容なら追跡数を更新する"
+  requires none
+  ensures none
+  effects none
+{
+  // 1. 同時接続数上限
+  if tracker.active_connections >= limits.max_connections {
+    return Err(RelayRejectReason.MaxConnectionsExceeded(tracker.active_connections, limits.max_connections));
+  }
+
+  // 2. ハンドシェイク中同時接続数上限
+  if tracker.active_handshakes >= limits.max_handshaking_connections {
+    return Err(RelayRejectReason.MaxHandshakingExceeded(tracker.active_handshakes, limits.max_handshaking_connections));
+  }
+
+  let src_key = extract_source_key(&peer_addr);
+  let src_idx_opt = find_source_index(&tracker.sources, &src_key);
+
+  let cur_src_total = match src_idx_opt {
+    Some(idx) => match tracker.sources.get(idx) {
+      Some(e) => e.total_conns,
+      None => 0,
+    },
+    None => 0,
+  };
+
+  let cur_src_hs = match src_idx_opt {
+    Some(idx) => match tracker.sources.get(idx) {
+      Some(e) => e.handshaking_conns,
+      None => 0,
+    },
+    None => 0,
+  };
+
+  // 3. 接続元ごとの同時接続数上限
+  if cur_src_total >= limits.max_connections_per_source {
+    return Err(RelayRejectReason.SourceMaxConnectionsExceeded(src_key, cur_src_total, limits.max_connections_per_source));
+  }
+
+  // 4. 接続元ごとのハンドシェイク中接続数上限
+  if cur_src_hs >= limits.max_handshaking_per_source {
+    return Err(RelayRejectReason.SourceMaxHandshakingExceeded(src_key, cur_src_hs, limits.max_handshaking_per_source));
+  }
+
+  // 上限内: カウンタ更新
+  tracker.active_connections = tracker.active_connections + 1;
+  tracker.active_handshakes = tracker.active_handshakes + 1;
+
+  match src_idx_opt {
+    Some(idx) => {
+      // 既存のエントリを更新
+      let mut new_sources = List.new();
+      let mut i = 0;
+      while i < tracker.sources.len() {
+        match tracker.sources.get(i) {
+          Some(e) => {
+            if i == idx {
+              new_sources.push(SourceEntry { source_key: e.source_key.clone(), total_conns: e.total_conns + 1, handshaking_conns: e.handshaking_conns + 1 });
+            } else {
+              new_sources.push(SourceEntry { source_key: e.source_key.clone(), total_conns: e.total_conns, handshaking_conns: e.handshaking_conns });
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      tracker.sources = new_sources;
+    }
+    None => {
+      // 新規エントリを追加
+      tracker.sources.push(SourceEntry { source_key: src_key, total_conns: 1, handshaking_conns: 1 });
+    }
+  }
+
+  return Ok(true);
+}
+
+pub fn tracker_handshake_finished(tracker: &mut RelayTracker, peer_addr: &String)
+  intent "ハンドシェイク完了時にハンドシェイク中カウンタを減算する"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_handshakes > 0 {
+    tracker.active_handshakes = tracker.active_handshakes - 1;
+  }
+
+  let src_key = extract_source_key(&peer_addr);
+  let src_idx_opt = find_source_index(&tracker.sources, &src_key);
+
+  match src_idx_opt {
+    Some(idx) => {
+      let mut new_sources = List.new();
+      let mut i = 0;
+      while i < tracker.sources.len() {
+        match tracker.sources.get(i) {
+          Some(e) => {
+            if i == idx {
+              let new_hs = match e.handshaking_conns > 0 {
+                true => e.handshaking_conns - 1,
+                false => 0,
+              };
+              new_sources.push(SourceEntry { source_key: e.source_key.clone(), total_conns: e.total_conns, handshaking_conns: new_hs });
+            } else {
+              new_sources.push(SourceEntry { source_key: e.source_key.clone(), total_conns: e.total_conns, handshaking_conns: e.handshaking_conns });
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      tracker.sources = new_sources;
+    }
+    None => {}
+  }
+}
+
+pub fn tracker_connection_closed(tracker: &mut RelayTracker, peer_addr: &String, was_handshaking: Bool)
+  intent "接続切断時に総接続数（および必要に応じハンドシェイク中接続数）を減算する"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_connections > 0 {
+    tracker.active_connections = tracker.active_connections - 1;
+  }
+  if was_handshaking && tracker.active_handshakes > 0 {
+    tracker.active_handshakes = tracker.active_handshakes - 1;
+  }
+
+  let src_key = extract_source_key(&peer_addr);
+  let src_idx_opt = find_source_index(&tracker.sources, &src_key);
+
+  match src_idx_opt {
+    Some(idx) => {
+      let mut new_sources = List.new();
+      let mut i = 0;
+      while i < tracker.sources.len() {
+        match tracker.sources.get(i) {
+          Some(e) => {
+            if i == idx {
+              let new_total = match e.total_conns > 0 {
+                true => e.total_conns - 1,
+                false => 0,
+              };
+              let new_hs = match was_handshaking && e.handshaking_conns > 0 {
+                true => e.handshaking_conns - 1,
+                false => e.handshaking_conns,
+              };
+              // 0 になったらエントリを削除してリークを防ぐ
+              if new_total > 0 {
+                new_sources.push(SourceEntry { source_key: e.source_key.clone(), total_conns: new_total, handshaking_conns: new_hs });
+              }
+            } else {
+              new_sources.push(SourceEntry { source_key: e.source_key.clone(), total_conns: e.total_conns, handshaking_conns: e.handshaking_conns });
+            }
+          }
+          None => {}
+        }
+        i = i + 1;
+      }
+      tracker.sources = new_sources;
+    }
+    None => {}
+  }
+}
+
+pub fn tracker_try_acquire_crypto(tracker: &mut RelayTracker, limits: &ShieldLimits) -> Bool
+  intent "鍵交換・署名並行計算タスクの取得を試みる（既定 2、超過時は待機数を加算して false）"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_crypto_tasks < limits.max_concurrent_crypto_tasks {
+    tracker.active_crypto_tasks = tracker.active_crypto_tasks + 1;
+    return true;
+  }
+  tracker.crypto_waiting_count = tracker.crypto_waiting_count + 1;
+  return false;
+}
+
+pub fn tracker_try_acquire_waiting_crypto(tracker: &mut RelayTracker, limits: &ShieldLimits) -> Bool
+  intent "待機中だったタスクが空いた暗号計算パーミットの取得を試みる（成功時に待機数を減算）"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_crypto_tasks < limits.max_concurrent_crypto_tasks {
+    tracker.active_crypto_tasks = tracker.active_crypto_tasks + 1;
+    if tracker.crypto_waiting_count > 0 {
+      tracker.crypto_waiting_count = tracker.crypto_waiting_count - 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+pub fn tracker_cancel_waiting_crypto(tracker: &mut RelayTracker)
+  intent "タイムアウト等により暗号計算タスクの待機を取り消す"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.crypto_waiting_count > 0 {
+    tracker.crypto_waiting_count = tracker.crypto_waiting_count - 1;
+  }
+}
+
+pub fn tracker_release_crypto(tracker: &mut RelayTracker)
+  intent "鍵交換・署名並行計算タスクの完了を通知し解放する"
+  requires none
+  ensures none
+  effects none
+{
+  if tracker.active_crypto_tasks > 0 {
+    tracker.active_crypto_tasks = tracker.active_crypto_tasks - 1;
+  }
+}
+
+// タイムアウトおよびバッファ定数（ADR 0063 決定 4.4, 5.3）
+pub fn max_relay_buffer_size() -> Int
+  intent "中継バッファの各方向上限（32 KiB = 2 レコード分）"
+  requires none
+  ensures none
+  effects none
+{
+  return 32768;
+}
+
+pub fn max_pre_handshake_plaintext_buffer() -> Int
+  intent "ハンドシェイク完了前に届いた平文のバッファ上限（32 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 32768;
+}
+
+pub fn build_502_bad_gateway_response() -> Bytes
+  intent "上流接続不能・期限超過時に返す外部入力を含まない固定の 502 Bad Gateway 応答（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let text = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 17\r\n\r\n502 Bad Gateway\r\n";
+  return text.as_bytes();
+}
+
+pub fn build_close_notify_record(prot: &mut RecordProtection) -> Result<Bytes, ShieldError>
+  intent "暗号化 close_notify アラートレコードを構築する（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut alert_payload = Bytes.with_capacity(2);
+  alert_payload.push(1);  // warning
+  alert_payload.push(0);  // close_notify
+  return seal_record(&mut prot, &ContentType.Alert, &alert_payload, 0);
+}
+
+pub fn build_fatal_alert_record(prot: &mut RecordProtection, desc: &AlertDescription) -> Result<Bytes, ShieldError>
+  intent "ハンドシェイク完了後の上流障害時等に送る暗号化致命的アラートレコードを構築する（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut alert_payload = Bytes.with_capacity(2);
+  alert_payload.push(2);  // fatal
+  let code = alert_description_to_u8(&desc);
+  alert_payload.push(code);
+  return seal_record(&mut prot, &ContentType.Alert, &alert_payload, 0);
+}
+
+pub fn build_plaintext_fatal_alert_record(desc: &AlertDescription) -> Bytes
+  intent "ハンドシェイク前の異常切断等に用いる平文の致命的アラートレコードを構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rec = Bytes.with_capacity(7);
+  rec.push(21);  // ContentType.Alert
+  rec.push(3);  // legacy_version 0x0303
+  rec.push(3);
+  rec.push(0);  // length 2
+  rec.push(2);
+  rec.push(2);  // fatal
+  let code = alert_description_to_u8(&desc);
+  rec.push(code);
+  return rec;
+}
+
+// 中継終了理由の分類（ADR 0063 決定 5.3）
+pub enum RelayOutcome {
+  NormalCompletion,  // 上流正常終了 -> 残り送信後 close_notify 送信
+  UpstreamConnectFailed502,  // 上流接続不能/期限超過 -> 502 Bad Gateway 暗号化送信後 close_notify 送信
+  UpstreamAbnormalInternalError,  // 上流異常終了（リセット/期限） -> close_notify なしで致命的 internal_error
+  ClientRequestedCloseNotify,  // クライアントが close_notify 送信 -> 上流 write shutdown、応答終わり待機
+  ClientTruncatedAbruptClose,  // クライアントが close_notify なしで切断 -> 切り詰めとして上流即時切断
+  BufferOverflowExceeded,  // バッファ 32 KiB 超過 -> 致命的切断
+}
+
+// ログ出力結果の分類（決定 5.3）
+pub enum RelayResultClassification {
+  HandshakeSuccess,
+  BadGateway502,
+  UpstreamInternalError,
+  ClientNormalClosed,
+  ClientTruncated,
+  LimitExceeded,
+  TimeoutExpired,
+}
+
+pub fn sanitize_sni_for_log(sni: &String) -> String
+  intent "ログへの注入を防ぐため、SNI 文字列を [a-z0-9._*-] のみに制限し長さを 253 文字以下に切る（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let b = sni.as_bytes();
+  let blen = b.byte_len();
+  let max_len = match blen > 253 {
+    true => 253,
+    false => blen,
+  };
+
+  let mut out = Bytes.with_capacity(max_len);
+  let mut i = 0;
+  while i < max_len {
+    let c = b.get(i).unwrap_or(0);
+    // [a-z]
+    let is_az = c >= 97 && c <= 122;
+    // [0-9]
+    let is_digit = c >= 48 && c <= 57;
+    // '.', '_', '*', '-'
+    let is_special = c == 46 || c == 95 || c == 42 || c == 45;
+
+    if is_az || is_digit || is_special {
+      out.push(c);
+    }
+    // 改行（\r, \n）、制御文字、エスケープシーケンス等はすべて除外
+    i = i + 1;
+  }
+
+  return out.to_string_utf8().unwrap_or("");
+}
+
+pub fn format_relay_log(peer_addr: &String, sanitized_sni: &Option<String>, classification: &RelayResultClassification) -> String
+  intent "機密（鍵・平文・ClientHello 中身・通信鍵）を一切含まない安全なログ行を整形する（決定 5.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut log = Bytes.new();
+  log.extend(&"peer=".as_bytes());
+  log.extend(&peer_addr.as_bytes());
+  log.extend(&" sni=".as_bytes());
+  match sanitized_sni {
+    Some(s) => {
+      log.extend(&s.as_bytes());
+    }
+    None => {
+      log.extend(&"-".as_bytes());
+    }
+  }
+  log.extend(&" result=".as_bytes());
+  let res_str = match classification {
+    RelayResultClassification.HandshakeSuccess => "HANDSHAKE_SUCCESS",
+    RelayResultClassification.BadGateway502 => "BAD_GATEWAY_502",
+    RelayResultClassification.UpstreamInternalError => "UPSTREAM_INTERNAL_ERROR",
+    RelayResultClassification.ClientNormalClosed => "CLIENT_CLOSED_NORMAL",
+    RelayResultClassification.ClientTruncated => "CLIENT_TRUNCATED",
+    RelayResultClassification.LimitExceeded => "LIMIT_EXCEEDED",
+    RelayResultClassification.TimeoutExpired => "TIMEOUT_EXPIRED",
+  };
+  log.extend(&res_str.as_bytes());
+  return log.to_string_utf8().unwrap_or("");
+}

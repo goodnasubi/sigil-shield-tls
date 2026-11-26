@@ -1,0 +1,473 @@
+module shield_proxy_v2
+  targets server
+  trust none
+
+// PROXY protocol v2 の構築と検証（ADR 0063 決定 5.1）
+// 後段へ渡す平文は HTTP のままとし、接続の先頭に PROXY protocol v2 のヘッダーを 1 回だけ付ける。
+// ヘッダー全体は 1 KiB 以下とする。
+
+pub enum ProxyError {
+  HeaderTooLarge(Int, Int),
+  InvalidSignature,
+  InvalidVersion(Int),
+  InvalidCommand(Int),
+  InvalidAddressFamily(Int),
+  InvalidPort(Int),
+  InvalidIpAddress(String),
+  IncompleteHeader(Int, Int),
+  MalformedTlv,
+}
+
+pub struct ProxyIpv4 {
+  b0: Int,
+  b1: Int,
+  b2: Int,
+  b3: Int,
+}
+
+pub fn new_ipv4(b0: Int, b1: Int, b2: Int, b3: Int) -> ProxyIpv4
+  intent "IPv4 アドレス構造体を生成する"
+  requires none
+  ensures none
+  effects none
+{
+  return ProxyIpv4 { b0: b0, b1: b1, b2: b2, b3: b3 };
+}
+
+pub enum ProxyEndpoint {
+  IPv4(ProxyIpv4, Int, ProxyIpv4, Int),  // src_ip, src_port, dst_ip, dst_port
+  IPv6(Bytes, Int, Bytes, Int),  // src_ip (16B), src_port, dst_ip (16B), dst_port
+  Unspec,
+}
+
+pub fn proxy_v2_signature() -> Bytes
+  intent "PROXY protocol v2 の 12 バイト固定シグネチャを返す"
+  requires none
+  ensures result.byte_len() == 12
+  effects none
+{
+  let mut sig = Bytes.with_capacity(12);
+  sig.push(13);  // \r
+  sig.push(10);  // \n
+  sig.push(13);  // \r
+  sig.push(10);  // \n
+  sig.push(0);  // \0
+  sig.push(13);  // \r
+  sig.push(10);  // \n
+  sig.push(81);  // Q
+  sig.push(85);  // U
+  sig.push(73);  // I
+  sig.push(84);  // T
+  sig.push(10);  // \n
+  return sig;
+}
+
+pub fn max_proxy_header_size() -> Int
+  intent "PROXY protocol v2 ヘッダー全体の最大バイト数（1 KiB）"
+  requires none
+  ensures none
+  effects none
+{
+  return 1024;
+}
+
+pub fn tlv_type_authority() -> Int
+  intent "PP2_TYPE_AUTHORITY (0x02)"
+  requires none
+  ensures none
+  effects none
+{
+  return 2;
+}
+
+pub fn tlv_type_ssl() -> Int
+  intent "PP2_TYPE_SSL (0x20)"
+  requires none
+  ensures none
+  effects none
+{
+  return 32;
+}
+
+pub fn pp2_client_ssl() -> Int
+  intent "PP2_CLIENT_SSL (0x01)"
+  requires none
+  ensures none
+  effects none
+{
+  return 1;
+}
+
+pub fn pp2_subtype_ssl_version() -> Int
+  intent "PP2_SUBTYPE_SSL_VERSION (0x21)"
+  requires none
+  ensures none
+  effects none
+{
+  return 33;
+}
+
+pub fn build_ssl_tlv() -> Bytes
+  intent "TLS 1.3 接続を示す TLV SSL（およびサブ TLV TLSv1.3）を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  // サブ TLV: PP2_SUBTYPE_SSL_VERSION (0x21), len=7, value="TLSv1.3"
+  let version_str = "TLSv1.3".as_bytes();
+  let sub_val_len = version_str.byte_len();
+  let mut sub_tlv = Bytes.with_capacity(3 + sub_val_len);
+  sub_tlv.push(pp2_subtype_ssl_version());
+  sub_tlv.push(sub_val_len / 256);
+  sub_tlv.push(sub_val_len % 256);
+  sub_tlv.extend(&version_str);
+
+  // TLV SSL: type=0x20, len=1(client) + 4(verify) + sub_tlv_len
+  let val_len = 1 + 4 + sub_tlv.byte_len();
+  let mut tlv = Bytes.with_capacity(3 + val_len);
+  tlv.push(tlv_type_ssl());
+  tlv.push(val_len / 256);
+  tlv.push(val_len % 256);
+
+  // client (1 byte): PP2_CLIENT_SSL
+  tlv.push(pp2_client_ssl());
+
+  // verify (4 bytes): 0
+  tlv.push(0);
+  tlv.push(0);
+  tlv.push(0);
+  tlv.push(0);
+
+  // sub-TLVs
+  tlv.extend(&sub_tlv);
+
+  return tlv;
+}
+
+pub fn build_authority_tlv(normalized_sni: &String) -> Bytes
+  intent "正規化済み SNI を格納する TLV AUTHORITY を構築する"
+  requires none
+  ensures none
+  effects none
+{
+  let sni_bytes = normalized_sni.as_bytes();
+  let vlen = sni_bytes.byte_len();
+  let mut tlv = Bytes.with_capacity(3 + vlen);
+  tlv.push(tlv_type_authority());
+  tlv.push(vlen / 256);
+  tlv.push(vlen % 256);
+  tlv.extend(&sni_bytes);
+  return tlv;
+}
+
+pub fn build_proxy_v2_header(endpoint: &ProxyEndpoint, normalized_sni: &Option<String>) -> Result<Bytes, ProxyError>
+  intent "PROXY protocol v2 ヘッダーを生成する（決定 5.1）"
+  requires none
+  ensures none
+  effects none
+{
+  let sig = proxy_v2_signature();
+  let mut header = Bytes.with_capacity(64);
+  header.extend(&sig);
+
+  // byte 12: version 2 (0x20) | command PROXY (0x01) = 0x21
+  header.push(33);
+
+  // byte 13 & address block
+  let mut addr_bytes = Bytes.new();
+  match endpoint {
+    ProxyEndpoint.IPv4(src, src_port, dst, dst_port) => {
+      if src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535 {
+        return Err(ProxyError.InvalidPort(src_port));
+      }
+      // AF_INET (0x10) | STREAM (0x01) = 0x11 (17)
+      header.push(17);
+      addr_bytes.push(src.b0);
+      addr_bytes.push(src.b1);
+      addr_bytes.push(src.b2);
+      addr_bytes.push(src.b3);
+      addr_bytes.push(dst.b0);
+      addr_bytes.push(dst.b1);
+      addr_bytes.push(dst.b2);
+      addr_bytes.push(dst.b3);
+      addr_bytes.push(src_port / 256);
+      addr_bytes.push(src_port % 256);
+      addr_bytes.push(dst_port / 256);
+      addr_bytes.push(dst_port % 256);
+    }
+    ProxyEndpoint.IPv6(src, src_port, dst, dst_port) => {
+      if src_port < 0 || src_port > 65535 || dst_port < 0 || dst_port > 65535 {
+        return Err(ProxyError.InvalidPort(src_port));
+      }
+      if src.byte_len() != 16 || dst.byte_len() != 16 {
+        return Err(ProxyError.InvalidAddressFamily(33));
+      }
+      // AF_INET6 (0x20) | STREAM (0x01) = 0x21 (33)
+      header.push(33);
+      addr_bytes.extend(&src);
+      addr_bytes.extend(&dst);
+      addr_bytes.push(src_port / 256);
+      addr_bytes.push(src_port % 256);
+      addr_bytes.push(dst_port / 256);
+      addr_bytes.push(dst_port % 256);
+    }
+    ProxyEndpoint.Unspec => {
+      // AF_UNSPEC (0x00) | UNSPEC (0x00) = 0x00
+      header.push(0);
+    }
+  }
+
+  // TLVs 構築
+  let mut tlvs = Bytes.new();
+
+  // 1. TLV AUTHORITY（SNI がある場合のみ）
+  match normalized_sni {
+    Some(sni) => {
+      let auth_tlv = build_authority_tlv(&sni);
+      tlvs.extend(&auth_tlv);
+    }
+    None => {}
+  }
+
+  // 2. TLV SSL (常に付与: TLS 終端接続)
+  let ssl_tlv = build_ssl_tlv();
+  tlvs.extend(&ssl_tlv);
+
+  let payload_len = addr_bytes.byte_len() + tlvs.byte_len();
+  let total_len = 16 + payload_len;
+  if total_len > max_proxy_header_size() {
+    return Err(ProxyError.HeaderTooLarge(total_len, max_proxy_header_size()));
+  }
+
+  // bytes 14-15: length in big-endian
+  header.push(payload_len / 256);
+  header.push(payload_len % 256);
+
+  // アドレス部と TLV 部を追加
+  header.extend(&addr_bytes);
+  header.extend(&tlvs);
+
+  return Ok(header);
+}
+
+// 構造化検証用のパース結果
+pub struct ParsedProxyV2 {
+  command: Int,
+  family: Int,
+  src_port: Int,
+  dst_port: Int,
+  has_authority: Bool,
+  authority: String,
+  has_ssl_tlv: Bool,
+  ssl_version: String,
+}
+
+pub fn parsed_has_authority(p: &ParsedProxyV2) -> Bool
+  intent "ParsedProxyV2 が authority TLV を持つか"
+  requires none
+  ensures none
+  effects none
+{
+  return p.has_authority;
+}
+
+pub fn parsed_authority(p: &ParsedProxyV2) -> String
+  intent "ParsedProxyV2 の authority 文字列"
+  requires none
+  ensures none
+  effects none
+{
+  return p.authority.clone();
+}
+
+pub fn parsed_has_ssl_tlv(p: &ParsedProxyV2) -> Bool
+  intent "ParsedProxyV2 が SSL TLV を持つか"
+  requires none
+  ensures none
+  effects none
+{
+  return p.has_ssl_tlv;
+}
+
+pub fn parsed_ssl_version(p: &ParsedProxyV2) -> String
+  intent "ParsedProxyV2 の SSL バージョン文字列"
+  requires none
+  ensures none
+  effects none
+{
+  return p.ssl_version.clone();
+}
+
+pub fn parsed_command(p: &ParsedProxyV2) -> Int
+  intent "ParsedProxyV2 のコマンドコード"
+  requires none
+  ensures none
+  effects none
+{
+  return p.command;
+}
+
+pub fn parsed_family(p: &ParsedProxyV2) -> Int
+  intent "ParsedProxyV2 のファミリコード"
+  requires none
+  ensures none
+  effects none
+{
+  return p.family;
+}
+
+pub fn parsed_src_port(p: &ParsedProxyV2) -> Int
+  intent "ParsedProxyV2 の送信元ポート"
+  requires none
+  ensures none
+  effects none
+{
+  return p.src_port;
+}
+
+pub fn parsed_dst_port(p: &ParsedProxyV2) -> Int
+  intent "ParsedProxyV2 の送信先ポート"
+  requires none
+  ensures none
+  effects none
+{
+  return p.dst_port;
+}
+
+pub fn parse_proxy_v2_header(data: &Bytes) -> Result<ParsedProxyV2, ProxyError>
+  intent "PROXY protocol v2 ヘッダーをパース・検証する（テストおよび照合用）"
+  requires none
+  ensures none
+  effects none
+{
+  if data.byte_len() < 16 {
+    return Err(ProxyError.IncompleteHeader(data.byte_len(), 16));
+  }
+
+  let sig = proxy_v2_signature();
+  let mut i = 0;
+  while i < 12 {
+    if data.get(i).unwrap_or(0) != sig.get(i).unwrap_or(0) {
+      return Err(ProxyError.InvalidSignature);
+    }
+    i = i + 1;
+  }
+
+  let ver_cmd = data.get(12).unwrap_or(0);
+  let ver = ver_cmd / 16;
+  let cmd = ver_cmd % 16;
+  if ver != 2 {
+    return Err(ProxyError.InvalidVersion(ver));
+  }
+  if cmd != 1 {
+    // 終端部品は PROXY コマンド (1) のみ生成
+    return Err(ProxyError.InvalidCommand(cmd));
+  }
+
+  let fam = data.get(13).unwrap_or(0);
+  let l0 = data.get(14).unwrap_or(0);
+  let l1 = data.get(15).unwrap_or(0);
+  let payload_len = l0 * 256 + l1;
+
+  if data.byte_len() < 16 + payload_len {
+    return Err(ProxyError.IncompleteHeader(data.byte_len(), 16 + payload_len));
+  }
+
+  let mut offset = 16;
+  let mut src_port = 0;
+  let mut dst_port = 0;
+
+  if fam == 17 {
+    // IPv4: 12 bytes
+    if payload_len < 12 {
+      return Err(ProxyError.MalformedTlv);
+    }
+    let sp0 = data.get(offset + 8).unwrap_or(0);
+    let sp1 = data.get(offset + 9).unwrap_or(0);
+    src_port = sp0 * 256 + sp1;
+    let dp0 = data.get(offset + 10).unwrap_or(0);
+    let dp1 = data.get(offset + 11).unwrap_or(0);
+    dst_port = dp0 * 256 + dp1;
+    offset = offset + 12;
+  } else if fam == 33 {
+    // IPv6: 36 bytes
+    if payload_len < 36 {
+      return Err(ProxyError.MalformedTlv);
+    }
+    let sp0 = data.get(offset + 32).unwrap_or(0);
+    let sp1 = data.get(offset + 33).unwrap_or(0);
+    src_port = sp0 * 256 + sp1;
+    let dp0 = data.get(offset + 34).unwrap_or(0);
+    let dp1 = data.get(offset + 35).unwrap_or(0);
+    dst_port = dp0 * 256 + dp1;
+    offset = offset + 36;
+  } else if fam == 0 {
+    // UNSPEC: 0 bytes
+  } else {
+    return Err(ProxyError.InvalidAddressFamily(fam));
+  }
+
+  let end = 16 + payload_len;
+  let mut has_auth = false;
+  let mut auth_str = "";
+  let mut has_ssl = false;
+  let mut ssl_ver_str = "";
+
+  while offset + 3 <= end {
+    let tlv_type = data.get(offset).unwrap_or(0);
+    let t0 = data.get(offset + 1).unwrap_or(0);
+    let t1 = data.get(offset + 2).unwrap_or(0);
+    let tlen = t0 * 256 + t1;
+    offset = offset + 3;
+
+    if offset + tlen > end {
+      return Err(ProxyError.MalformedTlv);
+    }
+
+    if tlv_type == tlv_type_authority() {
+      has_auth = true;
+      let auth_slice = data.slice(offset, offset + tlen).unwrap_or(Bytes.new());
+      match auth_slice.to_string_utf8() {
+        Ok(s) => {
+          auth_str = s;
+        }
+        Err(_) => {
+          return Err(ProxyError.MalformedTlv);
+        }
+      }
+    } else if tlv_type == tlv_type_ssl() {
+      has_ssl = true;
+      if tlen >= 5 {
+        // client (1) + verify (4) + sub-tlvs
+        let mut sub_off = offset + 5;
+        let sub_end = offset + tlen;
+        while sub_off + 3 <= sub_end {
+          let stype = data.get(sub_off).unwrap_or(0);
+          let st0 = data.get(sub_off + 1).unwrap_or(0);
+          let st1 = data.get(sub_off + 2).unwrap_or(0);
+          let slen = st0 * 256 + st1;
+          sub_off = sub_off + 3;
+          if sub_off + slen > sub_end {
+            return Err(ProxyError.MalformedTlv);
+          }
+          if stype == pp2_subtype_ssl_version() {
+            let ver_slice = data.slice(sub_off, sub_off + slen).unwrap_or(Bytes.new());
+            match ver_slice.to_string_utf8() {
+              Ok(s) => {
+                ssl_ver_str = s;
+              }
+              Err(_) => {
+                return Err(ProxyError.MalformedTlv);
+              }
+            }
+          }
+          sub_off = sub_off + slen;
+        }
+      }
+    }
+
+    offset = offset + tlen;
+  }
+
+  return Ok(ParsedProxyV2 { command: cmd, family: fam, src_port: src_port, dst_port: dst_port, has_authority: has_auth, authority: auth_str, has_ssl_tlv: has_ssl, ssl_version: ssl_ver_str });
+}
