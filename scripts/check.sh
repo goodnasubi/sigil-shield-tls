@@ -71,4 +71,7 @@ run_entry stage2_key_update_test "Stage 2 key update and limits"
 
 run_entry stage3_handshake_test "Stage 3 handshake state machine and RFC 8448 traces"
 
-printf 'All Stage 1, Stage 2, and Stage 3 evaluator and native tests passed.\n'
+run_entry stage4_certificate_test "Stage 4 certificate loading and management"
+
+printf 'All Stage 1, Stage 2, Stage 3, and Stage 4 evaluator and native tests passed.\n'
+

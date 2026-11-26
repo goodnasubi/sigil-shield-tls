@@ -1,0 +1,944 @@
+module stage4_certificate_test
+  targets server
+  trust none
+
+use shield_alert.AlertDescription;
+use shield_asn1.Asn1Error;
+use shield_asn1.read_element;
+use shield_certificate.ExpiryStatus;
+use shield_certificate.ReloadOutcome;
+use shield_certificate.check_expiry;
+use shield_certificate.create_session_for_bundle;
+use shield_certificate.load_bundle_from_pem_text;
+use shield_certificate.new_certificate_store;
+use shield_certificate.new_store_manager;
+use shield_certificate.normalize_hostname;
+use shield_certificate.reload_store;
+use shield_certificate.select_certificate_for_sni;
+use shield_certificate.validate_file_mode;
+use shield_handshake.HandshakePhase;
+use shield_handshake.handshake_phase;
+use shield_pem.PemError;
+use shield_pem.base64_decode;
+use shield_pem.parse_pem;
+use shield_x509.CertError;
+use shield_x509.match_san_pattern;
+use shield_x509.parse_certificate;
+use shield_x509.parse_private_key;
+
+fn get_p256_pkcs8_pem() -> String
+  intent "正常な P-256 PKCS#8 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgEYGnSiBgXwP7WZEK\nnW83yc235VtOZqeK/Q82a2KsKzChRANCAAQsjimmI6QJfZtzEjO7tDVwEdD3FDaG\nFNceg/i8+Od5h4vee9/+QglHMgchn7hqguuMfQgPiyd39KnTRghFUJse\n-----END PRIVATE KEY-----\n";
+}
+
+fn get_p256_sec1_pem() -> String
+  intent "正常な P-256 SEC1 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIBGBp0ogYF8D+1mRCp1vN8nNt+VbTmaniv0PNmtirCswoAoGCCqGSM49\nAwEHoUQDQgAELI4ppiOkCX2bcxIzu7Q1cBHQ9xQ2hhTXHoP4vPjneYeL3nvf/kIJ\nRzIHIZ+4aoLrjH0ID4snd/Sp00YIRVCbHg==\n-----END EC PRIVATE KEY-----\n";
+}
+
+fn get_other_p256_pkcs8_pem() -> String
+  intent "別ペアの P-256 PKCS#8 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgbs0n24W8Q8i1pnVY\nRSQ9NsPbYQ+4qgbMUlrGD+YcMWahRANCAASY/6nkJttrxHW0gXqWsc+S63Oyqhsn\n5j/Iq6IV9Z+jTKD/40PRqWDXdbBjaEsdVKb4XVz9hviI1QVTHiajfO2Y\n-----END PRIVATE KEY-----\n";
+}
+
+fn get_rsa_pem() -> String
+  intent "禁止される RSA 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAtpY7BhivmI7uUp0aq1hQ2NDvaRb1A+AwDlO1R0FWAUm4GugD\n-----END RSA PRIVATE KEY-----\n";
+}
+
+fn get_ed25519_pkcs8_pem() -> String
+  intent "禁止される Ed25519 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAvrjy2D+L09keScD3mu3OuikncAttfePkp2+0IYMe1g\n-----END PRIVATE KEY-----\n";
+}
+
+fn get_p384_pkcs8_pem() -> String
+  intent "禁止される P-384 秘密鍵 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN PRIVATE KEY-----\nMIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDClZGXXCoIb6grXWkza\nY1qBk9xmlxNWA4HUvznHKzjNsMWRHTzSNncsDFTk2M9bU+uhZANiAARbQVN0mFgp\nYoNXN/xVIVMKf7Fsm5p4fc6MOH4qT786KphPEKBDXWBII+/RHA/rGtNCSvuSkkdJ\nnX6ww33Kseb8l9C1mK5pHGR2NlwME5VxFevN5b/hB4usJveDcHrZLQg=\n-----END PRIVATE KEY-----\n";
+}
+
+fn get_leaf_cert_pem() -> String
+  intent "テスト用 リーフ証明書 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBVjCB/qADAgECAgECMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABCyOKaYjpAl9m3MSM7u0NXAR0PcUNoYU1x6D+Lz453mHi9573/5C\nCUcyByGfuGqC64x9CA+LJ3f0qdNGCEVQmx6jKTAnMCUGA1UdEQQeMByCC2V4YW1w\nbGUuY29tgg0qLmV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0cAMEQCIBwPwgIYt/HT\nFjg38v/ztFwZSNUvesJx5EYF1lnL773lAiAS4oI8uwonf2OgwhcSeaeRPd4WkBgS\nQuVXzxohuYlvNw==\n-----END CERTIFICATE-----\n";
+}
+
+fn get_ca_cert_pem() -> String
+  intent "テスト用 CA 証明書 PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBVTCB/KADAgECAgEBMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAqMRAwDgYDVQQDDAdUZXN0IENBMRYwFAYDVQQKDA1TaGllbGQgVExT\nIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExPyFTXe4R43oDNkBL8Vo2FYv\nWdlb5xCH8GvRf2gbu8MMmPzvupBajfVjZA8Cry9W2mZJ4K/Hp0Wp0V0uFCtNBaMT\nMBEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3+ozQ5fDf3mCs\nMYu/I0Cdd6iIOzGQd9OYKmZupKnV5wIhAMSh6uvvLlZgqYLTsGftiqaR7yCFBgyE\nIa6AnmlqfbLJ\n-----END CERTIFICATE-----\n";
+}
+
+fn get_fullchain_pem() -> String
+  intent "リーフと CA を連結した証明書チェーン PEM"
+  requires none
+  ensures none
+  effects none
+{
+  return "-----BEGIN CERTIFICATE-----\nMIIBVjCB/qADAgECAgECMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTBZMBMGByqGSM49AgEGCCqG\nSM49AwEHA0IABCyOKaYjpAl9m3MSM7u0NXAR0PcUNoYU1x6D+Lz453mHi9573/5C\nCUcyByGfuGqC64x9CA+LJ3f0qdNGCEVQmx6jKTAnMCUGA1UdEQQeMByCC2V4YW1w\nbGUuY29tgg0qLmV4YW1wbGUuY29tMAoGCCqGSM49BAMCA0cAMEQCIBwPwgIYt/HT\nFjg38v/ztFwZSNUvesJx5EYF1lnL773lAiAS4oI8uwonf2OgwhcSeaeRPd4WkBgS\nQuVXzxohuYlvNw==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBVTCB/KADAgECAgEBMAoGCCqGSM49BAMCMCoxEDAOBgNVBAMMB1Rlc3QgQ0Ex\nFjAUBgNVBAoMDVNoaWVsZCBUTFMgQ0EwHhcNMjUwMTAxMDAwMDAwWhcNMjgwMTAx\nMDAwMDAwWjAqMRAwDgYDVQQDDAdUZXN0IENBMRYwFAYDVQQKDA1TaGllbGQgVExT\nIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExPyFTXe4R43oDNkBL8Vo2FYv\nWdlb5xCH8GvRf2gbu8MMmPzvupBajfVjZA8Cry9W2mZJ4K/Hp0Wp0V0uFCtNBaMT\nMBEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiB3+ozQ5fDf3mCs\nMYu/I0Cdd6iIOzGQd9OYKmZupKnV5wIhAMSh6uvvLlZgqYLTsGftiqaR7yCFBgyE\nIa6AnmlqfbLJ\n-----END CERTIFICATE-----\n";
+}
+
+fn test_base64_strict() -> Int
+  intent "Base64 厳格デコードのテスト（決定 2.1）"
+  requires none
+  ensures none
+  effects none
+{
+  let res1 = base64_decode(&"YW55IGNhcm5hbCBwbGVhc3VyZS4=");
+  match res1 {
+    Ok(b) => {
+      if b.byte_len() != 20 {
+        return 101;
+      }
+    }
+    Err(_) => {
+      return 102;
+    }
+  }
+
+  let res_bad_pad = base64_decode(&"ZE==");
+  match res_bad_pad {
+    Ok(_) => {
+      return 103;
+    }
+    Err(_) => {}
+  }
+
+  let res_bad_char = base64_decode(&"YW55-GNh");
+  match res_bad_char {
+    Ok(_) => {
+      return 104;
+    }
+    Err(_) => {}
+  }
+
+  let res_bad_len = base64_decode(&"Y");
+  match res_bad_len {
+    Ok(_) => {
+      return 105;
+    }
+    Err(_) => {}
+  }
+
+  return 0;
+}
+
+fn test_pem_parser() -> Int
+  intent "PEM 解析・暗号化鍵拒否・上限検査のテスト（決定 2.1）"
+  requires none
+  ensures none
+  effects none
+{
+  let pkcs8 = get_p256_pkcs8_pem();
+  let blocks_res = parse_pem(&pkcs8);
+  match blocks_res {
+    Ok(b) => {
+      if b.len() != 1 {
+        return 201;
+      }
+    }
+    Err(_) => {
+      return 202;
+    }
+  }
+
+  let enc_pem1 = "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: DES-EDE3-CBC,1234\n\nYW55\n-----END RSA PRIVATE KEY-----\n";
+  let enc_res1 = parse_pem(&enc_pem1);
+  match enc_res1 {
+    Ok(_) => {
+      return 203;
+    }
+    Err(e) => {
+      match e {
+        PemError.EncryptedKeyForbidden => {}
+        _ => {
+          return 204;
+        }
+      }
+    }
+  }
+
+  let enc_pem2 = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nYW55\n-----END ENCRYPTED PRIVATE KEY-----\n";
+  let enc_res2 = parse_pem(&enc_pem2);
+  match enc_res2 {
+    Ok(_) => {
+      return 205;
+    }
+    Err(e) => {
+      match e {
+        PemError.EncryptedKeyForbidden => {}
+        _ => {
+          return 206;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
+fn test_asn1_der_strict() -> Int
+  intent "厳格 ASN.1 DER パーサーのテスト（決定 2.2, 2.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut indef = Bytes.new();
+  indef.push(48);
+  indef.push(128);
+  indef.push(0);
+  indef.push(0);
+  let indef_res = read_element(&indef, 0);
+  match indef_res {
+    Ok(_) => {
+      return 301;
+    }
+    Err(e) => {
+      match e {
+        Asn1Error.IndefiniteLengthForbidden => {}
+        _ => {
+          return 302;
+        }
+      }
+    }
+  }
+
+  let mut non_min = Bytes.new();
+  non_min.push(4);
+  non_min.push(129);
+  non_min.push(5);
+  non_min.push(1);
+  non_min.push(2);
+  non_min.push(3);
+  non_min.push(4);
+  non_min.push(5);
+  let non_min_res = read_element(&non_min, 0);
+  match non_min_res {
+    Ok(_) => {
+      return 303;
+    }
+    Err(e) => {
+      match e {
+        Asn1Error.NonMinimalLengthEncoding => {}
+        _ => {
+          return 304;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
+fn test_private_key_parsing() -> Int
+  intent "秘密鍵形式の判定とアルゴリズム検証（決定 2.2）"
+  requires none
+  ensures none
+  effects none
+{
+  let pkcs8_pem = get_p256_pkcs8_pem();
+  let blocks1 = parse_pem(&pkcs8_pem).unwrap_or(List.new());
+  match blocks1.get(0) {
+    Some(b1) => {
+      match parse_private_key(&b1) {
+        Ok(_) => {}
+        Err(_) => {
+          return 402;
+        }
+      }
+    }
+    None => {
+      return 401;
+    }
+  }
+
+  let sec1_pem = get_p256_sec1_pem();
+  let blocks2 = parse_pem(&sec1_pem).unwrap_or(List.new());
+  match blocks2.get(0) {
+    Some(b2) => {
+      match parse_private_key(&b2) {
+        Ok(_) => {}
+        Err(_) => {
+          return 404;
+        }
+      }
+    }
+    None => {
+      return 403;
+    }
+  }
+
+  let rsa_pem = get_rsa_pem();
+  let blocks_rsa = parse_pem(&rsa_pem).unwrap_or(List.new());
+  match blocks_rsa.get(0) {
+    Some(b_rsa) => {
+      match parse_private_key(&b_rsa) {
+        Ok(_) => {
+          return 406;
+        }
+        Err(e) => {
+          match e {
+            CertError.UnsupportedAlgorithm(_) => {}
+            _ => {
+              return 407;
+            }
+          }
+        }
+      }
+    }
+    None => {
+      return 405;
+    }
+  }
+
+  let ed_pem = get_ed25519_pkcs8_pem();
+  let blocks_ed = parse_pem(&ed_pem).unwrap_or(List.new());
+  match blocks_ed.get(0) {
+    Some(b_ed) => {
+      match parse_private_key(&b_ed) {
+        Ok(_) => {
+          return 409;
+        }
+        Err(e) => {
+          match e {
+            CertError.UnsupportedAlgorithm(_) => {}
+            _ => {
+              return 410;
+            }
+          }
+        }
+      }
+    }
+    None => {
+      return 408;
+    }
+  }
+
+  let p384_pem = get_p384_pkcs8_pem();
+  let blocks_p384 = parse_pem(&p384_pem).unwrap_or(List.new());
+  match blocks_p384.get(0) {
+    Some(b_p384) => {
+      match parse_private_key(&b_p384) {
+        Ok(_) => {
+          return 412;
+        }
+        Err(e) => {
+          match e {
+            CertError.UnsupportedCurve(_) => {}
+            _ => {
+              return 413;
+            }
+          }
+        }
+      }
+    }
+    None => {
+      return 411;
+    }
+  }
+
+  return 0;
+}
+
+fn test_certificate_parsing_and_san() -> Int
+  intent "X.509 証明書解析と SAN 抽出のテスト（決定 2.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let leaf_pem = get_leaf_cert_pem();
+  let blocks = parse_pem(&leaf_pem).unwrap_or(List.new());
+  match blocks.get(0) {
+    Some(b) => {
+      match parse_certificate(&b.data) {
+        Ok(cert) => {
+          if cert.san_dns_names.len() < 2 {
+            return 503;
+          }
+          let mut has_exact = false;
+          let mut has_wild = false;
+          let mut i = 0;
+          while i < cert.san_dns_names.len() {
+            match cert.san_dns_names.get(i) {
+              Some(name) => {
+                if name == "example.com" {
+                  has_exact = true;
+                }
+                if name == "*.example.com" {
+                  has_wild = true;
+                }
+              }
+              None => {}
+            }
+            i = i + 1;
+          }
+          if !has_exact || !has_wild {
+            return 504;
+          }
+        }
+        Err(_) => {
+          return 502;
+        }
+      }
+    }
+    None => {
+      return 501;
+    }
+  }
+
+  return 0;
+}
+
+fn test_chain_validation() -> Int
+  intent "証明書チェーンの検証・鍵照合・時刻判定のテスト（決定 2.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let fullchain = get_fullchain_pem();
+  let key_pem = get_p256_pkcs8_pem();
+  let other_key_pem = get_other_p256_pkcs8_pem();
+
+  let mut names = List.new();
+  names.push("example.com");
+
+  let bundle_ok = load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(1748736000));
+  match bundle_ok {
+    Ok(_) => {}
+    Err(_) => {
+      return 601;
+    }
+  }
+
+  let bundle_no_clock = load_bundle_from_pem_text(&fullchain, &key_pem, &names, None);
+  match bundle_no_clock {
+    Ok(_) => {
+      return 602;
+    }
+    Err(e) => {
+      match e {
+        CertError.ClockUnavailable => {}
+        _ => {
+          return 603;
+        }
+      }
+    }
+  }
+
+  let bundle_expired = load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(2000000000));
+  match bundle_expired {
+    Ok(_) => {
+      return 604;
+    }
+    Err(e) => {
+      match e {
+        CertError.CertificateExpired(_, _) => {}
+        _ => {
+          return 605;
+        }
+      }
+    }
+  }
+
+  let bundle_future = load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(1000));
+  match bundle_future {
+    Ok(_) => {
+      return 606;
+    }
+    Err(e) => {
+      match e {
+        CertError.CertificateNotYetValid(_, _) => {}
+        _ => {
+          return 607;
+        }
+      }
+    }
+  }
+
+  let bundle_mismatch_key = load_bundle_from_pem_text(&fullchain, &other_key_pem, &names, Some(1748736000));
+  match bundle_mismatch_key {
+    Ok(_) => {
+      return 608;
+    }
+    Err(e) => {
+      match e {
+        CertError.PublicKeyMismatch => {}
+        _ => {
+          return 609;
+        }
+      }
+    }
+  }
+
+  let mut bad_names = List.new();
+  bad_names.push("otherdomain.org");
+  let bundle_bad_san = load_bundle_from_pem_text(&fullchain, &key_pem, &bad_names, Some(1748736000));
+  match bundle_bad_san {
+    Ok(_) => {
+      return 610;
+    }
+    Err(e) => {
+      match e {
+        CertError.ConfiguredNameNotCovered(_) => {}
+        _ => {
+          return 611;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
+fn test_hostname_and_sni() -> Int
+  intent "ホスト名の正規化・ワイルドカード照合・SNI 選択（決定 2.4）"
+  requires none
+  ensures none
+  effects none
+{
+  let norm_res = normalize_hostname(&"Example.COM");
+  match norm_res {
+    Ok(h) => {
+      if h != "example.com" {
+        return 701;
+      }
+    }
+    Err(_) => {
+      return 702;
+    }
+  }
+
+  let dot_res = normalize_hostname(&"example.com.");
+  match dot_res {
+    Ok(_) => {
+      return 703;
+    }
+    Err(_) => {}
+  }
+
+  let ip4_res = normalize_hostname(&"192.168.1.1");
+  match ip4_res {
+    Ok(_) => {
+      return 704;
+    }
+    Err(_) => {}
+  }
+  let ip6_res = normalize_hostname(&"::1");
+  match ip6_res {
+    Ok(_) => {
+      return 705;
+    }
+    Err(_) => {}
+  }
+
+  if !match_san_pattern(&"*.example.com", &"foo.example.com") {
+    return 706;
+  }
+  if match_san_pattern(&"*.example.com", &"example.com") {
+    return 707;
+  }
+  if match_san_pattern(&"*.example.com", &"bar.foo.example.com") {
+    return 708;
+  }
+
+  let fullchain = get_fullchain_pem();
+  let key_pem = get_p256_pkcs8_pem();
+  let mut names = List.new();
+  names.push("example.com");
+  names.push("*.example.com");
+
+  match load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(1748736000)) {
+    Ok(bundle) => {
+      let mut bundles = List.new();
+      bundles.push(bundle);
+
+      match new_certificate_store(bundles, Some("example.com")) {
+        Ok(store) => {
+          match select_certificate_for_sni(&store, &Some("example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 711;
+              }
+            }
+            Err(_) => {
+              return 712;
+            }
+          }
+
+          match select_certificate_for_sni(&store, &Some("sub.example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 713;
+              }
+            }
+            Err(_) => {
+              return 714;
+            }
+          }
+
+          match select_certificate_for_sni(&store, &Some("unknown.org")) {
+            Ok(_) => {
+              return 715;
+            }
+            Err(a) => {
+              match a {
+                AlertDescription.UnrecognizedName => {}
+                _ => {
+                  return 716;
+                }
+              }
+            }
+          }
+
+          match select_certificate_for_sni(&store, &None) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 717;
+              }
+            }
+            Err(_) => {
+              return 718;
+            }
+          }
+        }
+        Err(_) => {
+          return 710;
+        }
+      }
+    }
+    Err(_) => {
+      return 709;
+    }
+  }
+
+  return 0;
+}
+
+fn test_file_mode_permissions() -> Int
+  intent "秘密鍵ファイルの権限検査（決定 2.5）"
+  requires none
+  ensures none
+  effects none
+{
+  let m600 = validate_file_mode(384);
+  match m600 {
+    Ok(_) => {}
+    Err(_) => {
+      return 801;
+    }
+  }
+
+  let m400 = validate_file_mode(256);
+  match m400 {
+    Ok(_) => {}
+    Err(_) => {
+      return 802;
+    }
+  }
+
+  let m644 = validate_file_mode(420);
+  match m644 {
+    Ok(_) => {
+      return 803;
+    }
+    Err(e) => {
+      match e {
+        CertError.InsecureFilePermissions(_) => {}
+        _ => {
+          return 804;
+        }
+      }
+    }
+  }
+
+  let m777 = validate_file_mode(511);
+  match m777 {
+    Ok(_) => {
+      return 805;
+    }
+    Err(_) => {}
+  }
+
+  return 0;
+}
+
+fn test_expiry_warning() -> Int
+  intent "証明書の有効期限警告（決定 2.3）"
+  requires none
+  ensures none
+  effects none
+{
+  let fullchain = get_fullchain_pem();
+  let key_pem = get_p256_pkcs8_pem();
+  let mut names = List.new();
+  names.push("example.com");
+
+  match load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(1748736000)) {
+    Ok(bundle) => {
+      let st1 = check_expiry(&bundle, 1748736000);
+      match st1 {
+        ExpiryStatus.Valid => {}
+        _ => {
+          return 902;
+        }
+      }
+
+      let st2 = check_expiry(&bundle, 1830297600 - 604800);
+      match st2 {
+        ExpiryStatus.ExpiringSoon(s) => {
+          if s != 604800 {
+            return 903;
+          }
+        }
+        _ => {
+          return 904;
+        }
+      }
+
+      let st3 = check_expiry(&bundle, 1830297600 + 86400);
+      match st3 {
+        ExpiryStatus.Expired(s) => {
+          if s != 86400 {
+            return 905;
+          }
+        }
+        _ => {
+          return 906;
+        }
+      }
+    }
+    Err(_) => {
+      return 901;
+    }
+  }
+
+  return 0;
+}
+
+fn test_store_reload() -> Int
+  intent "原子的な証明書ストア再読み込みとロールバック（決定 2.5）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut mgr = new_store_manager();
+
+  let fullchain = get_fullchain_pem();
+  let key_pem = get_p256_pkcs8_pem();
+  let mut names = List.new();
+  names.push("example.com");
+
+  match load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(1748736000)) {
+    Ok(bundle) => {
+      let mut initial_bundles = List.new();
+      initial_bundles.push(bundle);
+
+      let r1 = reload_store(&mut mgr, initial_bundles, Some("example.com"));
+      match r1 {
+        Ok(outcome) => {
+          match outcome {
+            ReloadOutcome.Success => {}
+            _ => {
+              return 1002;
+            }
+          }
+        }
+        Err(_) => {
+          return 1003;
+        }
+      }
+
+      let r2 = reload_store(&mut mgr, List.new(), Some("example.com"));
+      match r2 {
+        Ok(outcome) => {
+          match outcome {
+            ReloadOutcome.PreservedPrevious(_) => {}
+            _ => {
+              return 1004;
+            }
+          }
+        }
+        Err(_) => {
+          return 1005;
+        }
+      }
+
+      match mgr.current_store {
+        Some(cur_store) => {
+          match select_certificate_for_sni(&cur_store, &Some("example.com")) {
+            Ok(idx) => {
+              if idx != 0 {
+                return 1007;
+              }
+            }
+            Err(_) => {
+              return 1008;
+            }
+          }
+        }
+        None => {
+          return 1006;
+        }
+      }
+    }
+    Err(_) => {
+      return 1001;
+    }
+  }
+
+  return 0;
+}
+
+fn test_handshake_session_creation() -> Int
+  intent "証明書バンドルからの HandshakeSession 生成（段 3 連携）"
+  requires none
+  ensures none
+  effects none
+{
+  let fullchain = get_fullchain_pem();
+  let key_pem = get_p256_pkcs8_pem();
+  let mut names = List.new();
+  names.push("example.com");
+
+  match load_bundle_from_pem_text(&fullchain, &key_pem, &names, Some(1748736000)) {
+    Ok(bundle) => {
+      let session = create_session_for_bundle(&bundle);
+      match handshake_phase(&session) {
+        HandshakePhase.Initial => {}
+        _ => {
+          return 1102;
+        }
+      }
+    }
+    Err(_) => {
+      return 1101;
+    }
+  }
+
+  return 0;
+}
+
+fn test_fuzz_pem_and_asn1() -> Int
+  intent "PEM と ASN.1 パーサーの変異ファジング（パニックせず正常にエラーを返すこと）"
+  requires none
+  ensures none
+  effects none
+{
+  let mut rng = 123456789;
+  let mut i = 0;
+  while i < 50 {
+    let mut buf = Bytes.new();
+    let len = rng % 128 + 1;
+    let mut j = 0;
+    while j < len {
+      rng = (rng * 1103515245 + 12345) % 2147483648;
+      buf.push(rng % 256);
+      j = j + 1;
+    }
+
+    let _ = read_element(&buf, 0);
+    let _ = parse_pem(&"-----BEGIN CERTIFICATE-----\nmalformed\n-----END CERTIFICATE-----");
+
+    i = i + 1;
+  }
+
+  return 0;
+}
+
+pub fn main() -> Int
+  intent "段 4（証明書の読み込みと管理）の全テストを実行する"
+  requires none
+  ensures none
+  effects none
+{
+  let r1 = test_base64_strict();
+  if r1 != 0 {
+    return r1;
+  }
+
+  let r2 = test_pem_parser();
+  if r2 != 0 {
+    return r2;
+  }
+
+  let r3 = test_asn1_der_strict();
+  if r3 != 0 {
+    return r3;
+  }
+
+  let r4 = test_private_key_parsing();
+  if r4 != 0 {
+    return r4;
+  }
+
+  let r5 = test_certificate_parsing_and_san();
+  if r5 != 0 {
+    return r5;
+  }
+
+  let r6 = test_chain_validation();
+  if r6 != 0 {
+    return r6;
+  }
+
+  let r7 = test_hostname_and_sni();
+  if r7 != 0 {
+    return r7;
+  }
+
+  let r8 = test_file_mode_permissions();
+  if r8 != 0 {
+    return r8;
+  }
+
+  let r9 = test_expiry_warning();
+  if r9 != 0 {
+    return r9;
+  }
+
+  let r10 = test_store_reload();
+  if r10 != 0 {
+    return r10;
+  }
+
+  let r11 = test_handshake_session_creation();
+  if r11 != 0 {
+    return r11;
+  }
+
+  let r12 = test_fuzz_pem_and_asn1();
+  if r12 != 0 {
+    return r12;
+  }
+
+  return 0;
+}
