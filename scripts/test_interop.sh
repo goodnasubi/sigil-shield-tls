@@ -70,9 +70,16 @@ echo "Test 2 passed: OpenSSL successfully completed TLS 1.3 handshake with P-256
 
 # 3. curl: HTTPS GET over TLS 1.3 with HTTP/1.1 response
 echo "--- Test 3: curl HTTPS GET (TLS 1.3) ---"
+CURL_STATUS=0
 CURL_OUT=$(curl --noproxy "*" -k -s --tlsv1.3 --tls-max 1.3 --http1.1 \
   --resolve "example.com:${PORT}:127.0.0.1" \
-  "https://example.com:${PORT}/" || true)
+  "https://example.com:${PORT}/") || CURL_STATUS=$?
+
+if [[ ${CURL_STATUS} -ne 0 ]]; then
+  echo "Test 3 failed: curl exited with status ${CURL_STATUS}" >&2
+  kill "${SERVER_PID}" 2>/dev/null || true
+  exit 1
+fi
 
 if [[ "${CURL_OUT}" != "Hello Shield" ]]; then
   echo "Test 3 failed: curl output mismatch. Expected 'Hello Shield', got '${CURL_OUT}'" >&2
@@ -84,11 +91,13 @@ echo "Test 3 passed: curl HTTPS GET received expected body: '${CURL_OUT}'"
 # 4. OpenSSL s_client: Unrecognized SNI alert test
 echo "--- Test 4: openssl s_client with unknown SNI (rejection test) ---"
 OPENSSL_OUT_4=$(openssl s_client -connect "127.0.0.1:${PORT}" -servername unknown.domain.invalid -tls1_3 </dev/null 2>&1 || true)
-if ! echo "${OPENSSL_OUT_4}" | grep -qi -E "unrecognized(_name)?|alert"; then
-  echo "Test 4 warning: unexpected alert string from openssl" >&2
+if ! echo "${OPENSSL_OUT_4}" | grep -qi -E "unrecognized(_name| name)|alert (number )?112"; then
+  echo "Test 4 failed: server did not reject unknown SNI with unrecognized_name (alert 112)" >&2
   echo "${OPENSSL_OUT_4}" >&2
+  kill "${SERVER_PID}" 2>/dev/null || true
+  exit 1
 fi
-echo "Test 4 passed: server rejected unknown SNI"
+echo "Test 4 passed: server rejected unknown SNI with unrecognized_name (alert 112)"
 
 echo "=== Waiting for stage7_interop_server exit ==="
 wait "${SERVER_PID}"
